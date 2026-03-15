@@ -66,7 +66,7 @@ if __name__ == "__main__":
         # 1.0 uses 'validation' as the dev set
         val_key = "validation"
     else:
-        data_source = "neulab/logiqa2"
+        data_source = "baber/logiqa2"
         dataset = datasets.load_dataset(data_source, args.subset)
         val_key = "validation"
 
