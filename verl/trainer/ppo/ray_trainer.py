@@ -309,6 +309,23 @@ class RayPPOTrainer:
 
         self.checkpoint_manager = None
 
+        self.record_table = None
+        self.validation_table = None
+        import wandb
+        if wandb.run is not None:
+            columns = [
+                "epoch",
+                "step",
+                "prompt",
+                "response",
+                "ground_truth",
+                "outcome_reward",
+                "step_rewards",
+                "num_steps"
+            ]
+            self.record_table = wandb.Table(columns=columns)
+            self.validation_table = wandb.Table(columns=columns)
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -595,6 +612,32 @@ class RayPPOTrainer:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        # Add samples to validation_table
+        if self.validation_table is not None:
+            # aggregate step rewards if available
+            all_step_rewards = []
+            for i in range(len(sample_inputs)):
+                sr = []
+                for k, lst in reward_extra_infos_dict.items():
+                    if k.endswith("_step_reward") and i < len(lst):
+                        sr.append({k: lst[i]})
+                all_step_rewards.append(sr)
+            
+            # num_steps
+            all_num_steps = reward_extra_infos_dict.get("num_steps", [None] * len(sample_inputs))
+
+            for i in range(len(sample_inputs)):
+                self.validation_table.add_data(
+                    self.config.trainer.total_epochs if hasattr(self, 'global_eps') else 0, # Placeholder for epoch if not explicitly tracked
+                    self.global_steps,
+                    sample_inputs[i],
+                    sample_outputs[i],
+                    str(sample_gts[i]) if sample_gts[i] is not None else "",
+                    sample_scores[i],
+                    str(all_step_rewards[i]),
+                    all_num_steps[i]
+                )
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1379,11 +1422,48 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            import time
+                            start_time = time.perf_counter()
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
+                            end_time = time.perf_counter()
+                            print(f"[Info] Compute PRM cost {end_time - start_time:.4f} seconds, per sample cost {(end_time - start_time) / len(batch):.4f}, {len(batch)} samples in total!!")
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    # --- Start of Custom Logging ---
+                    if self.record_table is not None or self.global_steps % self.config.trainer.get("print_sample_freq", 1) == 0:
+                        prompts = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+                        responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+                        outcome_rewards = reward_tensor.sum(-1).cpu().tolist()
+                        gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", "") for item in batch]
+
+                        if self.record_table is not None:
+                            for i in range(len(prompts)):
+                                sr = []
+                                for k, v in reward_extra_infos_dict.items():
+                                    if k.endswith("_step_reward") and i < len(v):
+                                        sr.append({k: v[i]})
+                                num_steps = reward_extra_infos_dict.get("num_steps", [None] * len(prompts))[i]
+                                self.record_table.add_data(
+                                    epoch, self.global_steps, prompts[i], responses[i], str(gts[i]), outcome_rewards[i], str(sr) if sr else "", num_steps
+                                )
+
+                        # Print one sample
+                        if self.global_steps % self.config.trainer.get("print_sample_freq", 1) == 0:
+                            print(f"\n" + "=" * 40 + f" Step {self.global_steps} Sample " + "=" * 40)
+                            print(f"Prompt: {prompts[0]}")
+                            print(f"Response: {responses[0]}")
+                            print(f"Outcome Reward: {outcome_rewards[0]}")
+                            sr_sample = []
+                            for k, v in reward_extra_infos_dict.items():
+                                if k.endswith("_step_reward") and len(v) > 0:
+                                    sr_sample.append({k: v[0]})
+                            if sr_sample:
+                                print(f"Step Rewards: {sr_sample}")
+                            print("=" * 90 + "\n")
+                    # --- End of Custom Logging ---
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1635,6 +1715,10 @@ class RayPPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    if self.record_table is not None:
+                        import wandb
+                        wandb.log({"Training Record": self.record_table})
+                        wandb.log({"Validation Record": self.validation_table})
                     progress_bar.close()
                     return
 
