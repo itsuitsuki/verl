@@ -118,9 +118,10 @@ class TreeRewardManager(RewardManagerBase):
         api_timeout = reward_cfg_fol.get("api_timeout", algo_cfg_fol.get("api_timeout", None))
         if api_timeout is not None:
             self.api_config["api_timeout"] = int(api_timeout)
-        cumulative = reward_cfg_fol.get("fol_verify_with_cumulative_steps", algo_cfg_fol.get("fol_verify_with_cumulative_steps", False))
-        self.api_config["cumulative"] = bool(cumulative)
-        print(f"FOL config 'fol_verify_with_cumulative_steps' is set to: {self.api_config['cumulative']}")
+        fol_cumulative_mode = reward_cfg_fol.get("fol_cumulative_mode", algo_cfg_fol.get("fol_cumulative_mode", None))
+        if fol_cumulative_mode is not None:
+            self.api_config["fol_cumulative_mode"] = str(fol_cumulative_mode)
+        print(f"FOL config 'fol_cumulative_mode' is set to: {self.api_config.get('fol_cumulative_mode', 'current_only')}")
 
         # FOL pipeline / translation mode
         fol_preprocess = reward_cfg_fol.get("fol_preprocess", algo_cfg_fol.get("fol_preprocess", None))

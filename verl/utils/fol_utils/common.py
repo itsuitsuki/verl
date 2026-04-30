@@ -207,8 +207,9 @@ def _get_default_api_config() -> dict:
         "max_tokens": 1024,
         "top_p": 0.8,
         "api_context_shrink_min_tokens": 128,
-        "api_context_shrink_max_tokens": 512,
-        "api_context_shrink_retries": 3,
+        "api_context_shrink_max_tokens": 4096,
+        "api_context_shrink_max_output_tokens": 512,
+        "api_context_shrink_retries": 4,
         "api_context_shrink_initial_margin": 16,
         "api_context_shrink_margin_step": 64,
     }
@@ -413,6 +414,53 @@ def _accumulate_openai_usage(completion: Any, usage_info: Optional[dict[str, int
             continue
 
 
+_context_error_dump_lock = threading.Lock()
+
+
+def _dump_openai_context_error_prompt(
+    *,
+    call_id: int,
+    cfg: dict,
+    messages: list[dict[str, Any]],
+    context_error: tuple[int, int, int],
+    max_output_tokens: int,
+    estimated_tokens: int,
+    shrink_retries: int,
+    exc: BaseException,
+) -> None:
+    """Print the full offending OpenAI-compatible prompt for context overflows."""
+    if str(os.environ.get("FOL_CONTEXT_ERROR_DUMP_PROMPT", "1")).strip().lower() in {
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return
+
+    max_context, prompt_tokens, requested_output_tokens = context_error
+    with _context_error_dump_lock:
+        print("\n" + "=" * 32 + " FOL CONTEXT OVERFLOW PROMPT " + "=" * 32, file=sys.stderr, flush=True)
+        print(
+            (
+                f"call_id={call_id} model={cfg.get('model')} base_url={cfg.get('base_url')} "
+                f"max_context={max_context} prompt_tokens={prompt_tokens} "
+                f"requested_output_tokens={requested_output_tokens} current_max_tokens={max_output_tokens} "
+                f"estimated_tokens={estimated_tokens} shrink_retries={shrink_retries}"
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        print(f"error={str(exc)[:1000]}", file=sys.stderr, flush=True)
+        for idx, message in enumerate(messages):
+            role = message.get("role", f"message_{idx}")
+            content = _extract_message_text(message.get("content"))
+            print(f"\n--- {role.upper()} MESSAGE {idx} START ---", file=sys.stderr, flush=True)
+            print(content, file=sys.stderr, flush=True)
+            print(f"--- {role.upper()} MESSAGE {idx} END ---", file=sys.stderr, flush=True)
+        print("=" * 94 + "\n", file=sys.stderr, flush=True)
+
+
 def call_llm(
     user_prompt: str,
     *,
@@ -475,10 +523,12 @@ def call_llm(
     max_output_tokens = int(cfg.get("max_tokens", 1024))
     min_context_shrink_tokens = int(cfg.get("api_context_shrink_min_tokens", 128))
     max_context_shrink_tokens = int(cfg.get("api_context_shrink_max_tokens", 256))
+    max_context_shrink_output_tokens = int(cfg.get("api_context_shrink_max_output_tokens", 0) or 0)
     max_context_shrink_retries = int(cfg.get("api_context_shrink_retries", 1))
     context_shrink_initial_margin = int(cfg.get("api_context_shrink_initial_margin", 0))
     context_shrink_margin_step = int(cfg.get("api_context_shrink_margin_step", 0))
     context_shrink_retries = 0
+    dumped_context_error_prompt = False
     estimated_tokens = _estimate_openai_request_tokens(messages, max_output_tokens)
 
     attempt = 0
@@ -515,6 +565,11 @@ def call_llm(
                     + context_shrink_retries * context_shrink_margin_step,
                 )
                 available_output_tokens = raw_available_output_tokens - context_shrink_margin
+                if max_context_shrink_output_tokens > 0:
+                    available_output_tokens = min(
+                        available_output_tokens,
+                        max_context_shrink_output_tokens,
+                    )
                 shrink_tokens = requested_output_tokens - available_output_tokens
                 if (
                     available_output_tokens >= min_context_shrink_tokens
@@ -523,17 +578,30 @@ def call_llm(
                 ):
                     logger.warning(
                         "OpenAI request exceeded context by %d tokens; reducing max_tokens from %d to %d "
-                        "(raw_available=%d, safety_margin=%d)",
+                        "(raw_available=%d, safety_margin=%d, cap=%d)",
                         shrink_tokens,
                         max_output_tokens,
                         available_output_tokens,
                         raw_available_output_tokens,
                         context_shrink_margin,
+                        max_context_shrink_output_tokens,
                     )
                     max_output_tokens = available_output_tokens
                     estimated_tokens = _estimate_openai_request_tokens(messages, max_output_tokens)
                     context_shrink_retries += 1
                     continue
+            if context_error is not None and not dumped_context_error_prompt:
+                _dump_openai_context_error_prompt(
+                    call_id=call_id,
+                    cfg=cfg,
+                    messages=messages,
+                    context_error=context_error,
+                    max_output_tokens=max_output_tokens,
+                    estimated_tokens=estimated_tokens,
+                    shrink_retries=context_shrink_retries,
+                    exc=exc,
+                )
+                dumped_context_error_prompt = True
             if attempt >= max_retries or not _is_transient_openai_error(exc):
                 logger.error(
                     "Max retries exceeded at OpenAI SDK (model=%s, base_url=%s): %s",

@@ -11,7 +11,7 @@ Configurable via api_config keys:
   - max_tries: int (default 1), used by declaration/expression repair
   - old_max_tries: int (default 0), used by whole-code correction
   - timeout: float (default 30.0)
-  - cumulative: bool (default False)
+  - fol_cumulative_mode: "current_only" (default) | "step" | "dependency_graph"
 
 Exports:
   - check_step_format_fol
@@ -29,7 +29,7 @@ from hashlib import sha1
 # import threading
 # import time
 
-from verl.utils.fol_utils.common import check_step_format_fol, extract_fol_problem
+from verl.utils.fol_utils.common import check_step_format_fol, extract_fol_problem, parse_step_tags
 from verl.utils.fol_utils.engine import (
     FOLConfig,
     FOLEngine,
@@ -55,9 +55,26 @@ _fol_verify_cache_step_stats: OrderedDict[int, dict[str, int]] = OrderedDict()
 _fol_verify_cache_summary_registered = False
 
 
+def _normalize_cumulative_mode(mode: str | None) -> str:
+    """Normalize cumulative input construction mode."""
+    normalized = str(mode or "").strip().lower().replace("-", "_")
+    if not normalized:
+        return "current_only"
+    if normalized in {"current", "current_only", "none", "off", "false", "0"}:
+        return "current_only"
+    if normalized in {"step", "steps", "all", "all_previous", "all_ancestors"}:
+        return "step"
+    if normalized in {"dependency", "dependencies", "dependency_graph", "graph"}:
+        return "dependency_graph"
+    return "current_only"
+
+
 def _build_fol_config(api_config: dict | None = None) -> FOLConfig:
     """Construct a FOLConfig from reward API config."""
-    cfg = api_config or {}
+    cfg = dict(api_config or {})
+    cumulative_mode = _normalize_cumulative_mode(cfg.get("fol_cumulative_mode"))
+    cfg["fol_cumulative_mode"] = cumulative_mode
+    cfg["cumulative"] = cumulative_mode != "current_only"
 
     try:
         preprocess = PreprocessPipeline(cfg.get("fol_preprocess", "direct"))
@@ -75,7 +92,7 @@ def _build_fol_config(api_config: dict | None = None) -> FOLConfig:
         max_tries=int(cfg.get("max_tries", 1)),
         old_max_tries=int(cfg.get("old_max_tries", 0)),
         timeout=float(cfg.get("timeout", 30.0)),
-        cumulative=bool(cfg.get("cumulative", False)),
+        cumulative=cfg["cumulative"],
         api_config=cfg,
     )
 
@@ -94,6 +111,114 @@ def _has_student_premise_conclusion_duplicate(step_text: str) -> bool:
         return False
     premise_set = {item for item in premises if item}
     return any(conclusion in premise_set for conclusion in conclusions)
+
+
+def _deduplicate_text_items(items: list[str]) -> list[str]:
+    """Remove exact duplicate text items while preserving first-seen order."""
+    seen = set()
+    deduped = []
+    for item in items:
+        key = _normalize_step_text(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item.strip())
+    return deduped
+
+
+def _parse_cumulative_step_history(step_history: list[str]) -> list[dict[str, object]]:
+    """Parse step history into premise/conclusion records."""
+    parsed_steps = []
+    for step in step_history:
+        tags = parse_step_tags(step)
+        premises = [str(item).strip() for item in tags.get("premises", []) if str(item).strip()]
+        conclusion = str(tags.get("conclusion") or "").strip()
+        parsed_steps.append({"premises": premises, "conclusion": conclusion})
+    return parsed_steps
+
+
+def _dependency_ancestor_indices(parsed_steps: list[dict[str, object]], current_idx: int) -> set[int]:
+    """Find dependency ancestors using exact normalized premise-to-conclusion matches."""
+    conclusion_key_to_indices: dict[str, list[int]] = {}
+    edges: dict[int, set[int]] = {idx: set() for idx in range(len(parsed_steps))}
+
+    for idx, step in enumerate(parsed_steps):
+        for premise in step.get("premises", []):
+            premise_key = _normalize_step_text(str(premise))
+            if not premise_key:
+                continue
+            for parent_idx in conclusion_key_to_indices.get(premise_key, []):
+                edges[idx].add(parent_idx)
+
+        conclusion_key = _normalize_step_text(str(step.get("conclusion") or ""))
+        if conclusion_key:
+            conclusion_key_to_indices.setdefault(conclusion_key, []).append(idx)
+
+    ancestors = set()
+
+    def visit(idx: int) -> None:
+        for parent_idx in edges.get(idx, set()):
+            if parent_idx in ancestors:
+                continue
+            ancestors.add(parent_idx)
+            visit(parent_idx)
+
+    visit(current_idx)
+    return ancestors
+
+
+def _build_source_separated_cumulative_input(step_history: list[str], *, mode: str = "step") -> tuple[str, dict]:
+    """Build compact cumulative FOL input with explicit source separation."""
+    if not step_history:
+        return "", {}
+
+    parsed_steps = _parse_cumulative_step_history(step_history)
+    current_idx = len(parsed_steps) - 1
+    current_step = parsed_steps[current_idx]
+    current_conclusion = str(current_step.get("conclusion") or "").strip()
+    current_premises = _deduplicate_text_items([str(item) for item in current_step.get("premises", [])])
+    if not current_conclusion:
+        return "", {}
+
+    cumulative_mode = _normalize_cumulative_mode(mode)
+    if cumulative_mode == "dependency_graph":
+        previous_indices = sorted(
+            idx for idx in _dependency_ancestor_indices(parsed_steps, current_idx)
+            if idx < current_idx
+        )
+    else:
+        previous_indices = list(range(current_idx))
+
+    previous_conclusions = [
+        str(parsed_steps[idx].get("conclusion") or "").strip()
+        for idx in previous_indices
+        if str(parsed_steps[idx].get("conclusion") or "").strip()
+    ]
+    previous_conclusions = _deduplicate_text_items(previous_conclusions)
+
+    lines = ["Source-Separated Reasoning Input:", "<previous_conclusions>"]
+    for conclusion in previous_conclusions:
+        lines.append(f"<conclusion>{conclusion}</conclusion>")
+    lines.extend(["</previous_conclusions>", "", "<current_premises>"])
+    for premise in current_premises:
+        lines.append(f"<premise>{premise}</premise>")
+    lines.extend([
+        "</current_premises>",
+        "",
+        "<current_conclusion>",
+        f"<conclusion>{current_conclusion}</conclusion>",
+        "</current_conclusion>",
+    ])
+
+    stats = {
+        "cumulative_mode": cumulative_mode,
+        "previous_conclusions_before_dedup": max(0, len(step_history) - 1),
+        "previous_conclusions_selected": len(previous_conclusions),
+        "previous_conclusions_after_dedup": len(previous_conclusions),
+        "current_premises_before_dedup": len(current_step.get("premises", [])),
+        "current_premises_after_dedup": len(current_premises),
+    }
+    return "\n".join(lines), stats
 
 
 def prepare_fol_shared_state(
@@ -170,6 +295,7 @@ def _build_verify_cache_key(
         fol_config.old_max_tries,
         fol_config.timeout,
         fol_config.cumulative,
+        api_cfg.get("fol_cumulative_mode"),
         api_cfg.get("model"),
         api_cfg.get("base_url"),
         api_cfg.get("temperature"),
@@ -294,9 +420,21 @@ def compute_step_reward_fol(
         fol_config = shared_state["config"]
         engine = FOLEngine(fol_config)
 
-        # Handle cumulative mode
-        if fol_config.cumulative and step_history:
-            step_to_translate = "\n".join(step_history)
+        # Handle cumulative mode. Default is current_only; legacy cumulative=True
+        # maps to step mode inside _build_fol_config when no explicit mode is set.
+        cumulative_mode = _normalize_cumulative_mode(
+            (fol_config.api_config or {}).get("fol_cumulative_mode")
+        )
+        if cumulative_mode != "current_only" and step_history:
+            cumulative_input, cumulative_stats = _build_source_separated_cumulative_input(
+                step_history,
+                mode=cumulative_mode,
+            )
+            if cumulative_input:
+                step_to_translate = cumulative_input
+                debug_info.update(cumulative_stats)
+            else:
+                step_to_translate = step_text
         else:
             step_to_translate = step_text
         step_index = max(0, len(step_history) - 1)

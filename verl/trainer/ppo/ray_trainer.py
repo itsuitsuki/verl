@@ -1652,8 +1652,12 @@ class RayPPOTrainer:
                                     algo_cfg.get("fol_judge_use_outlines", False),
                                 )
                                 api_config["fol_judge_use_outlines"] = bool(fol_judge_use_outlines)
-                                cumulative = reward_cfg.get("fol_verify_with_cumulative_steps", algo_cfg.get("fol_verify_with_cumulative_steps", False))
-                                api_config["cumulative"] = bool(cumulative)
+                                fol_cumulative_mode = reward_cfg.get(
+                                    "fol_cumulative_mode",
+                                    algo_cfg.get("fol_cumulative_mode", None),
+                                )
+                                if fol_cumulative_mode is not None:
+                                    api_config["fol_cumulative_mode"] = str(fol_cumulative_mode)
                                 fol_format_failed_score = reward_cfg.get(
                                     "fol_format_failed_score",
                                     algo_cfg.get("fol_format_failed_score", None),

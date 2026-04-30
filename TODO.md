@@ -15,7 +15,9 @@ This note summarizes the current debugging state for the LogiQA2K 1.5B FOL rewar
 - FOL Tree-GAE deeper `(M,N,L,T)=(4,1,3,1)` did not solve the "multi-step and correct" target.
   - Step 50 val: acc `0.33487`, val num_steps `3.00`.
   - Step 100 val: acc `0.37174`, val num_steps `1.14`.
+  - Step 250 val: acc `0.31490`, val num_steps `1.00`.
   - It became short as training progressed and was much slower due to FOL judge load.
+  - The run was stopped after step 250/290-era evidence because it was worse than the shallow tree run and no longer represented multi-step search.
 - Short-tree collapse is not FOL-specific.
   - Old outcome tree quickly collapsed to `num_steps/mean ~= 2`.
   - Old self-eval tree also collapsed to `num_steps/mean ~= 2`.
@@ -34,7 +36,8 @@ This note summarizes the current debugging state for the LogiQA2K 1.5B FOL rewar
   - Completed at step 500. Best observed step was 450.
 - `train_fol_tree_gae_gpu4_judge56_deeper_v1.log`
   - FOL Tree-GAE deeper on GPU4 using judge56.
-  - Step 100 val is already available. Continue only if there is a reason to study late collapse; otherwise it is low priority.
+  - Stopped after observing short-tree collapse.
+  - Latest full val: step 250 acc `0.31490`, val num_steps `1.00`.
 
 ## Engineering Changes Already Made / Pending Commit
 
@@ -103,6 +106,9 @@ Stage 3: tree reruns after step baselines.
 - Only rerun Tree-GAE when the corresponding step-GDPO run is healthy.
 - For each promising actor/reward pair, compare shallow tree vs deeper tree.
 - Stop early if the tree collapses to one-step answer paths again without improving acc.
+- For future FOL tree attempts, do not repeat the stopped deeper `(4,1,3,1)` setup unchanged.
+  - It preserved theoretical 16 leaves but made the search effectively chain-like and still collapsed to direct boxed leaves.
+  - Prefer configurations with real branching, e.g. `rollout.n=4, tree_rounds=2, tree_top_n=2, tree_branches=2`, or `rollout.n=4, tree_rounds=1, tree_top_n=2, tree_branches=3`.
 
 - Let FOL step-GDPO v3 finish first.
   - It is the main candidate for "more steps and decent accuracy".
@@ -133,6 +139,17 @@ Stage 3: tree reruns after step baselines.
 - Consider a tree anti-collapse rule.
   - Penalize branches that immediately emit only boxed answer after one shallow step.
   - Keep this separate from FOL judge failure penalties.
+- Prefer outcome gating over a hard length penalty as the first tree anti-collapse change.
+  - Example: if `valid_step_count < 2`, set `outcome_reward_weight = 0` or heavily downweight it for that path.
+  - This prevents the model from getting full outcome credit for `one weak <step> + boxed`, while avoiding a blanket `-1` for all short but otherwise valid outputs.
+- Consider separating tree reasoning expansion from final answer generation.
+  - Tree expansion should search over reasoning steps.
+  - The final boxed answer can be generated or scored as a separate finalization stage.
+  - This would stop Tree-GAE from using forked nodes mainly as direct answer-letter probes.
+- Add lightweight nontrivial-step checks only if outcome gating is insufficient.
+  - A reasoning step should not simply restate the definition and jump to the answer.
+  - The conclusion should not be a bare option choice except in a designated final reasoning/finalization step.
+  - Avoid rewarding length alone; the goal is useful multi-step reasoning, not verbose traces.
 - Consider changing Tree-GAE weights.
   - Current FOL tree uses `[0.8, 0.2]`.
   - Higher FOL/process weight may preserve process, but only after FOL success/leakage rates are good enough.
@@ -157,7 +174,7 @@ Stage 3: tree reruns after step baselines.
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
 | FOL step-GDPO v3 | `train_fol_step_gdpo_gpu2_v3.log` | running | `0.38249` | 350 | `7.11` | `0.38249` latest known | Best current multi-step FOL run. |
 | FOL Tree-GAE shallow v3 | `train_fol_tree_gae_gpu3_judge56_v3.log` | done | `0.43318` | 450 | `1.00` | `0.37942` at step 500 | Highest FOL-tree acc but short-answer strategy. |
-| FOL Tree-GAE deeper v1 | `train_fol_tree_gae_gpu4_judge56_deeper_v1.log` | running | `0.37174` | 100 | `1.14` | `0.33641` at step 150 | Deeper tree still collapses short. |
+| FOL Tree-GAE deeper v1 | `train_fol_tree_gae_gpu4_judge56_deeper_v1.log` | stopped | `0.37174` | 100 | `1.14` | `0.31490` at step 250 | Worse than shallow; collapsed to val num_steps `1.00`. |
 | FOL step-GDPO old | `train_fol_step_gdpo_gpu2.log` | done | `0.39017` | 350 | `5.45` | `0.35791` at step 500 | Old aux FOL reward metric scale is buggy; compare acc/steps only. |
 | FOL step-GDPO v2 | `train_fol_step_gdpo_gpu2_v2.log` | failed/stopped | `0.34869` | 100 | `3.97` | `0.34869` at step 100 | Hit fatal errors later. |
 | FOL step-GDPO v2.1 | `train_fol_step_gdpo_gpu2_v2_1.log` | stopped | `0.34562` | 150 | `2.45` | `0.34562` at step 150 | Shorter than v3. |

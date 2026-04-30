@@ -3,7 +3,7 @@
 Input Data:
     1. Context & Question: The background information and the target problem.
     2. Z3 Declarations: The predefined Sorts, Functions, and Predicates.
-    3. Reasoning Steps: A sequence of <step> blocks containing <premise> and <conclusion> in natural language.
+    3. Reasoning Input: Either a sequence of <step> blocks, or a source-separated input with <previous_conclusions>, <current_premises>, and <current_conclusion>.
 Translation Rules (Strict Compliance Required):
     IMPORTANT: You are a faithful translator, not a proof constructor. Do not add facts merely to make the conclusion provable. Translate source text into symbolic form and keep each premise source separated.
     1. Strict Symbolic Mapping:
@@ -15,9 +15,9 @@ Translation Rules (Strict Compliance Required):
         • Function arguments must use values of the declared argument sorts. For example, if AdExpenditure has signature Brand -> RealSort(), do not call it with a Product or Option variable.
     2. Source Separation Rule:
         • background_axioms: definitions, general rules, and common knowledge that are explicitly stated or strongly implied by the Context, Question, or Options. Do not put the current conclusion here.
-        • previous_conclusions: faithful symbolic restatements of conclusions from earlier <step> blocks only. Do not include the current step's conclusion here.
-        • current_premises: faithful symbolic translations of only the text inside the current step's <premise> tags. Do not add any statement inferred from the current <conclusion>.
-        • conclusion: faithful symbolic translation of only the current step's <conclusion> tag.
+        • previous_conclusions: faithful symbolic restatements of conclusions from earlier <step> blocks or from the <previous_conclusions> section only. Do not include the current step's conclusion here.
+        • current_premises: faithful symbolic translations of only the text inside the current step's <premise> tags or the <current_premises> section. Do not add any statement inferred from the current <conclusion>.
+        • conclusion: faithful symbolic translation of only the current step's <conclusion> tag or the <current_conclusion> section.
         • DO NOT refer to previous steps using variable names like conclusion_n or step_n. Restate previous conclusions in full symbolic form under previous_conclusions.
     3. Anti-Leakage Rule:
         • The conclusion expression must not appear verbatim in background_axioms, previous_conclusions, or current_premises.
