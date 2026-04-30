@@ -72,7 +72,7 @@ export OPENAI_API_KEY="EMPTY"
 export OPENAI_BASE_URL="http://127.0.0.1:${FOL_PORT}/v1"
 
 # ── Step-GDPO training (same GPU) ──
-# +algorithm.fol_verify_with_cumulative_steps=true to enable step history on FOL evaluation
+# +algorithm.fol_cumulative_mode=step or dependency_graph to enable cumulative FOL evaluation
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_gdpo \
     +algorithm.step_reward_type=fol \

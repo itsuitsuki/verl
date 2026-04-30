@@ -738,6 +738,7 @@ class AgentLoopWorker:
             input_ids=input_ids,
             position_ids=position_ids,
             kwargs=kwargs,
+            validate=validate,
         )
         reward_elapsed = time.perf_counter() - reward_start
         output.metrics.reward_compute += reward_elapsed
@@ -864,7 +865,9 @@ class AgentLoopWorker:
         position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
         return position_ids
 
-    async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
+    async def _compute_score(
+        self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs, validate
+    ):
         """Compute reward score for single sample."""
         enable_async_reward = self.reward_loop_worker_handles is not None
 
@@ -881,6 +884,7 @@ class AgentLoopWorker:
             )
             non_tensor_batch = {
                 **{k: np.array([v]) for k, v in kwargs.items()},
+                "__validate__": np.array([validate]),
                 "__num_turns__": np.array([output.num_turns]),
                 "tool_extra_fields": np.array([output.extra_fields], dtype=object),
             }

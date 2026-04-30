@@ -55,6 +55,16 @@ def _compute_step_reward_random(step_text: str, prompt_text: str, step_history: 
     return float(random.randint(0, 1))
 
 
+def _as_bool(value) -> bool:
+    if hasattr(value, "item"):
+        value = value.item()
+    elif isinstance(value, (list, tuple)) and len(value) == 1:
+        value = value[0]
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 @register("tree")
 class TreeRewardManager(RewardManagerBase):
     """Tree Reward Manager for TreeRL.
@@ -141,6 +151,9 @@ class TreeRewardManager(RewardManagerBase):
         )
         if fol_format_failed_score is not None:
             self.api_config["fol_format_failed_score"] = float(fol_format_failed_score)
+        self.validate_with_step_reward = _as_bool(
+            reward_cfg_fol.get("validate_with_step_reward", algo_cfg_fol.get("validate_with_step_reward", True))
+        )
 
         # Step reward type: explicit parameter > reward config > algorithm config > None
         if step_reward_type is not None:
@@ -264,6 +277,7 @@ class TreeRewardManager(RewardManagerBase):
             "num_steps": 0,
             "process_reward_penalized": False,
             "penalty_reason": "",
+            "validation_skipped_step_reward": False,
         }
         for reward_type in self.step_reward_types:
             reward_extra_info[f"{reward_type}_step_reward"] = []
@@ -342,6 +356,10 @@ class TreeRewardManager(RewardManagerBase):
         reward_extra_info = self._init_reward_extra_info(score)
         if isinstance(result, dict):
             reward_extra_info.update(result)
+
+        if _as_bool(data_item.non_tensor_batch.get("__validate__", False)) and not self.validate_with_step_reward:
+            reward_extra_info["validation_skipped_step_reward"] = True
+            return {"reward_score": score, "reward_extra_info": reward_extra_info}
 
         # 2. Compute step-level process rewards (external PRM)
         if self.step_reward_types:

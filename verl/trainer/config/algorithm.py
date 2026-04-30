@@ -671,3 +671,7 @@ class AlgoConfig(BaseConfig):
     # When enabled, FOL translation requests ask the judge model for JSON output via
     # response_format=json_object, which activates vLLM's structured outputs backend.
     fol_judge_use_outlines: bool = True
+    # Validation normally uses the configured reward manager, including step-level
+    # process rewards such as FOL/self-eval. Disable this to run answer-only
+    # validation while keeping training rewards unchanged.
+    validate_with_step_reward: bool = True

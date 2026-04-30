@@ -67,7 +67,7 @@ fi
 # Uses structured preprocessing (rephrase + object/predicate extraction) and
 # assertion translation mode (prompt negates conclusion).
 # EPTree params: (M=4, N=1, L=1, T=3) -> 16 leaf paths per prompt
-# +algorithm.fol_verify_with_cumulative_steps=true to enable step history on FOL evaluation
+# +algorithm.fol_cumulative_mode=step or dependency_graph to enable cumulative FOL evaluation
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=tree_gae \
     +algorithm.step_reward_type=fol \

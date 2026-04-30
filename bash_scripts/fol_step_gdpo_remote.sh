@@ -81,7 +81,7 @@ fi
 #   reward_model.reward_manager: dapo -> step
 #   新增: step_reward_type, step_reward_weights (在 algorithm 里)
 #   删除: overlong_buffer_cfg (DAPO特有)
-# +algorithm.fol_verify_with_cumulative_steps=true to enable step history on FOL evaluation
+# +algorithm.fol_cumulative_mode=step or dependency_graph to enable cumulative FOL evaluation
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_gdpo \
     +algorithm.step_reward_type=fol \

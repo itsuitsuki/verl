@@ -75,7 +75,7 @@ export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
 export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}"
 
 # ── Step-GDPO training on GPU 0 ──
-# +algorithm.fol_verify_with_cumulative_steps=true to enable step history on FOL evaluation
+# +algorithm.fol_cumulative_mode=step or dependency_graph to enable cumulative FOL evaluation
 CUDA_VISIBLE_DEVICES=0 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_gdpo \
     +algorithm.step_reward_type=fol \
