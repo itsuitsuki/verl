@@ -4,6 +4,15 @@ This note summarizes the current debugging state for the LogiQA2K 1.5B FOL rewar
 
 ## Current Findings
 
+- Latest FOL judge overflow finding, 2026-04-30:
+  - Full LogiQA Step-GDPO FOL run with short response cap still crashed around step 9 because a declaration-repair judge call exceeded the 8192-token judge context.
+  - The offending request was not the actor prompt. It was the FOL declaration repair path: long declaration system prompt + repeated bad declaration JSON + many duplicate-identifier validation errors.
+  - The immediate code fix is in `verl/utils/fol_utils/engine.py`:
+    - compact duplicate declaration payloads before repair;
+    - locally accept the compacted payload if it already renders as valid Z3 declarations;
+    - cap declaration repair validation errors;
+    - use compact JSON and a short repair-specific system prompt instead of the full declaration prompt.
+  - This should reduce fatal context-overflow risk even when the judge is not restarted with a larger max context.
 - FOL step-GDPO v3 is the most plausible "multi-step and reasonably correct" run so far.
   - Best observed val: step 350, acc `0.38249`, val num_steps `7.11`.
   - It keeps multi-step generations, unlike tree runs.
@@ -28,6 +37,19 @@ This note summarizes the current debugging state for the LogiQA2K 1.5B FOL rewar
 
 ## Current Runs To Watch
 
+- Next FOL full-data restart should use short names:
+  - Log: `train_fol_step_gdpo_gpu2_v4.log`
+  - Experiment: `qwen1.5b_step_gdpo_fol_gpu2_v4`
+  - Judge endpoint: load balancer `http://127.0.0.1:4874/v1`
+  - Keep `+algorithm.fol_cumulative_mode=current_only` and `+algorithm.validate_with_step_reward=false`.
+  - Prefer high judge parallelism only after confirming the declaration repair overflow fix is in place:
+    - `REWARD_NUM_WORKERS=128`
+    - `STEP_REWARD_MAX_WORKERS=64`
+    - `FOL_OPENAI_MAX_INFLIGHT=512`
+  - If judge max context is still 8192, also pass:
+    - `+reward.api_config.api_context_shrink_min_tokens=16`
+    - `+reward.api_config.api_context_shrink_retries=6`
+  - If both judge services are restarted with max context 12288, the shrink overrides are still harmless but should be less frequently used.
 - `train_fol_step_gdpo_gpu2_v3.log`
   - Step-GDPO FOL v3 on GPU2 using judge01.
   - Watch step 350/400/450/500 val acc and val num_steps.

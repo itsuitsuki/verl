@@ -396,6 +396,148 @@ def _render_validated_declarations_from_schema(payload: Optional[dict]) -> tuple
     return declarations, []
 
 
+def _compact_declaration_payload_for_repair(payload: Optional[dict]) -> dict:
+    """Remove obvious duplicate declaration entries before asking the judge to repair.
+
+    Structured declaration failures are often caused by repeated JSON fragments.
+    Sending those repeats plus every duplicate-name error back to the judge can
+    make the repair prompt larger than the judge context. This pass is purely
+    syntactic: it keeps the first declaration for a name, removes redundant
+    option constants already emitted by an EnumSort, and preserves unresolved
+    unknown-sort issues for the repair model when needed.
+    """
+    if not isinstance(payload, dict):
+        return {"sorts": [], "variables": [], "constants": [], "functions": []}
+
+    raw_sorts = payload.get("sorts", [])
+    raw_variables = payload.get("variables", [])
+    raw_constants = payload.get("constants", [])
+    raw_functions = payload.get("functions", [])
+
+    sort_by_name: dict[str, dict[str, object]] = {}
+    sort_order: list[str] = []
+    if isinstance(raw_sorts, list):
+        for item in raw_sorts:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not _is_valid_python_identifier(name):
+                continue
+            enum_values = item.get("enum_values", [])
+            clean_values: list[str] = []
+            if isinstance(enum_values, list):
+                seen_values: set[str] = set()
+                for value in enum_values:
+                    if _is_valid_python_identifier(value) and value not in seen_values:
+                        clean_values.append(str(value))
+                        seen_values.add(str(value))
+            if str(name) not in sort_by_name:
+                sort_by_name[str(name)] = {"name": str(name), "enum_values": clean_values}
+                sort_order.append(str(name))
+            else:
+                existing_values = sort_by_name[str(name)].setdefault("enum_values", [])
+                if isinstance(existing_values, list):
+                    existing_set = set(existing_values)
+                    for value in clean_values:
+                        if value not in existing_set:
+                            existing_values.append(value)
+                            existing_set.add(value)
+
+    # If multiple enum sorts emit the same Python identifier, keep each enum
+    # literal in one owner sort. Option owns option_a/b/c/d when present.
+    enum_owner: dict[str, str] = {}
+    for sort_name in sort_order:
+        values = sort_by_name[sort_name].get("enum_values", [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if value not in enum_owner or sort_name == "Option":
+                enum_owner[value] = sort_name
+    for sort_name in sort_order:
+        values = sort_by_name[sort_name].get("enum_values", [])
+        if isinstance(values, list):
+            sort_by_name[sort_name]["enum_values"] = [
+                value for value in values if enum_owner.get(value) == sort_name
+            ]
+
+    compact: dict[str, list[dict[str, object]]] = {
+        "sorts": [sort_by_name[name] for name in sort_order],
+        "variables": [],
+        "constants": [],
+        "functions": [],
+    }
+
+    emitted_names = set(sort_order)
+    for sort_item in compact["sorts"]:
+        values = sort_item.get("enum_values", [])
+        if isinstance(values, list):
+            emitted_names.update(value for value in values if isinstance(value, str))
+
+    def add_named_sort_items(field_name: str, raw_items: object) -> None:
+        if not isinstance(raw_items, list):
+            return
+        seen: set[str] = set()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            sort = item.get("sort")
+            if not _is_valid_python_identifier(name) or not isinstance(sort, str):
+                continue
+            if name in seen or name in emitted_names:
+                continue
+            seen.add(str(name))
+            emitted_names.add(str(name))
+            compact[field_name].append({"name": str(name), "sort": sort})
+
+    add_named_sort_items("variables", raw_variables)
+    add_named_sort_items("constants", raw_constants)
+
+    if isinstance(raw_functions, list):
+        seen_functions: set[str] = set()
+        for item in raw_functions:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            arg_sorts = item.get("arg_sorts")
+            return_sort = item.get("return_sort")
+            if (
+                not _is_valid_python_identifier(name)
+                or name in seen_functions
+                or name in emitted_names
+                or not isinstance(arg_sorts, list)
+                or not all(isinstance(sort, str) for sort in arg_sorts)
+                or not isinstance(return_sort, str)
+            ):
+                continue
+            seen_functions.add(str(name))
+            emitted_names.add(str(name))
+            compact["functions"].append({
+                "name": str(name),
+                "arg_sorts": list(arg_sorts),
+                "return_sort": return_sort,
+            })
+
+    return compact
+
+
+def _summarize_declaration_errors_for_repair(
+    errors: list[dict[str, object]],
+    *,
+    max_errors: int,
+) -> list[dict[str, object]]:
+    """Cap repeated declaration validation errors before LLM repair."""
+    if max_errors <= 0 or len(errors) <= max_errors:
+        return errors
+    kept = errors[:max_errors]
+    kept.append({
+        "field": "$",
+        "error": "validation errors truncated",
+        "omitted": len(errors) - max_errors,
+    })
+    return kept
+
+
 def _repair_declaration_payload(
     payload: Optional[dict],
     errors: list[dict[str, object]],
@@ -409,29 +551,33 @@ def _repair_declaration_payload(
     if max_tries <= 0:
         return payload
 
-    current = payload if isinstance(payload, dict) else {
-        "sorts": [],
-        "variables": [],
-        "constants": [],
-        "functions": [],
-    }
+    current = _compact_declaration_payload_for_repair(payload)
+    declarations, compact_errors = _render_validated_declarations_from_schema(current)
+    if declarations and not compact_errors:
+        return current
+    errors = compact_errors or errors
+    max_errors = max(1, int(cfg.get("declaration_repair_max_errors", 40) or 40))
     repair_prompt_base = (
         "Repair this Z3 declaration JSON object so it follows the provided schema and renders as valid Z3-Python declarations.\n"
         "Do not output Python code. Do not add solver.add, axioms, facts, premises, conclusions, or background knowledge.\n"
         "Only repair identifiers, duplicate names, missing/unknown sort references, and return_sort spellings.\n"
         "Use return_sort values like BoolSort(), IntSort(), RealSort(), or a declared custom sort name.\n\n"
     )
+    repair_system_prompt = (
+        "You repair compact JSON declarations for Z3-Python. Output only the repaired JSON object."
+    )
     for attempt in range(max_tries):
         cfg["temperature"] = float(cfg.get("temperature", 0.2)) + 0.05 * (attempt + 1)
+        repair_errors = _summarize_declaration_errors_for_repair(errors, max_errors=max_errors)
         prompt = (
             repair_prompt_base +
-            f"Declaration JSON object:\n{json.dumps(current, ensure_ascii=False, indent=2)}\n\n"
-            f"Validation errors:\n{json.dumps(errors, ensure_ascii=False, indent=2)}"
+            f"Declaration JSON object:\n{json.dumps(current, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            f"Validation errors:\n{json.dumps(repair_errors, ensure_ascii=False, separators=(',', ':'))}"
         )
         repaired = call_llm_structured(
             prompt,
             api_config=cfg,
-            system_prompt=system_prompt,
+            system_prompt=repair_system_prompt,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -440,6 +586,7 @@ def _repair_declaration_payload(
                 },
             },
         )
+        repaired = _compact_declaration_payload_for_repair(repaired)
         declarations, repaired_errors = _render_validated_declarations_from_schema(repaired)
         if declarations and not repaired_errors:
             return repaired
