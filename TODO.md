@@ -4,6 +4,64 @@ This note summarizes the current debugging state for the LogiQA2K 1.5B FOL rewar
 
 ## Current Findings
 
+- Latest active-run snapshot, 2026-04-30 17:36 UTC:
+  - `train_fol_step_gdpo_gpu2_v4_2.log`
+    - Experiment: `qwen1.5b_step_gdpo_fol_gpu2_v4`
+    - GPU2, judge load balancer `http://127.0.0.1:4874/v1`
+    - Progress `89/1844`, ETA about `20:38:14`, roughly `42.33s/it`.
+    - Latest/best val acc so far: `0.33487` at step 50.
+    - Latest train score: `0.53125`; recent-10 mean about `0.325`.
+    - Bottleneck: `gen ~= 20.15s`, `update_actor ~= 12.73s`, FOL reward compute mean/max `8.21/18.21s`.
+    - FOL judge pressure is still high: total tokens mean/max `6011/14979`; invalid translation rate about `8.46%`.
+  - `train_fol_tree_gae_gpu3_v4.log`
+    - Experiment: `qwen1.5b_tree_gae_fol_gpu3_v4`
+    - GPU3, judge load balancer `http://127.0.0.1:4874/v1`
+    - Progress `43/1844`, ETA about `22:10:27`, roughly `44.32s/it`.
+    - Initial val acc: `0.27496`.
+    - Latest train score: `0.28125`; recent-10 mean about `0.14375`.
+    - Bottleneck: `tree_expansion ~= 20.65s`, mostly `tree/ext_prm_eval ~= 20.57s`, plus `update_actor ~= 13.81s`.
+    - Latest printed tree finish reason was `{'stop': 60}`; no obvious length/repetition explosion in that sample.
+  - `train_self_eval_step_gdpo_gpu4_v1.log`
+    - Experiment: `qwen1.5b_step_gdpo_self_eval_gpu4_v1`
+    - GPU4, self-eval endpoint `http://127.0.0.1:8199/v1`
+    - Progress `3/1844`, ETA about `17:05:39`, roughly `33.43s/it`.
+    - Initial val acc: `0.29186`.
+    - Latest train score: `0.28125`; early recent mean about `0.3229`.
+    - Bottleneck: `gen ~= 12.03s`, `update_actor ~= 12.72s`, reward compute mean/max `2.63/7.85s`.
+- Latest judge-server finding, 2026-04-30:
+  - Both 35B judge services now run with prefix caching enabled:
+    - `4872`: GPU0/1, `--max-model-len 12288 --gpu-memory-utilization 0.95 --max-num-seqs 256 --enable-prefix-caching --max-cudagraph-capture-size 256`
+    - `4873`: GPU5/6, same settings.
+  - Load balancer `4874` is alive and balancing both backends.
+  - Latest LB snapshot: `4872` had `9455` requests and `2` transient disconnect failures; `4873` had `9570` requests and `0` failures.
+  - vLLM logs show recent `200 OK` traffic and prefix cache hit rate around `80%`; the two `4872` failures look like transient connection drops, not OOM or a dead judge.
+  - This server-side prefix-cache fix is the main reason FOL became much faster than the earlier 60h+ ETA runs. Keep it in every future FOL judge launch.
+- Latest completed / external baseline results:
+  - DAPO outcome-only, `train_dapo_outcome_only_logiqa_full_prompt1_gpu4_v1.log`
+    - Completed `1844/1844`.
+    - Final val acc `0.39017` at step 1844.
+    - Best val acc `0.45315` at step 750.
+  - A800 format Step-GDPO, `train_format_step_gdpo_a800_gpu0_v1.log`
+    - Last synced progress `913/1844`.
+    - Latest val acc `0.44086` at step 900.
+    - Best val acc `0.44700` at step 600.
+  - A800 format Tree-GAE, `train_format_tree_gae_a800_gpu1_v1.log`
+    - Last synced progress `1320/1844`.
+    - Latest val acc `0.30261` at step 1300.
+    - Best val acc `0.40399` at step 550.
+  - A800 outcome-only Tree-GAE, `train_outcome_tree_gae_a800_gpu2_v1.log`
+    - Last synced progress `1331/1844`.
+    - Latest val acc `0.30876` at step 1300.
+    - Best val acc `0.39939` at step 400.
+- Latest FOL speed / format finding, 2026-04-30:
+  - Current full-data FOL Step-GDPO v4 prints boxed-only samples such as `\boxed{{B}}`.
+  - In XML mode, the shared splitter previously fell back to delimiter splitting when no `<step>` tags existed, so a boxed-only response became one fake step and still triggered expensive FOL declaration + translation judge calls.
+  - A real printed sample recheck showed this failure mode can spend roughly `25.8s` in declaration/preprocess plus `12.4s` in verify/translation before returning `0.0`.
+  - Current working-tree fix:
+    - Step-GDPO and Tree-GAE now treat FOL/FOL-old runs with `use_xml_steps=true`, `penalty_on_bad_format=true`, and zero `<step>` tags as `bad_format(no_xml_step)`;
+    - they assign `penalty_score` at the final valid response token;
+    - they skip all external PRM / FOL judge calls for that response.
+  - This is controlled by the existing `penalty_on_bad_format` and `penalty_score` config, not hardcoded.
 - Latest FOL judge overflow finding, 2026-04-30:
   - Full LogiQA Step-GDPO FOL run with short response cap still crashed around step 9 because a declaration-repair judge call exceeded the 8192-token judge context.
   - The offending request was not the actor prompt. It was the FOL declaration repair path: long declaration system prompt + repeated bad declaration JSON + many duplicate-identifier validation errors.
@@ -37,32 +95,38 @@ This note summarizes the current debugging state for the LogiQA2K 1.5B FOL rewar
 
 ## Current Runs To Watch
 
-- Next FOL full-data restart should use short names:
-  - Log: `train_fol_step_gdpo_gpu2_v4.log`
+- Current FOL Step-GDPO v4:
+  - Log: `train_fol_step_gdpo_gpu2_v4_2.log`
   - Experiment: `qwen1.5b_step_gdpo_fol_gpu2_v4`
   - Judge endpoint: load balancer `http://127.0.0.1:4874/v1`
+  - GPU: `CUDA_VISIBLE_DEVICES=2`
   - Keep `+algorithm.fol_cumulative_mode=current_only` and `+algorithm.validate_with_step_reward=false`.
-  - Prefer high judge parallelism only after confirming the declaration repair overflow fix is in place:
-    - `REWARD_NUM_WORKERS=128`
-    - `STEP_REWARD_MAX_WORKERS=64`
-    - `FOL_OPENAI_MAX_INFLIGHT=512`
-  - If judge max context is still 8192, also pass:
-    - `+reward.api_config.api_context_shrink_min_tokens=16`
-    - `+reward.api_config.api_context_shrink_retries=6`
-  - If both judge services are restarted with max context 12288, the shrink overrides are still harmless but should be less frequently used.
-- `train_fol_step_gdpo_gpu2_v3.log`
-  - Step-GDPO FOL v3 on GPU2 using judge01.
-  - Watch step 350/400/450/500 val acc and val num_steps.
-- `train_fol_tree_gae_gpu3_judge56_v3.log`
-  - FOL Tree-GAE shallow v3 on GPU3 using judge56.
-  - Completed at step 500. Best observed step was 450.
-- `train_fol_tree_gae_gpu4_judge56_deeper_v1.log`
-  - FOL Tree-GAE deeper on GPU4 using judge56.
-  - Stopped after observing short-tree collapse.
-  - Latest full val: step 250 acc `0.31490`, val num_steps `1.00`.
+  - Current env: `REWARD_NUM_WORKERS=128`, `STEP_REWARD_MAX_WORKERS=32`, `FOL_OPENAI_MAX_INFLIGHT=512`.
+  - Watch step 100/150/200 val acc, val num_steps, invalid translation rate, FOL token max, and whether no-step responses skip judge as expected.
+- Current FOL Tree-GAE v4:
+  - Log: `train_fol_tree_gae_gpu3_v4.log`
+  - Experiment: `qwen1.5b_tree_gae_fol_gpu3_v4`
+  - Judge endpoint: load balancer `http://127.0.0.1:4874/v1`
+  - GPU: `CUDA_VISIBLE_DEVICES=3`
+  - Keep `+algorithm.fol_cumulative_mode=current_only`, `+algorithm.validate_with_step_reward=false`, `+trainer.tree_defer_initial_ext_prm=true`, and `+trainer.tree_overlap_ext_prm=true`.
+  - Current env: `REWARD_NUM_WORKERS=64`, `STEP_REWARD_MAX_WORKERS=32`, `FOL_OPENAI_MAX_INFLIGHT=512`.
+  - Watch step 50/100 val acc, tree path length, leaf finish reasons, and whether it collapses to one-step direct answers.
+- Current self-eval Step-GDPO:
+  - Log: `train_self_eval_step_gdpo_gpu4_v1.log`
+  - Experiment: `qwen1.5b_step_gdpo_self_eval_gpu4_v1`
+  - GPU: `CUDA_VISIBLE_DEVICES=4`
+  - Endpoint: `http://127.0.0.1:8199/v1`
+  - Watch step 50/100 val acc and val num_steps. This is a cheap comparison point against FOL Step-GDPO.
 
 ## Engineering Changes Already Made / Pending Commit
 
+- `verl/experimental/reward_loop/reward_manager/step.py`
+  - No-XML-step hard penalty for FOL/FOL-old XML step rewards when bad-format penalty is enabled.
+  - Skips response-level FOL declaration when every step would fail before reaching the judge.
+- `verl/experimental/reward_loop/reward_manager/tree.py`
+  - Same no-XML-step hard penalty for Tree-GAE FOL/FOL-old external PRMs.
+- `scripts/benchmark_judge_latency.py`
+  - Lightweight OpenAI-compatible judge latency benchmark for direct endpoint / load-balancer checks.
 - `verl/utils/tree_structure.py`
   - Path-level TreeManager penalties for truncated / repeated / multi-boxed / bad-format branch paths are now consumed only when `prm_name == "fol"`.
   - This prevents FOL-specific fail-closed penalties from contaminating `format` or `self_eval` external PRM runs.
@@ -178,6 +242,23 @@ Stage 3: tree reruns after step baselines.
 
 ## FOL Judge / Pipeline Ideas
 
+- Immediate FOL speed TODO:
+  1. Run a short smoke test after the no-step penalty change and confirm boxed-only outputs produce `bad_format(no_xml_step)` with one `penalty_score` at the final response token and zero FOL judge usage.
+  2. Add a temporary one-batch dump option for FOL runs to save all 64 generated responses, step positions, FOL debug, and per-sample reward timing. Current console logs print only one sample per step.
+  3. Add declaration/preprocess judge usage and timing metrics. Current `fol_judge/calls` mostly reflects verify/translation calls and undercounts true judge pressure.
+  4. Done in working tree: add cross-process declaration/preprocess cache keyed by prompt + FOL config.
+     - Successful declarations are cached under `/tmp/verl_fol_shared_preprocess_cache` by default.
+     - `FOL_SHARED_PREPROCESS_DISK_CACHE=0` disables it.
+     - `FOL_SHARED_PREPROCESS_DISK_CACHE_DIR=/path/to/cache` changes the cache directory.
+     - `FOL_SHARED_PREPROCESS_DISK_CACHE_VERSION=...` can be bumped to invalidate old cache entries after prompt/pipeline changes.
+     - A 64-record / 4-prompt / 16-process smoke test reduced actual fake preprocess calls to 4.
+  5. Done in working tree: add cross-process exact verify reward cache.
+     - Exact verify rewards are cached under `/tmp/verl_fol_verify_cache` by default.
+     - `FOL_VERIFY_DISK_CACHE=0` disables it.
+     - `FOL_VERIFY_DISK_CACHE_DIR=/path/to/cache` changes the cache directory.
+     - `FOL_VERIFY_DISK_CACHE_VERSION=...` can be bumped to invalidate old cache entries after prompt/pipeline changes.
+     - A 64-record / 4-exact-key / 16-process smoke test reduced actual fake `verify_step` calls to 4, with 60 disk-cache hits.
+  6. Recheck whether `+reward.api_config.max_tokens=512` or `768` is safe for FOL judge quality after no-step waste is removed.
 - Continue reducing invalid FOL translation.
   - v3 improved over v2/v2.1 substantially.
   - Remaining failure modes include unknown identifiers, sort mismatch, declaration failures, leakage, and Z3 runtime errors.

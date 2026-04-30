@@ -36,14 +36,16 @@ class Backend:
     requests: int = 0
     failures: int = 0
     last_error: str = ""
+    disabled_until: float = 0.0
 
 
 class OpenAILoadBalancer:
-    def __init__(self, backends: Iterable[str], timeout_s: float):
+    def __init__(self, backends: Iterable[str], timeout_s: float, failure_cooldown_s: float):
         self.backends = [Backend(url.rstrip("/")) for url in backends]
         if not self.backends:
             raise ValueError("at least one backend is required")
         self.timeout = aiohttp.ClientTimeout(total=timeout_s)
+        self.failure_cooldown_s = failure_cooldown_s
         self._counter = itertools.count()
         self._lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
@@ -58,10 +60,24 @@ class OpenAILoadBalancer:
         if self._session is not None:
             await self._session.close()
 
-    async def choose_backend(self) -> Backend:
+    async def choose_backend(self, tried: set[str] | None = None) -> Backend | None:
+        tried = tried or set()
+        now = time.time()
         async with self._lock:
             offset = next(self._counter)
-            indexed = list(enumerate(self.backends))
+            indexed = [
+                (idx, backend)
+                for idx, backend in enumerate(self.backends)
+                if backend.url not in tried and backend.disabled_until <= now
+            ]
+            if not indexed:
+                indexed = [
+                    (idx, backend)
+                    for idx, backend in enumerate(self.backends)
+                    if backend.url not in tried
+                ]
+            if not indexed:
+                return None
             indexed.sort(key=lambda x: (x[1].inflight, (x[0] - offset) % len(self.backends)))
             backend = indexed[0][1]
             backend.inflight += 1
@@ -74,6 +90,8 @@ class OpenAILoadBalancer:
             if error is not None:
                 backend.failures += 1
                 backend.last_error = repr(error)
+                if self.failure_cooldown_s > 0:
+                    backend.disabled_until = time.time() + self.failure_cooldown_s
 
     def stats(self) -> dict:
         return {
@@ -85,6 +103,7 @@ class OpenAILoadBalancer:
                     "requests": b.requests,
                     "failures": b.failures,
                     "last_error": b.last_error,
+                    "disabled_for_s": max(0.0, round(b.disabled_until - time.time(), 3)),
                 }
                 for b in self.backends
             ],
@@ -102,37 +121,44 @@ async def stats_handler(request: web.Request) -> web.Response:
 
 async def proxy_handler(request: web.Request) -> web.Response:
     lb: OpenAILoadBalancer = request.app["lb"]
-    backend = await lb.choose_backend()
-    error: Exception | None = None
-    try:
-        body = await request.read()
-        target = f"{backend.url}{request.rel_url}"
-        session = await lb.session()
-        async with session.request(
-            request.method,
-            target,
-            data=body,
-            headers=filtered_headers(request.headers),
-            allow_redirects=False,
-        ) as resp:
-            payload = await resp.read()
-            headers = filtered_headers(resp.headers)
-            headers["x-openai-lb-backend"] = backend.url
-            return web.Response(status=resp.status, body=payload, headers=headers)
-    except Exception as exc:  # noqa: BLE001 - proxy should report backend failures as 502.
-        error = exc
-        return web.json_response(
-            {
-                "error": {
-                    "message": f"backend request failed: {exc!r}",
-                    "type": "backend_error",
-                    "backend": backend.url,
-                }
-            },
-            status=502,
-        )
-    finally:
-        await lb.release_backend(backend, error)
+    body = await request.read()
+    tried: set[str] = set()
+    last_error: Exception | None = None
+    while len(tried) < len(lb.backends):
+        backend = await lb.choose_backend(tried)
+        if backend is None:
+            break
+        tried.add(backend.url)
+        error: Exception | None = None
+        try:
+            target = f"{backend.url}{request.rel_url}"
+            session = await lb.session()
+            async with session.request(
+                request.method,
+                target,
+                data=body,
+                headers=filtered_headers(request.headers),
+                allow_redirects=False,
+            ) as resp:
+                payload = await resp.read()
+                headers = filtered_headers(resp.headers)
+                headers["x-openai-lb-backend"] = backend.url
+                return web.Response(status=resp.status, body=payload, headers=headers)
+        except Exception as exc:  # noqa: BLE001 - retry another backend on transport failures.
+            error = exc
+            last_error = exc
+        finally:
+            await lb.release_backend(backend, error)
+    return web.json_response(
+        {
+            "error": {
+                "message": f"all backend requests failed: {last_error!r}",
+                "type": "backend_error",
+                "tried": sorted(tried),
+            }
+        },
+        status=502,
+    )
 
 
 async def on_cleanup(app: web.Application) -> None:
@@ -141,7 +167,7 @@ async def on_cleanup(app: web.Application) -> None:
 
 def build_app(args: argparse.Namespace) -> web.Application:
     app = web.Application(client_max_size=args.client_max_size_mb * 1024 * 1024)
-    app["lb"] = OpenAILoadBalancer(args.backend, args.timeout)
+    app["lb"] = OpenAILoadBalancer(args.backend, args.timeout, args.failure_cooldown)
     app.router.add_get("/__lb_stats", stats_handler)
     app.router.add_route("*", "/{tail:.*}", proxy_handler)
     app.on_cleanup.append(on_cleanup)
@@ -160,6 +186,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=float, default=700.0)
     parser.add_argument("--client-max-size-mb", type=int, default=64)
+    parser.add_argument(
+        "--failure-cooldown",
+        type=float,
+        default=30.0,
+        help="Seconds to avoid a backend after a transport-level failure.",
+    )
     return parser.parse_args()
 
 

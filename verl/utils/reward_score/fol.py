@@ -20,6 +20,8 @@ Exports:
 """
 
 import atexit
+import fcntl
+import json
 import logging
 import os
 import re
@@ -43,9 +45,12 @@ _PREMISE_PATTERN = re.compile(r"<premise>(.*?)</premise>", re.DOTALL)
 _CONCLUSION_PATTERN = re.compile(r"<conclusion>(.*?)</conclusion>", re.DOTALL)
 
 _FOL_SHARED_STATE_CACHE_MAX_SIZE = max(1, int(os.environ.get("FOL_SHARED_PREPROCESS_CACHE_SIZE", "512")))
+_FOL_SHARED_STATE_DISK_CACHE_VERSION = os.environ.get("FOL_SHARED_PREPROCESS_DISK_CACHE_VERSION", "v1")
 _fol_shared_state_cache: OrderedDict[tuple, dict] = OrderedDict()
 _fol_shared_state_cache_lock = threading.Lock()
+_fol_shared_state_inflight: dict[tuple, dict] = {}
 _FOL_VERIFY_CACHE_MAX_SIZE = max(1, int(os.environ.get("FOL_VERIFY_CACHE_SIZE", "4096")))
+_FOL_VERIFY_DISK_CACHE_VERSION = os.environ.get("FOL_VERIFY_DISK_CACHE_VERSION", "v1")
 _fol_verify_cache: OrderedDict[tuple, float] = OrderedDict()
 _fol_verify_cache_lock = threading.Lock()
 _fol_verify_inflight: dict[tuple, dict] = {}
@@ -95,6 +100,138 @@ def _build_fol_config(api_config: dict | None = None) -> FOLConfig:
         cumulative=cfg["cumulative"],
         api_config=cfg,
     )
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    """Parse common bool-like config values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _shared_state_disk_cache_enabled(api_config: dict | None) -> bool:
+    """Whether to share declaration/preprocess cache across worker processes."""
+    cfg = api_config or {}
+    if "fol_shared_state_disk_cache" in cfg:
+        return _as_bool(cfg.get("fol_shared_state_disk_cache"), True)
+    return _as_bool(os.environ.get("FOL_SHARED_PREPROCESS_DISK_CACHE"), True)
+
+
+def _shared_state_disk_cache_dir(api_config: dict | None) -> str:
+    """Return the on-disk cache directory for FOL shared preprocessing."""
+    cfg = api_config or {}
+    return str(
+        cfg.get("fol_shared_state_cache_dir")
+        or os.environ.get("FOL_SHARED_PREPROCESS_DISK_CACHE_DIR")
+        or "/tmp/verl_fol_shared_preprocess_cache"
+    )
+
+
+def _shared_state_disk_cache_paths(cache_key: tuple, api_config: dict | None) -> tuple[str, str]:
+    """Return data and lock paths for one shared-state cache key."""
+    key_text = json.dumps(
+        [_FOL_SHARED_STATE_DISK_CACHE_VERSION, cache_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = sha1(key_text.encode("utf-8")).hexdigest()
+    cache_dir = os.path.join(_shared_state_disk_cache_dir(api_config), digest[:2])
+    return os.path.join(cache_dir, f"{digest}.json"), os.path.join(cache_dir, f"{digest}.lock")
+
+
+def _load_shared_state_from_disk(
+    cache_key: tuple,
+    fol_config: FOLConfig,
+    api_config: dict | None,
+) -> dict | None:
+    """Load a completed shared state from the cross-process cache."""
+    if not _shared_state_disk_cache_enabled(api_config):
+        return None
+    data_path, _ = _shared_state_disk_cache_paths(cache_key, api_config)
+    try:
+        with open(data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        processed_context = data.get("processed_context")
+        declarations = data.get("declarations")
+        if not isinstance(processed_context, str) or not isinstance(declarations, str) or not declarations:
+            return None
+        return {
+            "config": fol_config,
+            "processed_context": processed_context,
+            "declarations": declarations,
+        }
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("Failed to read FOL shared-state disk cache: %s", exc)
+        return None
+
+
+def _store_shared_state_to_disk(
+    cache_key: tuple,
+    shared_state: dict | None,
+    api_config: dict | None,
+) -> None:
+    """Store a successful shared state in the cross-process cache."""
+    if shared_state is None or not _shared_state_disk_cache_enabled(api_config):
+        return
+    data_path, _ = _shared_state_disk_cache_paths(cache_key, api_config)
+    tmp_path = f"{data_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    payload = {
+        "version": _FOL_SHARED_STATE_DISK_CACHE_VERSION,
+        "processed_context": shared_state["processed_context"],
+        "declarations": shared_state["declarations"],
+    }
+    try:
+        os.makedirs(os.path.dirname(data_path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, data_path)
+    except Exception as exc:
+        logger.warning("Failed to write FOL shared-state disk cache: %s", exc)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+class _SharedStateDiskLock:
+    """Per-key file lock used to prevent cross-process declaration stampedes."""
+
+    def __init__(self, cache_key: tuple, api_config: dict | None):
+        self.enabled = _shared_state_disk_cache_enabled(api_config)
+        self._file = None
+        _, self._lock_path = _shared_state_disk_cache_paths(cache_key, api_config)
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
+            self._file = open(self._lock_path, "a+", encoding="utf-8")
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+        except Exception as exc:
+            logger.warning("Failed to lock FOL shared-state disk cache: %s", exc)
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except OSError:
+                    pass
+            self._file = None
+            self.enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._file is None:
+            return False
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+        return False
 
 
 def _normalize_step_text(text: str) -> str:
@@ -244,6 +381,8 @@ def prepare_fol_shared_state(
         (fol_config.api_config or {}).get("max_tokens"),
         (fol_config.api_config or {}).get("top_p"),
         bool((fol_config.api_config or {}).get("fol_judge_use_outlines", False)),
+        fol_config.max_tries,
+        fol_config.old_max_tries,
     )
 
     with _fol_shared_state_cache_lock:
@@ -251,24 +390,63 @@ def prepare_fol_shared_state(
         if cached is not None:
             _fol_shared_state_cache.move_to_end(cache_key)
             return cached
+        inflight_state = _fol_shared_state_inflight.get(cache_key)
+        owner = inflight_state is None
+        if owner:
+            inflight_state = {"event": threading.Event(), "result": None, "exc": None}
+            _fol_shared_state_inflight[cache_key] = inflight_state
 
-    engine = FOLEngine(fol_config)
-    processed_ctx, declarations = engine.preprocess(context, question, options or "")
-    if not declarations:
-        return None
-    shared_state = {
-        "config": fol_config,
-        "processed_context": processed_ctx,
-        "declarations": declarations,
-    }
+    if not owner:
+        inflight_state["event"].wait()
+        with _fol_shared_state_cache_lock:
+            cached = _fol_shared_state_cache.get(cache_key)
+            if cached is not None:
+                _fol_shared_state_cache.move_to_end(cache_key)
+                return cached
+        inflight_exc = inflight_state.get("exc")
+        if inflight_exc is not None:
+            raise inflight_exc
+        return inflight_state.get("result")
+
+    try:
+        shared_state = _load_shared_state_from_disk(cache_key, fol_config, fol_config.api_config)
+        if shared_state is None:
+            with _SharedStateDiskLock(cache_key, fol_config.api_config):
+                shared_state = _load_shared_state_from_disk(cache_key, fol_config, fol_config.api_config)
+                if shared_state is None:
+                    engine = FOLEngine(fol_config)
+                    processed_ctx, declarations = engine.preprocess(context, question, options or "")
+                    if not declarations:
+                        shared_state = None
+                    else:
+                        shared_state = {
+                            "config": fol_config,
+                            "processed_context": processed_ctx,
+                            "declarations": declarations,
+                        }
+                        _store_shared_state_to_disk(cache_key, shared_state, fol_config.api_config)
+    except BaseException as exc:
+        with _fol_shared_state_cache_lock:
+            inflight_state["exc"] = exc
+            inflight_state["event"].set()
+            _fol_shared_state_inflight.pop(cache_key, None)
+        raise
+
     with _fol_shared_state_cache_lock:
         existing = _fol_shared_state_cache.get(cache_key)
         if existing is not None:
             _fol_shared_state_cache.move_to_end(cache_key)
+            inflight_state["result"] = existing
+            inflight_state["event"].set()
+            _fol_shared_state_inflight.pop(cache_key, None)
             return existing
-        _fol_shared_state_cache[cache_key] = shared_state
-        if len(_fol_shared_state_cache) > _FOL_SHARED_STATE_CACHE_MAX_SIZE:
-            _fol_shared_state_cache.popitem(last=False)
+        if shared_state is not None:
+            _fol_shared_state_cache[cache_key] = shared_state
+            if len(_fol_shared_state_cache) > _FOL_SHARED_STATE_CACHE_MAX_SIZE:
+                _fol_shared_state_cache.popitem(last=False)
+        inflight_state["result"] = shared_state
+        inflight_state["event"].set()
+        _fol_shared_state_inflight.pop(cache_key, None)
     return shared_state
 
 
@@ -303,6 +481,109 @@ def _build_verify_cache_key(
         api_cfg.get("top_p"),
         bool(api_cfg.get("fol_judge_use_outlines", False)),
     )
+
+
+def _verify_disk_cache_enabled(api_config: dict | None) -> bool:
+    """Whether to share exact verify rewards across worker processes."""
+    cfg = api_config or {}
+    if "fol_verify_disk_cache" in cfg:
+        return _as_bool(cfg.get("fol_verify_disk_cache"), True)
+    return _as_bool(os.environ.get("FOL_VERIFY_DISK_CACHE"), True)
+
+
+def _verify_disk_cache_dir(api_config: dict | None) -> str:
+    """Return the on-disk cache directory for exact FOL verify rewards."""
+    cfg = api_config or {}
+    return str(
+        cfg.get("fol_verify_cache_dir")
+        or os.environ.get("FOL_VERIFY_DISK_CACHE_DIR")
+        or "/tmp/verl_fol_verify_cache"
+    )
+
+
+def _verify_disk_cache_paths(cache_key: tuple, api_config: dict | None) -> tuple[str, str]:
+    """Return data and lock paths for one exact verify cache key."""
+    key_text = json.dumps(
+        [_FOL_VERIFY_DISK_CACHE_VERSION, cache_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = sha1(key_text.encode("utf-8")).hexdigest()
+    cache_dir = os.path.join(_verify_disk_cache_dir(api_config), digest[:2])
+    return os.path.join(cache_dir, f"{digest}.json"), os.path.join(cache_dir, f"{digest}.lock")
+
+
+def _load_verify_reward_from_disk(cache_key: tuple, api_config: dict | None) -> float | None:
+    """Load a completed exact verify reward from the cross-process cache."""
+    if not _verify_disk_cache_enabled(api_config):
+        return None
+    data_path, _ = _verify_disk_cache_paths(cache_key, api_config)
+    try:
+        with open(data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return float(data["reward"])
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("Failed to read FOL verify disk cache: %s", exc)
+        return None
+
+
+def _store_verify_reward_to_disk(cache_key: tuple, reward: float, api_config: dict | None) -> None:
+    """Store a successful exact verify reward in the cross-process cache."""
+    if not _verify_disk_cache_enabled(api_config):
+        return
+    data_path, _ = _verify_disk_cache_paths(cache_key, api_config)
+    tmp_path = f"{data_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    payload = {"version": _FOL_VERIFY_DISK_CACHE_VERSION, "reward": float(reward)}
+    try:
+        os.makedirs(os.path.dirname(data_path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, data_path)
+    except Exception as exc:
+        logger.warning("Failed to write FOL verify disk cache: %s", exc)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+class _VerifyDiskLock:
+    """Per-key file lock used to prevent cross-process exact verify stampedes."""
+
+    def __init__(self, cache_key: tuple, api_config: dict | None):
+        self.enabled = _verify_disk_cache_enabled(api_config)
+        self._file = None
+        _, self._lock_path = _verify_disk_cache_paths(cache_key, api_config)
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        try:
+            os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
+            self._file = open(self._lock_path, "a+", encoding="utf-8")
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+        except Exception as exc:
+            logger.warning("Failed to lock FOL verify disk cache: %s", exc)
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except OSError:
+                    pass
+            self._file = None
+            self.enabled = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._file is None:
+            return False
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+        return False
 
 
 def _verify_cache_log_enabled() -> bool:
@@ -477,18 +758,32 @@ def compute_step_reward_fol(
                 _log_verify_cache_event(True, step_index)
                 return {"score": inflight_reward, "debug": debug_info} if return_debug else inflight_reward
             raise RuntimeError("FOL verify cache in-flight request completed without a result")
-        _log_verify_cache_event(False, step_index)
 
         # print(f"[FOL][{_tid}] → verify_step({fol_config.translation.value})...", flush=True)
         # _t2 = time.time()
         try:
-            reward = engine.verify_step(
-                shared_state["processed_context"],
-                shared_state["declarations"],
-                step_to_translate,
-                debug_info=debug_info,
-            )
-            reward = float(reward)
+            reward = _load_verify_reward_from_disk(verify_cache_key, fol_config.api_config)
+            if reward is not None:
+                debug_info["cache_hit"] = True
+                debug_info["verify_disk_cache_hit"] = True
+                _log_verify_cache_event(True, step_index)
+            else:
+                with _VerifyDiskLock(verify_cache_key, fol_config.api_config):
+                    reward = _load_verify_reward_from_disk(verify_cache_key, fol_config.api_config)
+                    if reward is not None:
+                        debug_info["cache_hit"] = True
+                        debug_info["verify_disk_cache_hit"] = True
+                        _log_verify_cache_event(True, step_index)
+                    else:
+                        _log_verify_cache_event(False, step_index)
+                        reward = engine.verify_step(
+                            shared_state["processed_context"],
+                            shared_state["declarations"],
+                            step_to_translate,
+                            debug_info=debug_info,
+                        )
+                        reward = float(reward)
+                        _store_verify_reward_to_disk(verify_cache_key, reward, fol_config.api_config)
         except BaseException as exc:
             with _fol_verify_cache_lock:
                 inflight_state["exc"] = exc

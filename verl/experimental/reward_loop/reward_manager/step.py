@@ -399,7 +399,13 @@ class StepRewardManager(RewardManagerBase):
             last_conclusion = response_str.rfind("<conclusion>")
             if last_conclusion > last_step_close and last_step_close != -1:
                 has_conclusion_outside_step = True
-            if step_open != step_close or has_conclusion_outside_step:
+            has_fol_reward = any(rt in {"fol", "fol_old"} for rt in self.step_reward_types)
+            no_xml_step = self.use_xml and has_fol_reward and step_open == 0 and step_close == 0
+            if no_xml_step:
+                hard_penalize = True
+                hard_penalty_reason.append("bad_format(no_xml_step)")
+                reward_extra_info["num_steps"] = 0
+            elif step_open != step_close or has_conclusion_outside_step:
                 hard_penalize = True
                 hard_penalty_reason.append(
                     f"bad_format(open={step_open},close={step_close},conclusion_outside={has_conclusion_outside_step})"
@@ -407,7 +413,10 @@ class StepRewardManager(RewardManagerBase):
 
         if hard_penalize:
             penalty_val = self.penalty_score
-            penalty_rewards = [(int(pos), penalty_val) for _, pos in step_positions]
+            if self.use_xml and response_str.count("<step>") == 0 and response_str.count("</step>") == 0:
+                penalty_rewards = [(max(0, int(valid_response_length) - 1), penalty_val)]
+            else:
+                penalty_rewards = [(int(pos), penalty_val) for _, pos in step_positions]
             for reward_type in self.step_reward_types:
                 reward_extra_info[f"{reward_type}_step_reward"] = penalty_rewards
             reward_extra_info["process_reward_penalized"] = True
@@ -434,17 +443,38 @@ class StepRewardManager(RewardManagerBase):
 
             fol_shared_state = None
             if reward_type == "fol":
-                from verl.utils.reward_score.fol import prepare_fol_shared_state
-
-                loop = asyncio.get_event_loop()
-                fol_shared_state = await loop.run_in_executor(
-                    self._executor,
-                    lambda: prepare_fol_shared_state(
-                        prompt_text,
-                        api_config=self.api_config,
-                        extra_info=extra_info,
-                    ),
+                from verl.utils.reward_score.fol import (
+                    _has_student_premise_conclusion_duplicate,
+                    check_step_format_fol,
+                    prepare_fol_shared_state,
                 )
+
+                # Some responses have only malformed XML steps or copied
+                # premise/conclusion duplicates. compute_step_reward_fol will
+                # fail them before using declarations, so skip the expensive
+                # response-level declaration call unless at least one step can
+                # actually reach the FOL judge.
+                needs_fol_shared_state = False
+                for i, (step_text, _token_end_pos) in enumerate(step_positions):
+                    if i in penalty_step_indices:
+                        continue
+                    if "<step>" in step_text and not check_step_format_fol(step_text):
+                        continue
+                    if _has_student_premise_conclusion_duplicate(step_text):
+                        continue
+                    needs_fol_shared_state = True
+                    break
+
+                if needs_fol_shared_state:
+                    loop = asyncio.get_event_loop()
+                    fol_shared_state = await loop.run_in_executor(
+                        self._executor,
+                        lambda: prepare_fol_shared_state(
+                            prompt_text,
+                            api_config=self.api_config,
+                            extra_info=extra_info,
+                        ),
+                    )
 
             # Pre-build all step histories so calls can run in parallel
             call_args = []

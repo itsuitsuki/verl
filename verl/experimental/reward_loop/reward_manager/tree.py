@@ -402,7 +402,13 @@ class TreeRewardManager(RewardManagerBase):
                 last_conclusion = response_str.rfind("<conclusion>")
                 if last_conclusion > last_step_close and last_step_close != -1:
                     has_conclusion_outside_step = True
-                if step_open != step_close or has_conclusion_outside_step:
+                has_fol_reward = any(rt in {"fol", "fol_old"} for rt in self.step_reward_types)
+                no_xml_step = self.use_xml and has_fol_reward and step_open == 0 and step_close == 0
+                if no_xml_step:
+                    hard_penalize = True
+                    hard_penalty_reason.append("bad_format(no_xml_step)")
+                    reward_extra_info["num_steps"] = 0
+                elif step_open != step_close or has_conclusion_outside_step:
                     hard_penalize = True
                     hard_penalty_reason.append(
                         f"bad_format(open={step_open},close={step_close},conclusion_outside={has_conclusion_outside_step})"
@@ -410,7 +416,10 @@ class TreeRewardManager(RewardManagerBase):
 
             if hard_penalize:
                 penalty_val = self.penalty_score
-                penalty_rewards = [(int(pos), penalty_val) for _, pos in step_positions]
+                if self.use_xml and response_str.count("<step>") == 0 and response_str.count("</step>") == 0:
+                    penalty_rewards = [(max(0, int(valid_response_length) - 1), penalty_val)]
+                else:
+                    penalty_rewards = [(int(pos), penalty_val) for _, pos in step_positions]
                 for reward_type in self.step_reward_types:
                     reward_extra_info[f"{reward_type}_step_reward"] = penalty_rewards
                 reward_extra_info["process_reward_penalized"] = True
