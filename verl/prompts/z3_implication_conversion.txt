@@ -23,6 +23,7 @@ Translation Rules (Strict Compliance Required):
         • The conclusion expression must not appear verbatim in background_axioms, previous_conclusions, or current_premises.
         • If the current <premise> text repeats the current <conclusion>, still translate faithfully; do not invent a different supporting premise.
         • If the given premises do not entail the conclusion, do not repair the argument. Return faithful translations anyway.
+        • Preserve source-side distinctions when a premise supports the conclusion through a bridge concept. Do not canonicalize a premise into the exact conclusion expression just because it is semantically close. For example, if a premise says "not abstract" and the conclusion says "concrete", translate the premise as Not(IsAbstract(x)) when such a predicate is declared; only add a separate bridge axiom such as ForAll([x], Implies(Not(IsAbstract(x)), IsConcrete(x))) if that rule is explicitly stated or valid common knowledge.
     4. Grounded Premises:
         • Every symbolic statement must be derived from exactly one allowed source category above: background, previous conclusion, current premise, or current conclusion.
     5. Logical Purity:

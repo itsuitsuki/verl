@@ -677,6 +677,21 @@ def _render_structured_implication(
         if debug_info is not None:
             debug_info["autofilled_symbolic_constants"] = symbolic_constant_diagnostics
 
+    rewritten_expr_sources, enum_rewrite_diagnostics = _rewrite_enum_valued_function_calls(
+        expr_sources,
+        full_declarations,
+        new_variables,
+    )
+    if enum_rewrite_diagnostics:
+        background_axioms = rewritten_expr_sources["background_axioms"]
+        previous_conclusions = rewritten_expr_sources["previous_conclusions"]
+        current_premises = rewritten_expr_sources["current_premises"]
+        conclusion = rewritten_expr_sources["conclusion"][0]
+        premises = [*background_axioms, *previous_conclusions, *current_premises]
+        expr_sources = rewritten_expr_sources
+        if debug_info is not None:
+            debug_info["enum_valued_function_rewrites"] = enum_rewrite_diagnostics
+
     unknown_identifier_errors = _collect_unknown_identifier_errors(
         expr_sources,
         full_declarations,
@@ -1128,6 +1143,220 @@ def _collect_sort_mismatch_errors(
                 continue
             infer_sort(tree.body, source=source, index=idx, expr=expr)
     return errors
+
+
+def _infer_declared_expression_sort(
+    node: ast.AST,
+    *,
+    identifier_sorts: dict[str, str],
+    function_signatures: dict[str, dict[str, object]],
+) -> Optional[str]:
+    """Infer the declared Z3 sort for simple expression AST nodes."""
+    if isinstance(node, ast.Name):
+        if node.id in {"True", "False"}:
+            return "BoolSort()"
+        return identifier_sorts.get(node.id)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return "BoolSort()"
+        if isinstance(node.value, int):
+            return "IntSort()"
+        if isinstance(node.value, float):
+            return "RealSort()"
+        return None
+    if isinstance(node, ast.Compare):
+        return "BoolSort()"
+    if not isinstance(node, ast.Call):
+        return None
+
+    call_name = _ast_call_name(node)
+    if call_name in function_signatures:
+        signature = function_signatures[call_name]
+        arg_sorts = signature.get("arg_sorts", [])
+        return_sort = signature.get("return_sort")
+        if (
+            isinstance(arg_sorts, list)
+            and len(node.args) == len(arg_sorts)
+            and isinstance(return_sort, str)
+        ):
+            return return_sort
+        return None
+
+    if call_name in {"And", "Or", "Implies", "Not", "ForAll", "Exists", "Distinct"}:
+        return "BoolSort()"
+    if call_name == "If" and len(node.args) >= 2:
+        return _infer_declared_expression_sort(
+            node.args[1],
+            identifier_sorts=identifier_sorts,
+            function_signatures=function_signatures,
+        )
+    if call_name == "BoolVal":
+        return "BoolSort()"
+    if call_name == "IntVal":
+        return "IntSort()"
+    if call_name == "RealVal":
+        return "RealSort()"
+    return None
+
+
+def _rewrite_enum_valued_function_calls(
+    expr_sources: dict[str, list[str]],
+    declarations: str,
+    new_variables: list[dict[str, str]],
+) -> tuple[dict[str, list[str]], list[dict[str, object]]]:
+    """Rewrite enum-valued function predicates into equality expressions.
+
+    Translators sometimes emit ``F(x, EnumValue)`` when the declaration says
+    ``F: X -> EnumSort``. Z3Py reports this as ``b'index out of bounds'`` when
+    the one-argument function is called with two arguments. The conservative
+    repair is ``F(x) == EnumValue``; it preserves the identifier set and only
+    applies when the final argument has exactly the function return sort.
+    """
+    identifier_sorts = _declared_identifier_sorts(declarations, new_variables)
+    function_signatures = _declared_function_signatures(declarations)
+    diagnostics: list[dict[str, object]] = []
+
+    def enum_sort(node: ast.AST) -> Optional[str]:
+        sort = _infer_declared_expression_sort(
+            node,
+            identifier_sorts=identifier_sorts,
+            function_signatures=function_signatures,
+        )
+        if sort and sort != "BoolSort()":
+            return sort
+        return None
+
+    def collect_return_function_apps(node: ast.AST, target_sort: str) -> list[tuple[str, list[ast.AST]]]:
+        apps: list[tuple[str, list[ast.AST]]] = []
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            call_name = _ast_call_name(child)
+            signature = function_signatures.get(call_name or "")
+            if not signature:
+                continue
+            arg_sorts = signature.get("arg_sorts", [])
+            return_sort = signature.get("return_sort")
+            if (
+                isinstance(arg_sorts, list)
+                and isinstance(return_sort, str)
+                and return_sort == target_sort
+                and len(child.args) == len(arg_sorts)
+            ):
+                apps.append((str(call_name), list(child.args)))
+        return apps
+
+    class EnumFunctionCallRewriter(ast.NodeTransformer):
+        def __init__(self, *, source: str, index: int, original_expr: str):
+            super().__init__()
+            self.source = source
+            self.index = index
+            self.original_expr = original_expr
+            self.changed = False
+
+        def _record(self, *, kind: str, before: ast.AST, after: ast.AST, function: str, return_sort: str) -> None:
+            self.changed = True
+            diagnostics.append({
+                "source": self.source,
+                "index": self.index,
+                "kind": kind,
+                "function": function,
+                "return_sort": return_sort,
+                "expr": self.original_expr,
+                "before": _node_source(before),
+                "after": _node_source(after),
+            })
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            node = self.generic_visit(node)
+            call_name = _ast_call_name(node)
+
+            if call_name == "Implies" and len(node.args) >= 2:
+                consequent_sort = enum_sort(node.args[1])
+                if consequent_sort:
+                    candidates = collect_return_function_apps(node.args[0], consequent_sort)
+                    unique: dict[tuple[str, str], tuple[str, list[ast.AST]]] = {}
+                    for fn_name, fn_args in candidates:
+                        key = (fn_name, ast.dump(ast.Tuple(elts=fn_args, ctx=ast.Load())))
+                        unique[key] = (fn_name, fn_args)
+                    if len(unique) == 1:
+                        fn_name, fn_args = next(iter(unique.values()))
+                        after = ast.Compare(
+                            left=ast.Call(
+                                func=ast.Name(id=fn_name, ctx=ast.Load()),
+                                args=fn_args,
+                                keywords=[],
+                            ),
+                            ops=[ast.Eq()],
+                            comparators=[node.args[1]],
+                        )
+                        self._record(
+                            kind="bare_enum_implies_consequent",
+                            before=node.args[1],
+                            after=after,
+                            function=fn_name,
+                            return_sort=consequent_sort,
+                        )
+                        node.args[1] = ast.copy_location(after, node.args[1])
+
+            signature = function_signatures.get(call_name or "")
+            if not signature:
+                return node
+            arg_sorts = signature.get("arg_sorts", [])
+            return_sort = signature.get("return_sort")
+            if (
+                not isinstance(arg_sorts, list)
+                or not isinstance(return_sort, str)
+                or return_sort == "BoolSort()"
+                or len(node.args) != len(arg_sorts) + 1
+            ):
+                return node
+
+            value_node = node.args[-1]
+            value_sort = _infer_declared_expression_sort(
+                value_node,
+                identifier_sorts=identifier_sorts,
+                function_signatures=function_signatures,
+            )
+            if value_sort != return_sort:
+                return node
+
+            before = ast.copy_location(ast.Call(func=node.func, args=list(node.args), keywords=[]), node)
+            after = ast.Compare(
+                left=ast.Call(func=node.func, args=node.args[:-1], keywords=[]),
+                ops=[ast.Eq()],
+                comparators=[value_node],
+            )
+            self._record(
+                kind="enum_valued_function_predicate",
+                before=before,
+                after=after,
+                function=str(call_name),
+                return_sort=return_sort,
+            )
+            return ast.copy_location(after, node)
+
+    rewritten: dict[str, list[str]] = {}
+    for source, expressions in expr_sources.items():
+        rewritten_items: list[str] = []
+        for idx, expr in enumerate(expressions):
+            try:
+                tree = ast.parse(expr, mode="eval")
+            except SyntaxError:
+                rewritten_items.append(expr)
+                continue
+            rewriter = EnumFunctionCallRewriter(source=source, index=idx, original_expr=expr)
+            new_tree = rewriter.visit(tree)
+            ast.fix_missing_locations(new_tree)
+            if rewriter.changed:
+                try:
+                    rewritten_items.append(ast.unparse(new_tree.body))
+                except Exception:
+                    rewritten_items.append(expr)
+            else:
+                rewritten_items.append(expr)
+        rewritten[source] = rewritten_items
+    return rewritten, diagnostics
 
 
 def _infer_quantifier_variable_sorts(
