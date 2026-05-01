@@ -39,7 +39,9 @@ CUDA_VISIBLE_DEVICES=1 python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization 0.85 \
     --tensor-parallel-size 1 \
     --max-model-len $FOL_MAX_MODEL_LEN \
-    --enforce-eager \
+    --max-num-seqs ${VLLM_MAX_NUM_SEQS:-256} \
+    --enable-prefix-caching \
+    --max-cudagraph-capture-size ${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-256} \
     --gdn-prefill-backend triton \
     --no-enable-log-requests > fol_vllm_server.log 2>&1 &
 FOL_VLLM_PID=$!

@@ -43,6 +43,9 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization 0.15 \
     --tensor-parallel-size 1 \
     --max-model-len $SELF_EVAL_MAX_MODEL_LEN \
+    --max-num-seqs ${VLLM_MAX_NUM_SEQS:-256} \
+    --enable-prefix-caching \
+    --max-cudagraph-capture-size ${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-256} \
     --no-enable-log-requests > vllm_server.log 2>&1 &
 VLLM_PID=$!
 echo "vLLM server log: vllm_server.log"

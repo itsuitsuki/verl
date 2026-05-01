@@ -40,6 +40,9 @@ python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization 0.15 \
     --tensor-parallel-size 1 \
     --max-model-len $FOL_SLM_MAX_MODEL_LEN \
+    --max-num-seqs ${VLLM_MAX_NUM_SEQS:-256} \
+    --enable-prefix-caching \
+    --max-cudagraph-capture-size ${VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE:-256} \
     --no-enable-log-requests > fol_slm_vllm_server.log 2>&1 &
 FOL_VLLM_PID=$!
 echo "FOL-SLM vLLM server log: fol_slm_vllm_server.log"

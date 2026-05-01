@@ -2,6 +2,70 @@
 
 This note summarizes the current debugging state for the LogiQA2K 1.5B FOL reward runs, so another person can continue without reconstructing the full chat history.
 
+## Current Priority TODO, 2026-05-01
+
+Treat this section as the authoritative next-step list. Older sections below are historical context unless they agree with this section.
+
+### Active / Latest Runs
+
+- FOL Step-GDPO v4, `train_fol_step_gdpo_gpu2_v4_2.log`
+  - Active on GPU2 with judge load balancer `http://127.0.0.1:4874/v1`.
+  - Latest local snapshot: step `1397/1844`, ETA about `3:56:53`, estimated finish `2026-05-01 11:46 UTC` / `2026-05-01 19:46 UTC+8`.
+  - Latest val acc `0.3717` at step 1350; best val acc `0.4793` at step 550.
+  - Latest train score `0.2031`; recent-10 train score mean about `0.375`.
+  - Recent bottleneck is actor update (`update_actor ~= 13.0s`) plus generation (`gen ~= 9.0s`); FOL reward compute mean/max is now about `2.8/7.4s`, so judge is no longer the dominant steady-state bottleneck.
+  - Recent FOL health: calls mean `1.45`, total tokens mean/max `3586/9166`, entailed rate `0.337`, invalid translation rate `0.051`, leakage rate `0.008`, sort mismatch rate `0.150`, format-failed rate `0.0`.
+- Self-eval Step-GDPO v1, `train_self_eval_step_gdpo_gpu4_v1.log`
+  - Active on GPU4 with local self-eval server `http://127.0.0.1:8199/v1`.
+  - Latest local snapshot: step `1753/1844`, ETA about `55:13`, estimated finish `2026-05-01 08:44 UTC` / `2026-05-01 16:44 UTC+8`.
+  - Latest val acc `0.3932` at step 1750; best val acc `0.4516` at step 1050.
+  - Latest train score `0.9375`; recent-10 train score mean about `0.470`.
+  - Bottleneck is actor update (`update_actor ~= 13.9s`); reward compute is cheap.
+- FOL Tree-GAE v4, `train_fol_tree_gae_gpu3_v4.log`
+  - Completed `1844/1844`.
+  - Final val acc `0.2796`; best val acc `0.3871` at step 1050.
+  - Final train score `0.3125`; recent-10 train score mean about `0.365`.
+  - Final tree still has `num_steps/mean = 2.0` and `avg_leaves_per_tree = 3.0`, so treat this as a negative result for current tree shaping.
+
+### Completed Baselines To Use In Tables
+
+- GSPO outcome-only, `train_gspo_outcome_only_logiqa_full_prompt1_gpu4_v1.log`
+  - Completed. Final val acc `0.3687`; best val acc `0.4885` at step 1200.
+  - This is not a separate reward baseline from DAPO; it is DAPO/outcome-only reward with GSPO policy loss, sequence-level mean aggregation, and KL disabled.
+- DAPO outcome-only, `train_dapo_outcome_only_logiqa_full_prompt1_gpu4_v1.log`
+  - Completed. Final val acc `0.3902`; best val acc `0.4531` at step 750.
+- A800 format Step-GDPO, `train_format_step_gdpo_a800_gpu0_v1.log`
+  - Completed. Final val acc `0.3625`; best val acc `0.4470` at step 600.
+- A800 format Tree-GAE, `train_format_tree_gae_a800_gpu1_v1.log`
+  - Completed. Final val acc `0.2888`; best val acc `0.4040` at step 550.
+- A800 outcome-only Tree-GAE, `train_outcome_tree_gae_a800_gpu2_v1.log`
+  - Completed. Final val acc `0.3118`; best val acc `0.3994` at step 400.
+
+### Next Experiments
+
+1. Finish and sync the active FOL Step-GDPO v4 run.
+   - It is currently better than DAPO, format, self-eval, and tree baselines by best val acc, and only below GSPO best.
+   - Do not restart it only for the recent translator prompt / enum-call fixes; use those fixes in the next version.
+2. Run FOL Step-GDPO under GSPO/DAPO-style optimization controls.
+   - First: FOL Step-GDPO + `actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean` + KL `0.02`.
+   - Second: same but KL `0`.
+   - Third: FOL reward with `actor_rollout_ref.actor.policy_loss.loss_mode=gspo`, `seq-mean-token-mean`, and KL `0`.
+   - Goal: separate reward quality from GSPO's training-side changes.
+3. Tree search repair should start with the clean 5:5 reward-weight ablation.
+   - Run FOL Tree-GAE with `+algorithm.step_reward_weights='[0.5, 0.5]'`.
+   - This directly reduces the current outcome-dominant bias in `[0.8, 0.2]` without changing FOL semantics or the tree pipeline.
+   - Monitor both val acc and tree shape: `num_steps/mean`, printed tree paths, `tree/pass_rate`, and leaf finish reasons.
+4. If 5:5 still collapses to short paths, implement tree-only outcome gating.
+   - Candidate: if a leaf path has fewer than 2 rewardable XML reasoning steps, downweight or zero only that path's outcome contribution.
+   - Keep this separate from FOL judge fail-closed penalties and do not apply it to ordinary Step-GDPO.
+   - Avoid blind length bonuses; the target is useful multi-step reasoning, not verbosity.
+5. FOL translator hardening follow-up.
+   - Latest merged fixes: enum-valued function call rewrite, and bridge-premise prompt rule for cases like `not abstract -> concrete`.
+   - Before a major rerun, probe 5-10 historical leakage / invalid-translation cases and record whether exact-conclusion leakage, enum-call OOB, and sort mismatch rates improve.
+6. Reporting TODO.
+   - Build a table with final and best val acc, train score, num_steps, and relevant FOL/tree diagnostics for: DAPO, GSPO, format step, self-eval step, FOL step, format tree, outcome tree, and FOL tree.
+   - Report best checkpoint and final checkpoint separately; GSPO has the highest best so far but a much lower final.
+
 ## Current Findings
 
 - Latest active-run snapshot, 2026-04-30 17:36 UTC:
