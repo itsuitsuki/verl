@@ -43,8 +43,11 @@ def extract_solution(solution_str):
     return final_solution
 
 
-def make_map_fn(split, format="flat", system_prompt=None, user_prompt_suffix=None):
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+def make_map_fn(split, format="flat", system_prompt=None, user_prompt_suffix=None, answer_format="hash"):
+    if answer_format == "boxed":
+        instruction_following = r"Let's think step by step and output the final answer in \boxed{}."
+    else:
+        instruction_following = 'Let\'s think step by step and output the final answer after "####".'
 
     def process_fn(example, idx):
         question_raw = example.pop("question")
@@ -89,12 +92,13 @@ def make_map_fn(split, format="flat", system_prompt=None, user_prompt_suffix=Non
     return process_fn
 
 
-def map_with_progress(dataset, split, format="flat", system_prompt=None, user_prompt_suffix=None):
+def map_with_progress(dataset, split, format="flat", system_prompt=None, user_prompt_suffix=None, answer_format="hash"):
     mapper = make_map_fn(
         split,
         format=format,
         system_prompt=system_prompt,
         user_prompt_suffix=user_prompt_suffix,
+        answer_format=answer_format,
     )
     rows = []
     for idx, example in enumerate(tqdm(dataset, desc=f"Processing {split}", unit="example")):
@@ -111,6 +115,12 @@ if __name__ == "__main__":
         "--local_save_dir", default="~/data/gsm8k", help="The save directory for the preprocessed dataset."
     )
     parser.add_argument("--format", default="flat", choices=["flat", "xml"], help="Prompt format.")
+    parser.add_argument(
+        "--answer_format",
+        default="hash",
+        choices=["hash", "boxed"],
+        help="Final answer format requested from the actor.",
+    )
     parser.add_argument(
         "--system_prompt_file",
         default=None,
@@ -143,6 +153,7 @@ if __name__ == "__main__":
         format=args.format,
         system_prompt=system_prompt,
         user_prompt_suffix=user_prompt_suffix,
+        answer_format=args.answer_format,
     )
     test_dataset = map_with_progress(
         test_dataset,
@@ -150,6 +161,7 @@ if __name__ == "__main__":
         format=args.format,
         system_prompt=system_prompt,
         user_prompt_suffix=user_prompt_suffix,
+        answer_format=args.answer_format,
     )
 
     hdfs_dir = args.hdfs_dir
@@ -166,6 +178,7 @@ if __name__ == "__main__":
 
     print(f"Dataset saved to {local_save_dir}")
     print(f"Data source: {data_source}")
+    print(f"Answer format: {args.answer_format}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
 

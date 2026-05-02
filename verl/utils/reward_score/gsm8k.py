@@ -15,6 +15,11 @@
 import re
 
 _SOLUTION_CLIP_CHARS = 300
+_NUMBER_RE = r"-?(?:[0-9][0-9,]*(?:\.[0-9]+)?|\.[0-9]+)"
+
+
+def _normalize_number(answer):
+    return answer.replace(",", "").replace("$", "").strip()
 
 
 def extract_solution(solution_str, method="strict"):
@@ -29,13 +34,17 @@ def extract_solution(solution_str, method="strict"):
     if method == "strict":
         # this also tests the formatting of the model
         solutions = re.findall("#### (\\-?[0-9\\.\\,]+)", solution_str)
-        if len(solutions) == 0:
-            final_answer = None
-        else:
+        if len(solutions) > 0:
             # take the last solution
-            final_answer = solutions[-1].replace(",", "").replace("$", "")
+            final_answer = _normalize_number(solutions[-1])
+        else:
+            boxed_solutions = re.findall(r"\\boxed\{\{?\s*(\$?" + _NUMBER_RE + r")\s*\}?\}", solution_str)
+            if boxed_solutions:
+                final_answer = _normalize_number(boxed_solutions[-1])
+            else:
+                final_answer = None
     elif method == "flexible":
-        answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
+        answer = re.findall("(" + _NUMBER_RE + ")", solution_str)
         final_answer = None
         if len(answer) == 0:
             # no reward is there is no answer
@@ -44,6 +53,7 @@ def extract_solution(solution_str, method="strict"):
             invalid_str = ["", "."]
             # find the last number that is not '.'
             for final_answer in reversed(answer):
+                final_answer = _normalize_number(final_answer)
                 if final_answer not in invalid_str:
                     break
     return final_answer

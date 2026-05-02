@@ -374,10 +374,11 @@ def prepare_fol_shared_state(
 ) -> dict | None:
     """Precompute response-level FOL state reusable across all steps."""
     context, question, options = extract_fol_problem(prompt_text, extra_info)
-    if not context or not question:
-        return None
-
     fol_config = _build_fol_config(api_config)
+    if not question:
+        return None
+    if fol_config.task_type != TaskType.MATH and not context:
+        return None
     cache_key = (
         context,
         question,
@@ -459,8 +460,10 @@ def prepare_fol_shared_state(
     return shared_state
 
 
-def _digest_text(text: str) -> str:
+def _digest_text(text: str | None) -> str:
     """Return a stable digest for large cache-key strings."""
+    if text is None:
+        text = ""
     return sha1(text.encode("utf-8")).hexdigest()
 
 
