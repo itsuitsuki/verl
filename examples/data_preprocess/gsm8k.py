@@ -18,10 +18,21 @@ Preprocess the GSM8k dataset to parquet format
 import argparse
 import os
 import re
+from pathlib import Path
 
 import datasets
+from tqdm.auto import tqdm
 
 from verl.utils.hdfs_io import copy, makedirs
+
+PROMPT_DIR = Path(__file__).resolve().parents[2] / "verl" / "prompts"
+
+
+def _load_prompt_file(path_or_name: str) -> str:
+    p = Path(path_or_name)
+    if not p.is_absolute():
+        p = PROMPT_DIR / p
+    return p.read_text(encoding="utf-8").strip()
 
 
 def extract_solution(solution_str):
@@ -32,6 +43,65 @@ def extract_solution(solution_str):
     return final_solution
 
 
+def make_map_fn(split, format="flat", system_prompt=None, user_prompt_suffix=None):
+    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+
+    def process_fn(example, idx):
+        question_raw = example.pop("question")
+        answer_raw = example.pop("answer")
+        solution = extract_solution(answer_raw)
+
+        if format == "xml":
+            prompt_content = f"<Question>\n{question_raw}\n</Question>\n\n{instruction_following}"
+        else:
+            prompt_content = f"{question_raw} {instruction_following}"
+
+        if user_prompt_suffix:
+            prompt_content = f"{prompt_content}\n\n{user_prompt_suffix}"
+
+        prompt_messages = []
+        if system_prompt:
+            prompt_messages.append({"role": "system", "content": system_prompt})
+        prompt_messages.append({"role": "user", "content": prompt_content})
+
+        data_source = "openai/gsm8k"
+        data = {
+            "data_source": data_source,
+            "prompt": prompt_messages,
+            "ability": "math",
+            "reward_model": {"style": "rule", "ground_truth": solution},
+            "extra_info": {
+                "split": split,
+                "index": idx,
+                "answer": answer_raw,
+                "question": question_raw,
+                "math_question": question_raw,
+                "math_solution": answer_raw,
+                "math_final_answer": solution,
+                # Keep these structured fields compatible with the FOL extractor.
+                "fol_context": "",
+                "fol_question": question_raw,
+                "fol_options": "",
+            },
+        }
+        return data
+
+    return process_fn
+
+
+def map_with_progress(dataset, split, format="flat", system_prompt=None, user_prompt_suffix=None):
+    mapper = make_map_fn(
+        split,
+        format=format,
+        system_prompt=system_prompt,
+        user_prompt_suffix=user_prompt_suffix,
+    )
+    rows = []
+    for idx, example in enumerate(tqdm(dataset, desc=f"Processing {split}", unit="example")):
+        rows.append(mapper(dict(example), idx))
+    return datasets.Dataset.from_list(rows)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default=None, help="The save directory for the preprocessed dataset.")
@@ -40,9 +110,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--local_save_dir", default="~/data/gsm8k", help="The save directory for the preprocessed dataset."
     )
+    parser.add_argument("--format", default="flat", choices=["flat", "xml"], help="Prompt format.")
+    parser.add_argument(
+        "--system_prompt_file",
+        default=None,
+        help="Path or bare filename under verl/prompts/ for the system prompt.",
+    )
+    parser.add_argument(
+        "--user_prompt_file",
+        default=None,
+        help="Path or bare filename under verl/prompts/ to append to the user prompt.",
+    )
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
+    system_prompt = _load_prompt_file(args.system_prompt_file) if args.system_prompt_file else None
+    user_prompt_suffix = _load_prompt_file(args.user_prompt_file) if args.user_prompt_file else None
 
     data_source = "openai/gsm8k"
 
@@ -54,40 +137,20 @@ if __name__ == "__main__":
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
-
-    # add a row to each data item that represents a unique id
-    def make_map_fn(split):
-        def process_fn(example, idx):
-            question_raw = example.pop("question")
-
-            question = question_raw + " " + instruction_following
-
-            answer_raw = example.pop("answer")
-            solution = extract_solution(answer_raw)
-            data = {
-                "data_source": data_source,
-                "prompt": [
-                    {
-                        "role": "user",
-                        "content": question,
-                    }
-                ],
-                "ability": "math",
-                "reward_model": {"style": "rule", "ground_truth": solution},
-                "extra_info": {
-                    "split": split,
-                    "index": idx,
-                    "answer": answer_raw,
-                    "question": question_raw,
-                },
-            }
-            return data
-
-        return process_fn
-
-    train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
+    train_dataset = map_with_progress(
+        train_dataset,
+        "train",
+        format=args.format,
+        system_prompt=system_prompt,
+        user_prompt_suffix=user_prompt_suffix,
+    )
+    test_dataset = map_with_progress(
+        test_dataset,
+        "test",
+        format=args.format,
+        system_prompt=system_prompt,
+        user_prompt_suffix=user_prompt_suffix,
+    )
 
     hdfs_dir = args.hdfs_dir
     local_save_dir = args.local_dir
@@ -96,8 +159,15 @@ if __name__ == "__main__":
     else:
         local_save_dir = args.local_save_dir
 
+    local_save_dir = os.path.expanduser(local_save_dir)
+    os.makedirs(local_save_dir, exist_ok=True)
     train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_save_dir, "test.parquet"))
+
+    print(f"Dataset saved to {local_save_dir}")
+    print(f"Data source: {data_source}")
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
 
     if hdfs_dir is not None:
         makedirs(hdfs_dir)
