@@ -83,6 +83,9 @@ PROMPT_ROOT = Path(__file__).resolve().parents[2] / "prompts"
 # Direct pipeline
 Z3_DECLARATION_PROMPT = PROMPT_ROOT / "z3_declaration_generation.txt"
 Z3_IMPLICATION_PROMPT = PROMPT_ROOT / "z3_implication_conversion.txt"
+# Direct pipeline (math)
+Z3_DECLARATION_PROMPT_MATH = PROMPT_ROOT / "z3_declaration_generation_math.txt"
+Z3_IMPLICATION_PROMPT_MATH = PROMPT_ROOT / "z3_implication_conversion_math.txt"
 # Structured pipeline
 REPHRASE_PROMPT = PROMPT_ROOT / "rephrase.txt"
 OBJECT_EXTRACT_PROMPT = PROMPT_ROOT / "object_extract.txt"

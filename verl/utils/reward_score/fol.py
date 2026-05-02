@@ -8,6 +8,7 @@ Verification semantics is always entailment: UNSAT -> 1.0.
 Configurable via api_config keys:
   - fol_preprocess: "direct" (default) | "structured"
   - fol_translation: "implication" (default) | "assertion"
+  - fol_task_type: "logic" (default) | "math"
   - max_tries: int (default 1), used by declaration/expression repair
   - old_max_tries: int (default 0), used by whole-code correction
   - timeout: float (default 30.0)
@@ -36,6 +37,7 @@ from verl.utils.fol_utils.engine import (
     FOLConfig,
     FOLEngine,
     PreprocessPipeline,
+    TaskType,
     TranslationMode,
 )
 
@@ -91,9 +93,15 @@ def _build_fol_config(api_config: dict | None = None) -> FOLConfig:
     except ValueError:
         translation = TranslationMode.IMPLICATION
 
+    try:
+        task_type = TaskType(cfg.get("fol_task_type", "logic"))
+    except ValueError:
+        task_type = TaskType.LOGIC
+
     return FOLConfig(
         preprocess=preprocess,
         translation=translation,
+        task_type=task_type,
         max_tries=int(cfg.get("max_tries", 1)),
         old_max_tries=int(cfg.get("old_max_tries", 0)),
         timeout=float(cfg.get("timeout", 30.0)),
@@ -375,6 +383,7 @@ def prepare_fol_shared_state(
         question,
         options or "",
         fol_config.preprocess.value,
+        fol_config.task_type.value,
         (fol_config.api_config or {}).get("model"),
         (fol_config.api_config or {}).get("base_url"),
         (fol_config.api_config or {}).get("temperature"),
@@ -469,6 +478,7 @@ def _build_verify_cache_key(
         _digest_text(step_to_translate),
         fol_config.preprocess.value,
         fol_config.translation.value,
+        fol_config.task_type.value,
         fol_config.max_tries,
         fol_config.old_max_tries,
         fol_config.timeout,

@@ -639,12 +639,78 @@ export FOL_MODEL=${FOL_MODEL:-"gpt-4o-mini-2024-07-18"}
 
 LLM 调用次数：每道题 1 次（declarations），每步 1 次（implication conversion）。
 
+#### `api_config` 参数
+
+通过 reward manager 的 `api_config` dict 传入，控制 FOL pipeline 的行为：
+
+| 参数 | 默认值 | 可选值 | 说明 |
+|------|--------|--------|------|
+| `fol_task_type` | `"logic"` | `"logic"` / `"math"` | 任务类型。`logic` 使用 entity-predicate schema（适用于 LogiQA、FOLIO、AR-LSAT 等逻辑推理）；`math` 使用纯 Int/Real 算术 schema（适用于 GSM8K 等算术应用题） |
+| `fol_preprocess` | `"direct"` | `"direct"` / `"structured"` | 预处理管线。`direct` = 1 次 LLM 调用生成 Z3 声明；`structured` = rephrase + object/predicate 提取的多步管线 |
+| `fol_translation` | `"implication"` | `"implication"` / `"assertion"` | 翻译模式。`implication` = 源分离的前提/结论翻译（推荐）；`assertion` = premise_fol/conclusion_fol 直接翻译 |
+| `fol_cumulative_mode` | `"current_only"` | `"current_only"` / `"step"` / `"dependency_graph"` | 累积推理模式。`current_only` = 只用当前步骤；`step` = 包含所有前序结论；`dependency_graph` = 按前提-结论依赖图选择祖先步骤 |
+| `fol_judge_use_outlines` | `false` | `true` / `false` | 是否请求结构化 JSON 输出（structured generation）。需要 judge 模型支持 json_schema response_format |
+| `fol_format_failed_score` | `0.0` | 任意 float | 步骤格式不合法时（缺少 premise/conclusion 标签）的替代分值 |
+| `max_tries` | `1` | int ≥ 0 | 声明/表达式修复的最大重试次数 |
+| `old_max_tries` | `0` | int ≥ 0 | 整段 Z3 代码纠错循环的最大重试次数（旧版纠错路径） |
+| `timeout` | `30.0` | float (秒) | Z3 求解器单步超时时间 |
+| `model` | — | string | judge LLM 的模型名称 |
+| `base_url` | — | string | judge LLM 的 OpenAI 兼容 API 地址 |
+| `temperature` | — | float | judge LLM 采样温度 |
+| `max_tokens` | — | int | judge LLM 最大输出 token 数 |
+| `top_p` | — | float | judge LLM top-p 采样 |
+| `fol_shared_state_disk_cache` | `true` | bool | 跨进程磁盘缓存声明预处理结果 |
+| `fol_shared_state_cache_dir` | `"/tmp/verl_fol_shared_preprocess_cache"` | path | 声明缓存目录 |
+| `fol_verify_disk_cache` | `true` | bool | 跨进程磁盘缓存验证结果 |
+| `fol_verify_cache_dir` | `"/tmp/verl_fol_verify_cache"` | path | 验证缓存目录 |
+
+#### `fol_task_type: "math"` 模式
+
+为数学题设计的算术/代数验证路径。与默认 `logic` 模式的区别：
+
+| | `logic`（默认） | `math` |
+|--|---|---|
+| **Schema** | Entity sorts + predicate functions（`DeclareSort`, `EnumSort`, `Function → BoolSort()`） | 纯 `Int`/`Real` 算术变量（`Const → IntSort()/RealSort()`） |
+| **Declaration prompt** | `z3_declaration_generation.txt` | `z3_declaration_generation_math.txt` |
+| **Translation prompt** | `z3_implication_conversion.txt` | `z3_implication_conversion_math.txt` |
+| **验证语义** | 相同：`And(premises) ∧ Not(conclusion) → UNSAT = 1.0` | 相同 |
+| **适用数据集** | LogiQA, FOLIO, AR-LSAT, ReClor | GSM8K, MATH-500（部分类别） |
+
+**MATH-500 子类别覆盖情况：**
+
+| 子类别 | Z3 覆盖 | 说明 |
+|--------|---------|------|
+| Prealgebra | ✅ 完全 | 基础算术、分数、百分比 |
+| Algebra | ✅ 大部分 | 方程、多项式、不等式（Z3 nlsat solver） |
+| Number Theory | ⚠️ 部分 | 整除 `%`、模运算、GCD/LCM 可以；归纳证明不行 |
+| Counting & Probability | ⚠️ 有限 | 小规模计数可展开；无原生阶乘/组合数，归纳和组合恒等式不可表达 |
+| Geometry | ⚠️ 部分 | 坐标几何（距离、斜率、面积）可以；综合几何证明和三角函数不行 |
+| Intermediate Algebra | ⚠️ 部分 | 多项式运算可以；复杂非线性可能 timeout |
+| Precalculus | ❌ 极有限 | Z3 无原生三角函数、复数、矩阵支持 |
+
+Z3 覆盖不了的步骤会自然 fail-closed（返回 0.0），不会产生错误的正面奖励。对于需要完整 MATH-500 step-level 验证的场景，需要引入 Isabelle/HOL 定理证明器（参见 TODO.md）。
+
+使用示例（训练配置中）：
+
+```yaml
+algorithm:
+  step_reward_type: fol
+  step_reward_api_config:
+    fol_task_type: "math"       # 切换到数学模式
+    fol_preprocess: "direct"
+    fol_translation: "implication"
+    model: "Qwen3.6-35B-A3B"
+    base_url: "http://localhost:4869/v1"
+```
+
 核心文件：
 
 - `verl/utils/reward_score/fol.py` — reward function 入口
-- `verl/utils/fol_utils/nl2fol.py` — pipeline 实现
-- `verl/prompts/z3_declaration_generation.txt` — Z3 声明生成 prompt
-- `verl/prompts/z3_implication_conversion.txt` — Z3 蕴含转换 prompt
+- `verl/utils/fol_utils/engine.py` — 统一 FOL 验证引擎
+- `verl/prompts/z3_declaration_generation.txt` — Z3 声明生成 prompt（logic）
+- `verl/prompts/z3_implication_conversion.txt` — Z3 蕴含转换 prompt（logic）
+- `verl/prompts/z3_declaration_generation_math.txt` — Z3 声明生成 prompt（math）
+- `verl/prompts/z3_implication_conversion_math.txt` — Z3 蕴含转换 prompt（math）
 
 ------
 

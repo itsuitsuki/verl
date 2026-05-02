@@ -304,6 +304,45 @@ Stage 3: tree reruns after step baselines.
   - Current FOL tree uses `[0.8, 0.2]`.
   - Higher FOL/process weight may preserve process, but only after FOL success/leakage rates are good enough.
 
+## Math Dataset Coverage & Isabelle Integration
+
+### Current State: Z3 Math Mode (`fol_task_type: "math"`)
+
+已实现 `fol_task_type="math"` 模式，使用纯 Int/Real 算术 schema + 数学专用 prompt。适用于 GSM8K 级别算术应用题，以及 MATH-500 中的 Prealgebra、Algebra、Number Theory（部分）、Coordinate Geometry 等类别。
+
+Z3 的根本限制：
+- **无归纳证明**：组合数学和数论中需要数学归纳法的证明不可表达
+- **无高阶逻辑**：无法表达 "对所有函数 f..."
+- **无三角函数/微积分**：Precalculus 类别几乎完全不覆盖
+- **非线性算术不完备**：Z3 用 nlsat 启发式，复杂多项式可能 timeout 返回 UNKNOWN → 0.0
+
+覆盖不了的步骤 fail-closed（返回 0.0），不产生错误正面奖励，但降低了 process reward 的有效信号密度。
+
+### TODO: Isabelle/HOL 集成路线
+
+参考 FoVer（2505.15960）的 `sorry` trick 实现 step-level 定理证明验证：
+
+1. **评估可行性**
+   - Isabelle 每步验证 ~3s（FoVer 用 40 并行进程在 CPU 上跑）
+   - 在线 RL 场景下：假设 8 步/proof × 16 rollouts = ~6 min/batch 纯验证延迟
+   - 需要评估是否可以异步验证（rollout 先用 outcome reward，Isabelle reward 延迟回传）
+
+2. **架构方案（优先级从高到低）**
+   - **方案 A：离线标注 + PRM 蒸馏**：用 Isabelle 离线标注数学步骤数据 → 训练 PRM → PRM score 作为在线 RL 的 process reward signal（不需要 Isabelle 在线跑）
+   - **方案 B：异步在线验证**：Isabelle 验证结果延迟回传到下一个 RL epoch
+   - **方案 C：在线同步验证**：直接在 reward loop 中调用 Isabelle（延迟最大，但信号最准确）
+
+3. **Autoformalization 挑战**
+   - NL → Isabelle thy 的翻译比 NL → Z3 更难
+   - FoVer 用 Qwen 2.5 7B few-shot 做 autoformalization
+   - 需要 Isabelle 服务器基础设施（Java/ML 运行时）
+   - 验证 GSM8K/MATH 上的 autoformalization 成功率
+
+4. **与当前系统的集成点**
+   - `engine.py` 的 `TaskType` 枚举可扩展 `MATH_ISABELLE`
+   - 验证语义不同：Z3 用 UNSAT entailment check，Isabelle 用 `sorry` trick step isolation
+   - 需要新的 `IsabelleEngine` 类替代 `FOLEngine.verify_step()`
+
 ## FOL Judge / Pipeline Ideas
 
 - Immediate FOL speed TODO:

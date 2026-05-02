@@ -22,6 +22,8 @@ from verl.utils.fol_utils.common import (
     # Prompt paths
     Z3_DECLARATION_PROMPT,
     Z3_IMPLICATION_PROMPT,
+    Z3_DECLARATION_PROMPT_MATH,
+    Z3_IMPLICATION_PROMPT_MATH,
     TRANSLATE_STEP_PROMPT,
     # LLM calls
     call_llm,
@@ -317,10 +319,8 @@ def _collect_declaration_payload_errors(payload: Optional[dict]) -> list[dict[st
     constants = payload.get("constants", []) if isinstance(payload.get("constants"), list) else []
     functions = payload.get("functions", []) if isinstance(payload.get("functions"), list) else []
 
-    if not sorts:
-        errors.append({"field": "sorts", "error": "at least one sort is required"})
-
     declared_sorts: set[str] = set()
+    _all_sorts_builtin = True
     emitted_names: set[str] = set()
 
     def add_name(name: object, field: str) -> None:
@@ -354,8 +354,10 @@ def _collect_declaration_payload_errors(payload: Optional[dict]) -> list[dict[st
                 continue
             add_name(item.get("name"), f"{field_name}[{idx}].name")
             sort = item.get("sort")
-            if not isinstance(sort, str) or sort not in declared_sorts:
+            if not isinstance(sort, str) or (sort not in declared_sorts and sort not in _DECLARATION_BUILTIN_RETURN_SORTS):
                 errors.append({"field": f"{field_name}[{idx}].sort", "sort": sort, "error": "unknown sort"})
+            elif sort not in _DECLARATION_BUILTIN_RETURN_SORTS:
+                _all_sorts_builtin = False
 
     for idx, item in enumerate(functions):
         if not isinstance(item, dict):
@@ -378,6 +380,9 @@ def _collect_declaration_payload_errors(payload: Optional[dict]) -> list[dict[st
             return_sort not in declared_sorts and return_sort not in _DECLARATION_BUILTIN_RETURN_SORTS
         ):
             errors.append({"field": f"functions[{idx}].return_sort", "sort": return_sort, "error": "unknown return sort"})
+
+    if not sorts and (functions or not _all_sorts_builtin):
+        errors.append({"field": "sorts", "error": "at least one sort is required"})
 
     return errors
 
@@ -1773,10 +1778,16 @@ class TranslationMode(Enum):
     ASSERTION = "assertion"      # translate_step.txt -> premise_fol/conclusion_fol
 
 
+class TaskType(Enum):
+    LOGIC = "logic"  # qualitative predicate logic (LogiQA, FOLIO, AR-LSAT)
+    MATH = "math"    # arithmetic word problems (GSM8K, MATH-500)
+
+
 @dataclass
 class FOLConfig:
     preprocess: PreprocessPipeline = PreprocessPipeline.DIRECT
     translation: TranslationMode = TranslationMode.IMPLICATION
+    task_type: TaskType = TaskType.LOGIC
     max_tries: int = 1
     old_max_tries: int = 0
     timeout: float = 30.0
@@ -1797,7 +1808,9 @@ def _preprocess_direct(
 
     Returns (context, declarations).
     """
-    system_prompt = load_prompt(Z3_DECLARATION_PROMPT)
+    task_type = (api_config or {}).get("fol_task_type", "logic")
+    prompt_path = Z3_DECLARATION_PROMPT_MATH if task_type == "math" else Z3_DECLARATION_PROMPT
+    system_prompt = load_prompt(prompt_path)
     user_input = f"<Context>{context}</Context>\n<Question>{question}</Question>"
     if options:
         user_input += f"\n<Options>{options}</Options>"
@@ -1889,7 +1902,9 @@ def _translate_implication(
 
     Returns executable Z3 Python code string.
     """
-    system_prompt = load_prompt(Z3_IMPLICATION_PROMPT)
+    task_type = (api_config or {}).get("fol_task_type", "logic")
+    prompt_path = Z3_IMPLICATION_PROMPT_MATH if task_type == "math" else Z3_IMPLICATION_PROMPT
+    system_prompt = load_prompt(prompt_path)
     user_input = (
         f"Z3 Declarations:\n```python\n{declarations}\n```\n\n"
         f"Context:\n{context}\n\n"
