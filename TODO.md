@@ -304,11 +304,42 @@ Stage 3: tree reruns after step baselines.
   - Current FOL tree uses `[0.8, 0.2]`.
   - Higher FOL/process weight may preserve process, but only after FOL success/leakage rates are good enough.
 
-## Math Dataset Coverage & Isabelle Integration
+## Dataset Coverage
 
-### Current State: Z3 Math Mode (`fol_task_type: "math"`)
+### Logic Datasets: Z3 Logic Mode (`fol_task_type: "logic"`)
 
-已实现 `fol_task_type="math"` 模式，使用纯 Int/Real 算术 schema + 数学专用 prompt。适用于 GSM8K 级别算术应用题，以及 MATH-500 中的 Prealgebra、Algebra、Number Theory（部分）、Coordinate Geometry 等类别。
+逻辑侧使用 entity-predicate schema + FOL prompt，Z3 作为 SAT/SMT solver 天然适配约束满足类推理。
+
+| 数据集 | 题型 | Z3 覆盖率 | 说明 |
+|--------|------|-----------|------|
+| LogiQA | 逻辑推理选择题 | ~90% | 当前主力训练/评估数据集 |
+| FOLIO | FOL 自然语言推理 | ~90% | 天然 FOL 表达，Z3 直接适配 |
+| AR-LSAT | 分析推理（逻辑游戏） | ~90-95% | 排序/分组/条件约束 = CSP，Z3 的甜区 |
+| ReClor | 阅读理解式逻辑推理 | ~85-90% | 偏自然语言推理，个别题需 pragmatic reasoning |
+| SCONE | 状态追踪（实体位置/属性变化） | ~85-90% | 约束满足 + 状态更新，Z3 适配 |
+
+不适合 FOL verification 的数据集：
+- **ARC (AI2 Reasoning Challenge)**：小学科学常识推理，需要世界知识和因果推理，Z3 无法编码物理直觉和常识（覆盖率 ~20-30%）。
+
+逻辑侧覆盖率整体较高，不需要 Isabelle 等外部工具补充。
+
+### Math Datasets: Z3 Math Mode (`fol_task_type: "math"`)
+
+已实现 `fol_task_type="math"` 模式，使用纯 Int/Real 算术 schema + 数学专用 prompt。
+
+**各数学数据集 Z3 step-level 覆盖率估计：**
+
+| 数据集 | 难度 | Z3 覆盖率 | 建议 |
+|--------|------|-----------|------|
+| GSM8K | 小学算术 | ~95% | ✅ 主力对标数据集，FoVer 也报了此数据集 |
+| AQUA-RAT | 数学应用题（多选） | ~80-85% | ✅ 类似 GSM8K 但稍难，含 rationale，多选格式 A-E |
+| MATH-500 | 高中竞赛混合 | ~50% | ⚠️ 可跑，需标注覆盖率限制；Prealgebra/Algebra 好，Precalculus 废 |
+| AMC 10/12 | 高中竞赛 | ~40-50% | ⚠️ 算术/代数/数论可以，组合计数和几何不行 |
+| Minerva | STEM 混合 | ~30-40% | ⚠️ 含微积分/物理/化学，Z3 无 sin/cos/积分/微分 |
+| AIME 2024 | 竞赛进阶 | ~20-30% | ❌ 大量组合/三角/复数/数列，信号太稀疏 |
+| Olympiad Bench | 奥赛级 | ~15-20% | ❌ 需归纳/构造性证明/高等技巧，基本不可用 |
+
+覆盖率随难度递增骤降。GSM8K 是 Z3 的甜区；AIME 及以上没有 Isabelle 不应跑 step-level PRM。
 
 Z3 的根本限制：
 - **无归纳证明**：组合数学和数论中需要数学归纳法的证明不可表达

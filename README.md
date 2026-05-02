@@ -93,6 +93,20 @@ To save it for generation-only inspection:
 bash bash_scripts/prepare_reclor_prompt_v2.sh --save_unlabeled_test
 ```
 
+For AR-LSAT, use the same prompt-v2 format and A/B/C/D/E answer labels:
+
+```bash
+bash bash_scripts/prepare_ar_lsat_prompt_v2.sh
+```
+
+This writes all labeled splits from `olegbask/AR-LSAT`:
+
+```text
+data/ar_lsat_prompt_v2/train.parquet
+data/ar_lsat_prompt_v2/validation.parquet
+data/ar_lsat_prompt_v2/test.parquet
+```
+
 The new experiment scripts use:
 
 ```bash
@@ -674,7 +688,9 @@ LLM 调用次数：每道题 1 次（declarations），每步 1 次（implicatio
 | **Declaration prompt** | `z3_declaration_generation.txt` | `z3_declaration_generation_math.txt` |
 | **Translation prompt** | `z3_implication_conversion.txt` | `z3_implication_conversion_math.txt` |
 | **验证语义** | 相同：`And(premises) ∧ Not(conclusion) → UNSAT = 1.0` | 相同 |
-| **适用数据集** | LogiQA, FOLIO, AR-LSAT, ReClor | GSM8K, MATH-500（部分类别） |
+| **适用数据集** | LogiQA, FOLIO, AR-LSAT, ReClor, SCONE | GSM8K, AQUA-RAT, MATH-500, AMC 10/12, Minerva, AIME 2024, Olympiad Bench |
+
+> **不适合 FOL verification 的数据集**：ARC (AI2 Reasoning Challenge) — 需要世界知识和因果常识推理，Z3 无法编码（覆盖率 ~20-30%）。
 
 **MATH-500 子类别覆盖情况：**
 
@@ -688,7 +704,19 @@ LLM 调用次数：每道题 1 次（declarations），每步 1 次（implicatio
 | Intermediate Algebra | ⚠️ 部分 | 多项式运算可以；复杂非线性可能 timeout |
 | Precalculus | ❌ 极有限 | Z3 无原生三角函数、复数、矩阵支持 |
 
-Z3 覆盖不了的步骤会自然 fail-closed（返回 0.0），不会产生错误的正面奖励。对于需要完整 MATH-500 step-level 验证的场景，需要引入 Isabelle/HOL 定理证明器（参见 TODO.md）。
+**数学数据集 Z3 step-level 覆盖率总览：**
+
+| 数据集 | 难度 | Z3 覆盖率 | 说明 |
+|--------|------|-----------|------|
+| GSM8K | 小学算术 | ~95% | 主力对标数据集，FoVer 也报了此数据集 |
+| AQUA-RAT | 数学应用题（多选） | ~80-85% | 类似 GSM8K 但稍难，含 rationale，多选格式 A-E |
+| MATH-500 | 高中竞赛混合 | ~50% | 可跑，需标注覆盖率限制 |
+| AMC 10/12 | 高中竞赛 | ~40-50% | 算术/代数/数论可以，组合计数和几何不行 |
+| Minerva | STEM 混合 | ~30-40% | 含微积分/物理/化学，Z3 无 sin/cos/积分/微分 |
+| AIME 2024 | 竞赛进阶 | ~20-30% | 大量组合/三角/复数/数列，信号太稀疏 |
+| Olympiad Bench | 奥赛级 | ~15-20% | 需归纳/构造性证明/高等技巧，基本不可用 |
+
+Z3 覆盖不了的步骤会自然 fail-closed（返回 0.0），不会产生错误的正面奖励。覆盖率随难度递增骤降；AIME 及以上没有 Isabelle 不应跑 step-level PRM。详见 TODO.md 的 Isabelle 集成路线。
 
 使用示例（训练配置中）：
 

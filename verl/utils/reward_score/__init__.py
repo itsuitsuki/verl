@@ -102,7 +102,14 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
-    elif data_source in ["logiqa", "lucasmccabe/logiqa", "reclor", "voidful/ReClor"]:
+    elif data_source in [
+        "logiqa",
+        "lucasmccabe/logiqa",
+        "reclor",
+        "voidful/ReClor",
+        "ar_lsat",
+        "olegbask/AR-LSAT",
+    ]:
         from . import logiqa
 
         res = logiqa.compute_score(solution_str, ground_truth)
