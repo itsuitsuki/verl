@@ -1427,6 +1427,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                logger.finish()
                 return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
@@ -2312,6 +2313,7 @@ class RayPPOTrainer:
                         wandb.log({"Training Record": self.record_table})
                         wandb.log({"Validation Record": self.validation_table})
                     progress_bar.close()
+                    logger.finish()
                     return
 
                 # this is experimental and may be changed/removed in the future

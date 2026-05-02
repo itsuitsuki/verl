@@ -67,6 +67,7 @@ class Tracking:
                 assert backend in self.supported_backend, f"{backend} is not supported"
 
         self.logger = {}
+        self._closed = False
 
         if "tracking" in default_backend or "wandb" in default_backend:
             import os
@@ -183,21 +184,46 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def finish(self, exit_code: int = 0, raise_errors: bool = False, log_errors: bool = True):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        logger_map = getattr(self, "logger", {})
+        errors = []
+
+        def finish_backend(name, callback):
+            try:
+                callback()
+            except Exception as exc:
+                errors.append((name, exc))
+
+        if "wandb" in logger_map:
+            finish_backend("wandb", lambda: logger_map["wandb"].finish(exit_code=exit_code))
+        if "swanlab" in logger_map:
+            finish_backend("swanlab", lambda: logger_map["swanlab"].finish())
+        if "vemlp_wandb" in logger_map:
+            finish_backend("vemlp_wandb", lambda: logger_map["vemlp_wandb"].finish(exit_code=exit_code))
+        if "tensorboard" in logger_map:
+            finish_backend("tensorboard", lambda: logger_map["tensorboard"].finish())
+        if "clearml" in logger_map:
+            finish_backend("clearml", lambda: logger_map["clearml"].finish())
+        if "trackio" in logger_map:
+            finish_backend("trackio", lambda: logger_map["trackio"].finish())
+        if "file" in logger_map:
+            finish_backend("file", lambda: logger_map["file"].finish())
+
+        if errors:
+            if raise_errors:
+                raise errors[0][1]
+            if log_errors:
+                for name, exc in errors:
+                    try:
+                        logger.warning("Failed to finish %s tracking backend cleanly: %s", name, exc)
+                    except Exception:
+                        pass
+
     def __del__(self):
-        if "wandb" in self.logger:
-            self.logger["wandb"].finish(exit_code=0)
-        if "swanlab" in self.logger:
-            self.logger["swanlab"].finish()
-        if "vemlp_wandb" in self.logger:
-            self.logger["vemlp_wandb"].finish(exit_code=0)
-        if "tensorboard" in self.logger:
-            self.logger["tensorboard"].finish()
-        if "clearml" in self.logger:
-            self.logger["clearml"].finish()
-        if "trackio" in self.logger:
-            self.logger["trackio"].finish()
-        if "file" in self.logger:
-            self.logger["file"].finish()
+        self.finish(raise_errors=False, log_errors=False)
 
 
 class ClearMLLogger:
