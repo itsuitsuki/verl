@@ -160,29 +160,56 @@ when the judge server has memory pressure or needs a different concurrency cap.
 
 ## LogiQA Prompt-v2 Baseline Snapshot
 
-Snapshot from local logs on 2026-05-01. Accuracy is `val-core/logiqa/acc/mean@1`.
+Snapshot from local logs on 2026-05-02. Accuracy is `val-core/logiqa/acc/mean@1`;
+percentages are reported to three decimal places.
 For active runs, the "final/current" column reports the latest available validation
 instead of a completed final checkpoint.
 
 | Method | Log | Train GPU | Judge / Eval GPU | Best Val Acc | Final / Current Val Acc | Notes |
 |---|---|---:|---:|---:|---:|---|
-| GSPO outcome-only | `train_gspo_outcome_only_logiqa_full_prompt1_gpu4_v1.log` | GPU4 | none | `0.4885 @1200` | `0.3687 @1844` | DAPO/outcome reward with GSPO policy loss, `seq-mean-token-mean`, KL off |
-| FOL Step-GDPO v4 | `train_fol_step_gdpo_gpu2_v4_2.log` | GPU2 | GPU0/1 + GPU5/6 via `:4874` LB | `0.4793 @550` | `0.3717 @1350` | Active at `1397/1844`; FOL judge no longer dominant steady-state bottleneck |
-| DAPO outcome-only | `train_dapo_outcome_only_logiqa_full_prompt1_gpu4_v1.log` | GPU4 | none | `0.4531 @750` | `0.3902 @1844` | Outcome-only GRPO/DAPO baseline |
-| Self-eval Step-GDPO v1 | `train_self_eval_step_gdpo_gpu4_v1.log` | GPU4 | GPU4 local `:8199` | `0.4516 @1050` | `0.3932 @1750` | Active at `1753/1844` |
-| Format Step-GDPO | `train_format_step_gdpo_a800_gpu0_v1.log` | A800 GPU0 | none | `0.4470 @600` | `0.3625 @1844` | A800 baseline |
-| Format Tree-GAE | `train_format_tree_gae_a800_gpu1_v1.log` | A800 GPU1 | none | `0.4040 @550` | `0.2888 @1844` | Short-tree collapse by the end |
-| Outcome-only Tree-GAE | `train_outcome_tree_gae_a800_gpu2_v1.log` | A800 GPU2 | none | `0.3994 @400` | `0.3118 @1844` | Short-tree collapse by the end |
-| FOL Tree-GAE v4 | `train_fol_tree_gae_gpu3_v4.log` | GPU3 | GPU0/1 + GPU5/6 via `:4874` LB | `0.3871 @1050` | `0.2796 @1844` | Negative result for current tree shaping; final `num_steps/mean=2.0` |
+| GSPO outcome-only | `train_gspo_outcome_only_logiqa_full_prompt1_gpu4_v1.log` | GPU4 | none | `48.848% @1200` | `36.866% @1844` | DAPO/outcome reward with GSPO policy loss, `seq-mean-token-mean`, KL off |
+| FOL Step-GDPO v4 | `train_fol_step_gdpo_gpu2_v4_2.log` | GPU2 | GPU0/1 + GPU5/6 via `:4874` LB | `47.926% @550` | `42.704% @1844` | Completed; final checkpoint also evaluated on held-out test |
+| DAPO outcome-only | `train_dapo_outcome_only_logiqa_full_prompt1_gpu4_v1.log` | GPU4 | none | `45.315% @750` | `39.017% @1844` | Outcome-only GRPO/DAPO baseline |
+| Self-eval Step-GDPO v1 | `train_self_eval_step_gdpo_gpu4_v1.log` | GPU4 | GPU4 local `:8199` | `45.161% @1050/1500` | `38.556% @1844` | Completed |
+| Format Step-GDPO | `train_format_step_gdpo_a800_gpu0_v1.log` | A800 GPU0 | none | `44.700% @600/1400` | `36.252% @1844` | A800 baseline |
+| Format Tree-GAE | `train_format_tree_gae_a800_gpu1_v1.log` | A800 GPU1 | none | `40.399% @550` | `28.879% @1844` | Short-tree collapse by the end |
+| Outcome-only Tree-GAE | `train_outcome_tree_gae_a800_gpu2_v1.log` | A800 GPU2 | none | `39.939% @400` | `31.183% @1844` | Short-tree collapse by the end |
+| FOL Tree-GAE v4 | `train_fol_tree_gae_gpu3_v4.log` | GPU3 | GPU0/1 + GPU5/6 via `:4874` LB | `38.710% @1050` | `27.957% @1844` | Negative result for current tree shaping; final `num_steps/mean=2.0` |
+| Self-eval Tree-GAE v1 | `train_self_eval_tree_gae_gpu4_v1.log` | GPU4 | GPU4 local `:8199` | `39.017% @1700` | `31.183% @1844` | Tree baseline remained weak |
+
+Held-out LogiQA test results use `data/logiqa2k_prompt_v2/test.parquet` as
+`data.val_files` with `trainer.val_only=true`. LogiQA validation and test each
+contain 651 examples in this preprocessing.
+
+| Method | Checkpoint | Test Acc | Test Log | Notes |
+|---|---:|---:|---|---|
+| Qwen2.5-1.5B-Instruct base | none | TBD | TBD | Priority next test-only run on H20 |
+| GSPO outcome-only | `global_step_1844` | `43.318%` | `test_gspo_outcome_only_logiqa_final1844_remote.log` | Final checkpoint |
+| FOL Step-GDPO v4 | `global_step_1844` | `47.158%` | `test_fol_step_gdpo_logiqa_final1844.log` | Pure answer accuracy; `validate_with_step_reward=false`, so no FOL judge calls |
+| DAPO outcome-only | `global_step_1844` | `42.550%` | `test_dapo_outcome_only_logiqa_final1844_remote.log` | Final checkpoint |
+
+## ReClor Prompt-v2 Snapshot
+
+ReClor uses `data/reclor_prompt_v2`; the official test split is unlabeled, so
+these are validation results on 500 labeled validation examples.
+
+| Method | Log | Best Val Acc | Final Val Acc | Notes |
+|---|---|---:|---:|---|
+| Qwen2.5-1.5B-Instruct base | `train_fol_step_gdpo_reclor_gpu2_v4.log` | `48.600% @0` | `48.600% @0` | Initial validation before RL |
+| FOL Step-GDPO v4 | `train_fol_step_gdpo_reclor_gpu2_v4.log` | `58.600% @450` | `58.000% @579` | Final train score `52.344%`; final FOL step reward `55.469%` |
+| GSPO outcome-only | `train_gspo_outcome_only_reclor_gpu4_v1.log` | running | running | Started after FOL run |
+| DAPO outcome-only | `train_dapo_outcome_only_reclor_gpu3_v1.log` | running | running | Started after FOL run |
 
 Current priority after this snapshot:
 
-1. Finish and sync FOL Step-GDPO v4.
-2. Run FOL Step-GDPO with GSPO/DAPO-style optimization controls:
+1. Run held-out LogiQA test for the Qwen2.5-1.5B-Instruct base model.
+2. Monitor ReClor GSPO/DAPO baselines against the FOL Step-GDPO `58.600%` best.
+3. Run held-out LogiQA test for remaining retained checkpoints: self-eval Step-GDPO, FOL Tree-GAE, and A800 tree baselines.
+4. Run FOL Step-GDPO with GSPO/DAPO-style optimization controls:
    `seq-mean-token-mean`, KL ablations, then `policy_loss.loss_mode=gspo`.
-3. For tree search, first run the clean 5:5 ablation:
+5. For tree search, first run the clean 5:5 ablation:
    `+algorithm.step_reward_weights='[0.5, 0.5]'`.
-4. If 5:5 still collapses to short paths, add tree-only outcome gating for paths
+6. If 5:5 still collapses to short paths, add tree-only outcome gating for paths
    with too few rewardable XML reasoning steps.
 
 Version 1, 2000 samples, plain text format:
