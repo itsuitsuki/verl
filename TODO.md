@@ -2,30 +2,26 @@
 
 This note summarizes the current debugging state for the LogiQA2K 1.5B FOL reward runs, so another person can continue without reconstructing the full chat history.
 
-## Current Priority TODO, 2026-05-01
+## Current Priority TODO, 2026-05-05
 
 Treat this section as the authoritative next-step list. Older sections below are historical context unless they agree with this section.
 
 ### Active / Latest Runs
 
-- FOL Step-GDPO v4, `train_fol_step_gdpo_gpu2_v4_2.log`
-  - Active on GPU2 with judge load balancer `http://127.0.0.1:4874/v1`.
-  - Latest local snapshot: step `1397/1844`, ETA about `3:56:53`, estimated finish `2026-05-01 11:46 UTC` / `2026-05-01 19:46 UTC+8`.
-  - Latest val acc `0.3717` at step 1350; best val acc `0.4793` at step 550.
-  - Latest train score `0.2031`; recent-10 train score mean about `0.375`.
-  - Recent bottleneck is actor update (`update_actor ~= 13.0s`) plus generation (`gen ~= 9.0s`); FOL reward compute mean/max is now about `2.8/7.4s`, so judge is no longer the dominant steady-state bottleneck.
-  - Recent FOL health: calls mean `1.45`, total tokens mean/max `3586/9166`, entailed rate `0.337`, invalid translation rate `0.051`, leakage rate `0.008`, sort mismatch rate `0.150`, format-failed rate `0.0`.
-- Self-eval Step-GDPO v1, `train_self_eval_step_gdpo_gpu4_v1.log`
-  - Active on GPU4 with local self-eval server `http://127.0.0.1:8199/v1`.
-  - Latest local snapshot: step `1753/1844`, ETA about `55:13`, estimated finish `2026-05-01 08:44 UTC` / `2026-05-01 16:44 UTC+8`.
-  - Latest val acc `0.3932` at step 1750; best val acc `0.4516` at step 1050.
-  - Latest train score `0.9375`; recent-10 train score mean about `0.470`.
-  - Bottleneck is actor update (`update_actor ~= 13.9s`); reward compute is cheap.
-- FOL Tree-GAE v4, `train_fol_tree_gae_gpu3_v4.log`
-  - Completed `1844/1844`.
-  - Final val acc `0.2796`; best val acc `0.3871` at step 1050.
-  - Final train score `0.3125`; recent-10 train score mean about `0.365`.
-  - Final tree still has `num_steps/mean = 2.0` and `avg_leaves_per_tree = 3.0`, so treat this as a negative result for current tree shaping.
+- GSM8K Qwen2.5-7B FOL Step-GDPO, `train_gsm8k7b_fol_gpu34_v1.log`
+  - Completed on `013_2` GPU3/4 with judge load balancer `http://127.0.0.1:4874/v1`.
+  - Final val/test acc `90.447%` at step `934`; best val/test acc `91.054%` at step `200`; initial val/test acc `83.776%` at step `0`.
+  - Final train score `100.000%`; recent-10 train score mean about `94.531%`.
+  - Late-run bottleneck was mostly 7B actor generation/update rather than judge: recent averages were generation `~41s`, actor update `~46s`, and FOL reward compute `~16s`.
+- ReClor Qwen2.5-7B FOL Step-GDPO, `train_reclor7b_fol_gpu1_v1.log`
+  - Not currently active. The run reached about step `206/579` and then stopped when `017_2` became unavailable / lost the judge route.
+  - Latest val acc `74.600%` at step 200; best val acc `75.000%` at step 100; initial val acc `71.000%` at step 0.
+  - Latest train score before crash `73.438%`; recent-10 train score mean about `77.891%`.
+  - Restart only after a clean two-GPU slot and stable `:4874` judge route are available.
+- LogiQA Qwen2.5-7B FOL Step-GDPO, `train_logiqa7b_fol_gpu34_v2.log`
+  - Not currently active. The two-GPU attempt reached only step `0` validation, with initial val acc `49.002%`, then failed before training updates.
+  - The previous one-GPU attempt, `train_logiqa7b_fol_gpu3_v1.log`, OOMed during actor / rollout weight update.
+  - The two-GPU v2 attempt also needs a config change before rerun: one launch hit CUDA/cumem OOM, and the lower-memory launch failed vLLM startup with no available KV cache blocks.
 
 ### Completed Baselines To Use In Tables
 
@@ -40,31 +36,66 @@ Treat this section as the authoritative next-step list. Older sections below are
   - Completed. Final val acc `0.2888`; best val acc `0.4040` at step 550.
 - A800 outcome-only Tree-GAE, `train_outcome_tree_gae_a800_gpu2_v1.log`
   - Completed. Final val acc `0.3118`; best val acc `0.3994` at step 400.
+- ReClor 1.5B completed baselines:
+  - FOL Step-GDPO v4, `train_fol_step_gdpo_reclor_gpu2_v4.log`: best `58.600%` at step 450, final `58.000%`.
+  - FOL Step-GDPO KL-off, `train_reclor_fol_kloff_gpu2_v1.log`: stopped after step 404; best `56.400%` at step 200, latest `54.800%` at step 400.
+  - Format Step-GDPO, `train_format_step_gdpo_reclor_gpu2_v1.log`: best/final `59.000%` at step 579.
+  - Self-eval Step-GDPO, `train_self_eval_step_gdpo_reclor_gpu2_v1.log`: best `58.400%` at step 450, final `57.800%`.
+  - GSPO outcome-only, `train_gspo_outcome_only_reclor_gpu4_v1.log`: best `59.600%` at step 400, final `55.000%`.
+  - DAPO outcome-only, `train_dapo_outcome_only_reclor_gpu3_v1.log`: best `59.400%` at step 550, final `58.800%`.
+- GSM8K 1.5B completed baselines:
+  - Qwen2.5-1.5B-Instruct base, `test_base_qwen25_15b_gsm8k_0172_gpu2.log`: test `40.788%`.
+  - FOL Step-GDPO, `train_fol_step_gdpo_gsm8k_gpu4_v1.log`: best `75.739%` at step 700/900, final `74.223%`.
+  - Format Step-GDPO, `train_format_step_gdpo_gsm8k_0172_gpu0_v1.log`: best `77.331%` at step 700, final `74.905%`.
+  - Self-eval Step-GDPO, `train_self_eval_step_gdpo_gsm8k_gpu3_v1.log`: best/final `79.682%` at step 934.
+  - GSPO outcome-only, `train_gspo_outcome_only_gsm8k_0172_gpu1_v1.log`: best `77.938%` at step 800, final `75.284%`.
+  - DAPO outcome-only, `train_dapo_outcome_only_gsm8k_0172_gpu3_v1.log`: best `77.180%` at step 400, final `73.086%`.
 
 ### Next Experiments
 
-1. Finish and sync the active FOL Step-GDPO v4 run.
-   - It is currently better than DAPO, format, self-eval, and tree baselines by best val acc, and only below GSPO best.
-   - Do not restart it only for the recent translator prompt / enum-call fixes; use those fixes in the next version.
-2. Run FOL Step-GDPO under GSPO/DAPO-style optimization controls.
-   - First: FOL Step-GDPO + `actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean` + KL `0.02`.
-   - Second: same but KL `0`.
-   - Third: FOL reward with `actor_rollout_ref.actor.policy_loss.loss_mode=gspo`, `seq-mean-token-mean`, and KL `0`.
-   - Goal: separate reward quality from GSPO's training-side changes.
-3. Tree search repair should start with the clean 5:5 reward-weight ablation.
-   - Run FOL Tree-GAE with `+algorithm.step_reward_weights='[0.5, 0.5]'`.
-   - This directly reduces the current outcome-dominant bias in `[0.8, 0.2]` without changing FOL semantics or the tree pipeline.
-   - Monitor both val acc and tree shape: `num_steps/mean`, printed tree paths, `tree/pass_rate`, and leaf finish reasons.
-4. If 5:5 still collapses to short paths, implement tree-only outcome gating.
-   - Candidate: if a leaf path has fewer than 2 rewardable XML reasoning steps, downweight or zero only that path's outcome contribution.
-   - Keep this separate from FOL judge fail-closed penalties and do not apply it to ordinary Step-GDPO.
-   - Avoid blind length bonuses; the target is useful multi-step reasoning, not verbosity.
-5. FOL translator hardening follow-up.
-   - Latest merged fixes: enum-valued function call rewrite, and bridge-premise prompt rule for cases like `not abstract -> concrete`.
-   - Before a major rerun, probe 5-10 historical leakage / invalid-translation cases and record whether exact-conclusion leakage, enum-call OOB, and sort mismatch rates improve.
-6. Reporting TODO.
-   - Build a table with final and best val acc, train score, num_steps, and relevant FOL/tree diagnostics for: DAPO, GSPO, format step, self-eval step, FOL step, format tree, outcome tree, and FOL tree.
-   - Report best checkpoint and final checkpoint separately; GSPO has the highest best so far but a much lower final.
+1. Finish the Qwen2.5-7B FOL Step-GDPO main experiments on LogiQA and ReClor, including train + test/eval.
+   - LogiQA: run as a two-GPU FOL job, but do not repeat the failed v1/v2 launch configs.
+   - Before relaunching LogiQA 7B, adjust the rollout memory / tensor-parallel / offload settings so the actor update and vLLM KV cache both fit.
+   - Use `CUDA_VISIBLE_DEVICES=3,4` on `013_2` if those GPUs remain free, with the existing `:4874` judge load balancer.
+   - ReClor: resume or restart `train_reclor7b_fol_gpu1_v1.log` only after a stable two-GPU slot is available.
+   - If using `017_2`, restore the reverse judge forward to `127.0.0.1:4874` before launching.
+   - Test/evaluate best and final checkpoints. For ReClor, use labeled validation as the reportable held-out split unless a labeled test source is added.
+2. Rerun LogiQA Qwen2.5-1.5B FOL Step-GDPO after the small rewarding change.
+   - Treat this as the refreshed 1.5B main FOL run; compare against the previous v4 numbers and report best/final validation plus held-out test.
+   - Keep judge / FOL settings fixed unless the rewarding change explicitly requires a config delta.
+3. Run pure GRPO / outcome-only baselines with and without the reasoning prompt.
+   - With prompt: use the same prompt-v2 data format as the FOL/format/self-eval runs.
+   - Without prompt: remove the reasoning system prompt while keeping dataset splits, answer extraction, rollout count, and optimizer settings comparable.
+   - Run train + held-out test, and use this as the prompt-dependence ablation for the paper tables.
+4. Evaluate LogiQA-trained checkpoints out of domain.
+   - Evaluate best/final LogiQA checkpoints on ReClor and GSM8K.
+   - Label these as transfer / out-of-domain results, not in-domain test scores.
+   - For ReClor, use labeled validation unless a labeled test source is added; for GSM8K, use the standard test parquet.
+5. Rerun GSM8K Qwen2.5-Math-1.5B-Instruct FOL only with XML-compatible prompting / constraints.
+   - The prior run stopped early because the math model emitted natural-language CoT without XML steps, so FOL process reward was skipped.
+6. Use two experimental protocols in the paper.
+   - In-domain protocol: train on dataset A and evaluate on A for controlled reward/method comparisons.
+   - Universal-verifier protocol: train one mixed checkpoint, then evaluate it on multiple datasets.
+   - Candidate logic mix: LogiQA + ReClor + AR-LSAT, tested on LogiQA/ReClor/AR-LSAT/FOLIO/FLDx2.
+   - Candidate math mix: GSM8K + AQUA-RAT, tested on GSM8K/AQUA-RAT and selected math test sets.
+7. Finish probe work before scaling the mixed-training runs.
+   - FOLIO full and FLDx2 full: report strict/all FOL judge metrics separately.
+   - ProcessBench GSM8K: use it as diagnostic F1 for step correctness, not as a training reward until quality is known.
+8. Dataset expansion.
+   - AR-LSAT preprocessing is ready for A/B/C/D/E labels; run a small FOL probe before training.
+   - Add AQUA-RAT only through math mode, with A-E option handling.
+   - Treat ARC as low-priority or non-FOL because most signal is world knowledge rather than Z3-verifiable logic.
+9. Tree search remains lower priority.
+   - Current evidence says tree collapse is not fixed by simply making the tree deeper.
+   - If revisited, use outcome gating or a nontrivial-step constraint rather than another deeper-only run.
+10. Reporting.
+   - Keep README tables updated with best and final/current metrics to three decimals.
+   - Separate validation from held-out test; for ReClor, the official test split is unlabeled, so use labeled validation unless a new labeled test source is added.
+11. Related-work alignment for the paper.
+   - Logic-RL (`arXiv:2502.14768`): cite as rule-based RLVR / strict-format logic training, not as a PRM baseline. Use our format and rule-reward ablations plus cross-dataset generalization to compare against this line.
+   - AURORA (`arXiv:2502.11520`): cite as automated LLM-as-a-judge process-label generation plus universal PRM training. If we compare directly, use mixed-train multi-test evaluation and ProcessBench-style diagnostics rather than only A-on-A training.
+   - ThinkPRM / Process Reward Models That Think (`arXiv:2504.16828`): cite as generative PRM with verification CoT. Our contrast is executable Z3 verification and fail-closed semantics; probes on ProcessBench, FOLIO, and FLDx2 are the minimum evidence for this comparison.
+   - For PRM-style related work in general, keep both views: in-domain A->A tables for controlled training comparisons, and single-checkpoint mixed-train multi-test tables for "universal verifier / PRM" claims.
 
 ## Current Findings
 

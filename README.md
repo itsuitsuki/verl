@@ -157,6 +157,26 @@ python3 scripts/openai_lb.py \
     --timeout 700
 ```
 
+If only one large-memory GPU is available, start a single-card judge instead.
+This is slower and has a lower concurrency cap, but is enough for probes and
+small FOL runs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model /root/run/models/Qwen3.6-35B-A3B \
+    --served-model-name Qwen3.6-35B-A3B \
+    --port 4872 \
+    --tensor-parallel-size 1 \
+    --max-model-len 12288 \
+    --gpu-memory-utilization 0.90 \
+    --max-num-seqs 128 \
+    --enable-prefix-caching \
+    --max-cudagraph-capture-size 128
+```
+
+If the single-card server OOMs during initialization, first lower
+`--max-num-seqs` to `64`, then lower `--gpu-memory-utilization` to `0.85`.
+
 Then point FOL training at the load balancer:
 
 ```bash
@@ -211,20 +231,46 @@ these are validation results on 500 labeled validation examples.
 |---|---|---:|---:|---|
 | Qwen2.5-1.5B-Instruct base | `train_fol_step_gdpo_reclor_gpu2_v4.log` | `48.600% @0` | `48.600% @0` | Initial validation before RL |
 | FOL Step-GDPO v4 | `train_fol_step_gdpo_reclor_gpu2_v4.log` | `58.600% @450` | `58.000% @579` | Final train score `52.344%`; final FOL step reward `55.469%` |
-| GSPO outcome-only | `train_gspo_outcome_only_reclor_gpu4_v1.log` | running | running | Started after FOL run |
-| DAPO outcome-only | `train_dapo_outcome_only_reclor_gpu3_v1.log` | running | running | Started after FOL run |
+| Format Step-GDPO | `train_format_step_gdpo_reclor_gpu2_v1.log` | `59.000% @579` | `59.000% @579` | Strongest completed 1.5B ReClor baseline so far |
+| Self-eval Step-GDPO | `train_self_eval_step_gdpo_reclor_gpu2_v1.log` | `58.400% @450` | `57.800% @579` | Completed |
+| GSPO outcome-only | `train_gspo_outcome_only_reclor_gpu4_v1.log` | `59.600% @400` | `55.000% @579` | Outcome-only + GSPO loss, KL off |
+| DAPO outcome-only | `train_dapo_outcome_only_reclor_gpu3_v1.log` | `59.400% @550` | `58.800% @579` | Outcome-only baseline |
+| FOL Step-GDPO KL-off | `train_reclor_fol_kloff_gpu2_v1.log` | `56.400% @200` | `54.800% @400` stopped | Stopped after step `404/579`; weaker than FOL v4 / format / DAPO |
+| Qwen2.5-7B FOL Step-GDPO | `train_reclor7b_fol_gpu1_v1.log` | `75.000% @100` | `74.600% @200` crashed | Crashed after step `206/579` when the `017_2` judge forward to `:4874` disappeared; `global_step_200` checkpoint exists |
+
+## GSM8K Snapshot
+
+GSM8K uses `data/gsm8k` with `fol_task_type=math`; validation below is the
+GSM8K test set used as `data.val_files`.
+
+| Method | Log | Best Val/Test Acc | Final / Current Val/Test Acc | Notes |
+|---|---|---:|---:|---|
+| Qwen2.5-1.5B-Instruct base | `test_base_qwen25_15b_gsm8k_0172_gpu2.log` | `40.788% @0` | `40.788% @0` | Greedy/test-only base model evaluation |
+| FOL Step-GDPO 1.5B | `train_fol_step_gdpo_gsm8k_gpu4_v1.log` | `75.739% @700/900` | `74.223% @934` | Math-mode FOL reward |
+| Format Step-GDPO 1.5B | `train_format_step_gdpo_gsm8k_0172_gpu0_v1.log` | `77.331% @700` | `74.905% @934` | Completed on `017_2` |
+| Self-eval Step-GDPO 1.5B | `train_self_eval_step_gdpo_gsm8k_gpu3_v1.log` | `79.682% @934` | `79.682% @934` | Strongest completed GSM8K 1.5B run so far |
+| GSPO outcome-only 1.5B | `train_gspo_outcome_only_gsm8k_0172_gpu1_v1.log` | `77.938% @800` | `75.284% @934` | Completed on `017_2` |
+| DAPO outcome-only 1.5B | `train_dapo_outcome_only_gsm8k_0172_gpu3_v1.log` | `77.180% @400` | `73.086% @934` | Completed on `017_2` |
+| Qwen2.5-Math-1.5B-Instruct FOL | `train_gsm8k_math1.5b_fol_gpu4_v1.log` | stopped | stopped | Produced natural-language math CoT without XML steps, so FOL process reward was skipped |
+| Qwen2.5-7B-Instruct FOL | `train_gsm8k7b_fol_gpu34_v1.log` | `91.054% @200` | `90.447% @934` | Completed on GPU3/4; final train score `100.000%`, recent-10 train score `94.531%` |
 
 Current priority after this snapshot:
 
-1. Run held-out LogiQA test for the Qwen2.5-1.5B-Instruct base model.
-2. Monitor ReClor GSPO/DAPO baselines against the FOL Step-GDPO `58.600%` best.
-3. Run held-out LogiQA test for remaining retained checkpoints: self-eval Step-GDPO, FOL Tree-GAE, and A800 tree baselines.
-4. Run FOL Step-GDPO with GSPO/DAPO-style optimization controls:
-   `seq-mean-token-mean`, KL ablations, then `policy_loss.loss_mode=gspo`.
-5. For tree search, first run the clean 5:5 ablation:
-   `+algorithm.step_reward_weights='[0.5, 0.5]'`.
-6. If 5:5 still collapses to short paths, add tree-only outcome gating for paths
-   with too few rewardable XML reasoning steps.
+1. Run LogiQA 7B FOL Step-GDPO on two GPUs; the earlier one-GPU attempt OOMed during actor update.
+2. Resume or restart ReClor 7B FOL Step-GDPO only after a stable two-GPU slot and judge route are available.
+3. Keep both evaluation protocols: in-domain A->A comparisons and single-checkpoint mixed-train multi-test evaluation for universal-verifier claims.
+4. Finish FOLIO/FLDx2 and ProcessBench GSM8K probes to quantify out-of-domain FOL judge behavior.
+5. Deprioritize tree search until step-level baselines and 7B scaling are clearer; if revisited, start from reward-shaping rather than deeper tree length alone.
+
+## Related-Work Positioning
+
+| Work | Category | What It Does | How To Compare / Position Ours |
+|---|---|---|---|
+| Logic-RL (`arXiv:2502.14768`) | Rule-based RLVR on logic | Trains on synthetic logic puzzles with a strict format reward and exact answer verification; the paper reports that a 7B model trained on 5K logic problems generalizes to harder math benchmarks such as AIME/AMC. | Cite as evidence that rule-based verifiers plus strict format constraints can teach reasoning behavior. It is not a PRM baseline; the closest comparison is our format/rule-reward ablation and cross-dataset generalization from logic data. |
+| AURORA (`arXiv:2502.11520`) | Automated universal PRM training | Uses LLM-as-a-judge ensemble prompting plus reverse verification to label reasoning processes, then trains a universal PRM evaluated on diverse policies and long-CoT trajectories. | Position our method as replacing learned/judge-generated process labels with executable formal verification online. A fair PRM-style comparison should include mixed-train, multi-test evaluation and ProcessBench-style diagnostics; optional follow-up is distilling FOL labels into a PRM. |
+| Process Reward Models That Think / ThinkPRM (`arXiv:2504.16828`) | Generative PRM | Fine-tunes a verifier to generate verification CoT for each reasoning step, using far fewer process labels than discriminative PRMs; evaluates on ProcessBench, MATH-500, AIME, and OOD reasoning/code subsets. | Closest conceptual baseline for "a reward model that reasons before scoring." Our distinction is formal fail-closed checking through Z3 rather than verbalized judging; report ProcessBench/FOLIO/FLDx2 probes to show where executable FOL verification helps or fails. |
+
+Protocol note: report both in-domain A->A results and single-checkpoint mixed-train multi-test results. The latter is the right comparison point for universal PRM / LLM-as-judge verifier work.
 
 Version 1, 2000 samples, plain text format:
 

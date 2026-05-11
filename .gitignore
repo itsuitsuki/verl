@@ -1,3 +1,5 @@
+probe_outputs
+probe_outputs/*
 .claude
 .claude/*
 # self-defined
