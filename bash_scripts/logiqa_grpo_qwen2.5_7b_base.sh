@@ -12,11 +12,15 @@ set -x
 #   bash bash_scripts/prepare_logiqa_base_prompt.sh
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+PROJECT_ROOT=${PROJECT_ROOT:-/data/home/scyb224/run/Workspaces/nverl}
+if [ ! -d "$PROJECT_ROOT" ]; then
+    PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+fi
+REPO_ROOT="$PROJECT_ROOT"
 
-MODEL_PATH=${MODEL_PATH:-/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-7B-Instruct}
+MODEL_PATH=${MODEL_PATH:-/data/home/scyb224/run/Workspaces/LLMs/Qwen2.5-7B-Instruct}
 DATA_NAME=${DATA_NAME:-logiqa_base_prompt}
-DATA_DIR=${DATA_DIR:-"$REPO_ROOT/data/${DATA_NAME}"}
+DATA_DIR=${DATA_DIR:-/data/home/scyb224/run/Workspaces/nverl/data/logiqa_base_prompt}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-2}
 NNODES=${NNODES:-1}
 
