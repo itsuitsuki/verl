@@ -17,12 +17,19 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 MODEL_PATH=${MODEL_PATH:-/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-7B-Instruct}
 DATA_NAME=${DATA_NAME:-logiqa_base_prompt}
 DATA_DIR=${DATA_DIR:-"$REPO_ROOT/data/${DATA_NAME}"}
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-2}
+NNODES=${NNODES:-1}
 
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
+
+# Default to 2 GPUs when user does not provide CUDA_VISIBLE_DEVICES.
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES=0,1
+fi
 
 if [ ! -d "$MODEL_PATH" ]; then
     echo "ERROR: MODEL_PATH does not exist: $MODEL_PATH" >&2
@@ -37,6 +44,8 @@ if [ ! -f "$DATA_DIR/train.parquet" ] || [ ! -f "$DATA_DIR/validation.parquet" ]
 fi
 
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+echo "N_GPUS_PER_NODE=$N_GPUS_PER_NODE"
+echo "NNODES=$NNODES"
 echo "MODEL_PATH=$MODEL_PATH"
 echo "DATA_DIR=$DATA_DIR"
 
@@ -83,8 +92,8 @@ python3 -u -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl-fol-2' \
     trainer.experiment_name="qwen2.5-7b_grpo_logiqa_base_${DATA_NAME}" \
-    trainer.n_gpus_per_node=1 \
-    trainer.nnodes=1 \
+    trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
+    trainer.nnodes=$NNODES \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.test_freq=50 \
