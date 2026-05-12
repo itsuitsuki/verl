@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Re-exec with bash when invoked via `sh ...`.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 set -x
 
