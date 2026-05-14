@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Re-exec with bash when invoked via `sh ...`.
+
+module load cuda/12.8
+
+
 if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-set -euo pipefail
 set -x
 
 # LogiQA + GRPO baseline training script (Qwen2.5-7B-Instruct).
@@ -24,16 +27,17 @@ DATA_DIR=${DATA_DIR:-/data/home/scyb224/run/Workspaces/nverl/data/logiqa_base_pr
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-2}
 NNODES=${NNODES:-1}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1536}
-ROLLOUT_N=${ROLLOUT_N:-8}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
+ROLLOUT_N=${ROLLOUT_N:-16}
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.5}
-ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
-ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-true}
 
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
+export WANDB_API_KEY='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'
+export WANDB_MODE=online
+
 
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
@@ -65,9 +69,8 @@ echo "MAX_RESPONSE_LENGTH=$MAX_RESPONSE_LENGTH"
 echo "ROLLOUT_N=$ROLLOUT_N"
 echo "ROLLOUT_TP_SIZE=$ROLLOUT_TP_SIZE"
 echo "ROLLOUT_GPU_MEMORY_UTILIZATION=$ROLLOUT_GPU_MEMORY_UTILIZATION"
-echo "ROLLOUT_MAX_NUM_SEQS=$ROLLOUT_MAX_NUM_SEQS"
 echo "ROLLOUT_MAX_NUM_BATCHED_TOKENS=$ROLLOUT_MAX_NUM_BATCHED_TOKENS"
-echo "ROLLOUT_ENFORCE_EAGER=$ROLLOUT_ENFORCE_EAGER"
+echo "FLASHINFER_DISABLE_VERSION_CHECK=$FLASHINFER_DISABLE_VERSION_CHECK"
 
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -90,38 +93,29 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEMORY_UTILIZATION \
-    actor_rollout_ref.rollout.max_num_seqs=$ROLLOUT_MAX_NUM_SEQS \
     actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_NUM_BATCHED_TOKENS \
-    actor_rollout_ref.rollout.enforce_eager=$ROLLOUT_ENFORCE_EAGER \
     actor_rollout_ref.rollout.n=$ROLLOUT_N \
     actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
-    reward_model.reward_manager=dapo \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=$MAX_RESPONSE_LENGTH \
+    reward_model.reward_manager=naive \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl-fol-2' \
-    trainer.experiment_name="qwen2.5-7b_grpo_logiqa_base_${DATA_NAME}" \
+    trainer.experiment_name="Qwen2.5-7B_grpo_${DATA_NAME}_base_Prompt" \
     trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
-    trainer.save_freq=100 \
+    trainer.save_freq=999999 \
     trainer.max_actor_ckpt_to_keep=1 \
-    trainer.test_freq=50 \
     trainer.total_epochs=1 \
     ++data.seed=42 \
     actor_rollout_ref.actor.data_loader_seed=42 \
-    critic.data_loader_seed=42 \
-    "$@"
+    critic.data_loader_seed=42 $@
