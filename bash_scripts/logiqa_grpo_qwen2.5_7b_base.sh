@@ -23,6 +23,14 @@ DATA_NAME=${DATA_NAME:-logiqa_base_prompt}
 DATA_DIR=${DATA_DIR:-/data/home/scyb224/run/Workspaces/nverl/data/logiqa_base_prompt}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-2}
 NNODES=${NNODES:-1}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1536}
+ROLLOUT_N=${ROLLOUT_N:-8}
+ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
+ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.35}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-64}
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
+ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER:-true}
 
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-XFORMERS}
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
@@ -52,6 +60,14 @@ echo "N_GPUS_PER_NODE=$N_GPUS_PER_NODE"
 echo "NNODES=$NNODES"
 echo "MODEL_PATH=$MODEL_PATH"
 echo "DATA_DIR=$DATA_DIR"
+echo "MAX_PROMPT_LENGTH=$MAX_PROMPT_LENGTH"
+echo "MAX_RESPONSE_LENGTH=$MAX_RESPONSE_LENGTH"
+echo "ROLLOUT_N=$ROLLOUT_N"
+echo "ROLLOUT_TP_SIZE=$ROLLOUT_TP_SIZE"
+echo "ROLLOUT_GPU_MEMORY_UTILIZATION=$ROLLOUT_GPU_MEMORY_UTILIZATION"
+echo "ROLLOUT_MAX_NUM_SEQS=$ROLLOUT_MAX_NUM_SEQS"
+echo "ROLLOUT_MAX_NUM_BATCHED_TOKENS=$ROLLOUT_MAX_NUM_BATCHED_TOKENS"
+echo "ROLLOUT_ENFORCE_EAGER=$ROLLOUT_ENFORCE_EAGER"
 
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -59,8 +75,8 @@ python3 -u -m verl.trainer.main_ppo \
     data.val_files=$DATA_DIR/validation.parquet \
     data.train_batch_size=4 \
     data.val_batch_size=8 \
-    data.max_prompt_length=2048 \
-    data.max_response_length=2048 \
+    data.max_prompt_length=$MAX_PROMPT_LENGTH \
+    data.max_response_length=$MAX_RESPONSE_LENGTH \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.dataloader_num_workers=0 \
@@ -77,10 +93,13 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
-    actor_rollout_ref.rollout.n=16 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEMORY_UTILIZATION \
+    actor_rollout_ref.rollout.max_num_seqs=$ROLLOUT_MAX_NUM_SEQS \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$ROLLOUT_MAX_NUM_BATCHED_TOKENS \
+    actor_rollout_ref.rollout.enforce_eager=$ROLLOUT_ENFORCE_EAGER \
+    actor_rollout_ref.rollout.n=$ROLLOUT_N \
     actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
@@ -91,7 +110,7 @@ python3 -u -m verl.trainer.main_ppo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=2048 \
+    +reward_model.reward_kwargs.max_resp_len=$MAX_RESPONSE_LENGTH \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl-fol-2' \
