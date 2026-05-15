@@ -133,7 +133,7 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
         actor_rollout_ref.rollout.val_kwargs.do_sample=false \
         actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-        actor_rollout_ref.ref.fsdp_config.param_offload=False \
+        actor_rollout_ref.ref.fsdp_config.param_offload=True \
         trainer.critic_warmup=0 \
         trainer.logger='["console"]' \
         trainer.project_name=verl-fol-2 \
