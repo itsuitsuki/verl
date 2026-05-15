@@ -192,6 +192,84 @@ are enabled in the script: prefix caching, `VLLM_MAX_NUM_SEQS=256`, and
 `VLLM_MAX_CUDAGRAPH_CAPTURE_SIZE=256`. Override those environment variables only
 when the judge server has memory pressure or needs a different concurrency cap.
 
+### Experiment Alignment Invariants
+
+Use this section when reproducing runs on another cluster. The items below are
+the baseline constants for comparable FOL Step-GDPO runs. Do not silently change
+them across clusters.
+
+Core task and reward:
+
+```text
+DATA_DIR=data/logiqa2k_prompt_v2
+algorithm.adv_estimator=step_gdpo
+algorithm.step_reward_type=fol
+algorithm.use_xml_steps=true
+algorithm.step_reward_weights=[0.8,0.2]
+algorithm.penalty_max_steps=12
+algorithm.penalty_on_truncated=true
+algorithm.penalty_on_multi_boxed=true
+algorithm.penalty_on_bad_format=true
+algorithm.penalty_score=-1.0
+algorithm.fol_max_tries=1
+algorithm.fol_timeout=10
+algorithm.fol_cumulative_mode=current_only
+algorithm.fol_judge_use_outlines=true
+algorithm.validate_with_step_reward=false
+reward.api_config.api_context_shrink_min_tokens=16
+reward.api_config.api_context_shrink_retries=6
+```
+
+Training and rollout invariants for the main `n=16` LogiQA 7B run:
+
+```text
+actor_rollout_ref.model.path=/root/run/models/Qwen2.5-7B-Instruct
+data.train_batch_size=4
+data.max_prompt_length=2048
+data.max_response_length=1536
+actor_rollout_ref.actor.ppo_mini_batch_size=4
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+actor_rollout_ref.rollout.n=16
+actor_rollout_ref.rollout.temperature=0.8
+actor_rollout_ref.rollout.top_p=0.95
+actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4
+actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4
+actor_rollout_ref.actor.use_kl_loss=true
+actor_rollout_ref.actor.kl_loss_coef=0.02
+actor_rollout_ref.actor.kl_loss_type=low_var_kl
+algorithm.use_kl_in_reward=false
+data.seed=42
+actor_rollout_ref.actor.data_loader_seed=42
+critic.data_loader_seed=42
+```
+
+Resource knobs may change across clusters, but record them in the run note if
+they differ:
+
+```text
+CUDA_VISIBLE_DEVICES
+trainer.n_gpus_per_node
+OPENAI_BASE_URL
+REWARD_NUM_WORKERS
+STEP_REWARD_MAX_WORKERS
+FOL_OPENAI_MAX_INFLIGHT
+actor_rollout_ref.rollout.gpu_memory_utilization
+actor_rollout_ref.rollout.max_model_len
+actor_rollout_ref.rollout.max_num_seqs
+actor_rollout_ref.rollout.max_num_batched_tokens
+actor_rollout_ref.actor.fsdp_config.optimizer_offload
+```
+
+Changing `actor_rollout_ref.rollout.n` changes the experiment. If a memory
+fallback uses `n=8`, the experiment name and log name must include `n8`, for
+example `qwen7b_step_gdpo_fol_logiqa_gpu67_n8_v1`.
+
+For H200 migration, the clean two-GPU layout is one H200 for the single-card
+judge and one H200 for training. Keep the invariants above unchanged unless the
+run name explicitly marks the change. For H100, do not assume the current
+Qwen3.6-35B-A3B judge is stable as a single-card server; prefer tensor-parallel
+judge service or a smaller judge.
+
 ## LogiQA Prompt-v2 Baseline Snapshot
 
 Snapshot from local logs on 2026-05-02. Accuracy is `val-core/logiqa/acc/mean@1`;
