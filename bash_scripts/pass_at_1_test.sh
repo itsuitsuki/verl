@@ -37,7 +37,7 @@ VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1536}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.50}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-128}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 
@@ -110,13 +110,11 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.ppo_mini_batch_size=4 \
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
-        actor_rollout_ref.actor.use_kl_loss=True \
-        actor_rollout_ref.actor.kl_loss_coef=0.02 \
-        actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+        actor_rollout_ref.actor.use_kl_loss=False \
         actor_rollout_ref.actor.entropy_coeff=0 \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
-        actor_rollout_ref.actor.fsdp_config.param_offload=False \
-        actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+        actor_rollout_ref.actor.fsdp_config.param_offload=True \
+        actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
         actor_rollout_ref.rollout.name=vllm \
@@ -128,11 +126,11 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         actor_rollout_ref.rollout.max_num_seqs="$MAX_NUM_SEQS" \
         actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
         actor_rollout_ref.rollout.enforce_eager=True \
+        actor_rollout_ref.actor.fsdp_config.model_dtype=auto \
         actor_rollout_ref.rollout.val_kwargs.n=1 \
         actor_rollout_ref.rollout.val_kwargs.temperature=0 \
         actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
         actor_rollout_ref.rollout.val_kwargs.do_sample=false \
-        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         trainer.critic_warmup=0 \
         trainer.logger='["console"]' \
@@ -151,11 +149,11 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         actor_rollout_ref.actor.data_loader_seed=42 \
         critic.data_loader_seed=42 \
         "${resume_args[@]}" \
-        "$@" 2>&1)
+        "$@" 2>&1) || true
 
     echo "$run_output"
 
-    acc=$(echo "$run_output" | grep -oP "val-core/[^/]+/acc/mean@1['\"]?:\s*\K[0-9.]+" | tail -1)
+    acc=$(echo "$run_output" | grep -oP "val-core/[^/]+/acc/mean@1[^0-9]*\K[0-9.]+" | tail -1)
     if [ -z "$acc" ]; then
         echo "WARNING: could not parse accuracy from run $run_i"
     else

@@ -2,9 +2,84 @@
 
 This note summarizes the current debugging state for the LogiQA2K 1.5B FOL reward runs, so another person can continue without reconstructing the full chat history.
 
-## Current Priority TODO, 2026-05-05
+## Current Priority TODO, 2026-05-21
 
-Treat this section as the authoritative next-step list. Older sections below are historical context unless they agree with this section.
+Treat this section as the authoritative next-step list. Older sections below are historical context.
+
+### Phase 1: Data Preparation (Paratera ~/run/work/verl/data/)
+
+- [x] AR-LSAT parquet 生成: `ar_lsat_prompt_v2/` (train 1585 / val 231 / test 230)
+- [x] MATH-lighteval parquet 生成: `math/` (train 7500 / test 5000)
+- [ ] MATH-500 parquet 生成: `math/dev.parquet` (从 HuggingFaceH4/MATH-500 下载，或从 test 按 index 拆出)
+- [x] 合并逻辑数据集: `combined_logic/` (train 13599 = LogiQA 7376 + Reclor 4638 + AR-LSAT 1585, val 1382)
+- [x] GSM8K 已有: `gsm8k/`
+
+### Phase 2: 7B Training on Combined Logic (Paratera)
+
+四种方法，全部在 combined_logic 上训练 7B (Qwen2.5-7B-Instruct):
+
+| 方法 | 需要 judge | 脚本 | 状态 |
+|------|-----------|------|------|
+| FOL Step GDPO | 是 (Qwen3.6-35B-A3B) | 待写 | [ ] |
+| GRPO | 否 | 待写 (基于 grpo_outcome_only_1gpu.sh) | [ ] |
+| GSPO | 否 | 待写 (基于 gspo_outcome_only.sh) | [ ] |
+| DAPO | 否 | 待写 (基于 one_epoch_dapo.sh) | [ ] |
+
+训练参数参考:
+- Paratera srun: `-G N -p gpu_h200 -t 480`
+- LD_PRELOAD 必须设置
+- WANDB_ENTITY=verl-fol, project=verl-fol-2
+- combined_logic total_steps = 13599 / batch_size
+
+### Phase 3: Pass@1 Testing (每个模型 × 每个数据集)
+
+测试数据集:
+- LogiQA test (`logiqa2k_prompt_v2/test.parquet` 或同目录 validation)
+- Reclor val (`reclor_prompt_v2/validation.parquet`)
+- AR-LSAT test (`ar_lsat_prompt_v2/test.parquet`)
+- GSM8K test (`gsm8k/test.parquet`)
+- MATH-500 (`math/dev.parquet`)
+
+测试脚本: `bash_scripts/pass_at_1_test.sh` (已修改: 无 ref model, bf16 dtype, param_offload=True)
+
+### Phase 4: Code Sync
+
+- [ ] 本地改动 git push → Paratera git pull (pass_at_1_test.sh 改动等)
+
+### Completed Results
+
+**7B FOL Step GDPO (单数据集训练)**
+
+| 训练数据 | 测试数据 | 结果 |
+|---------|---------|------|
+| LogiQA ckpt@1844 → LogiQA val | 49.46% ± 0.13% |
+| LogiQA ckpt@1844 → LogiQA test | 57.60% ± 0.13% |
+| Reclor ckpt@579 → Reclor val | 76.40% ± 0.00% |
+
+**1.5B FOL Step GDPO**
+
+| 训练数据 | 测试数据 | 结果 |
+|---------|---------|------|
+| LogiQA ckpt@1844 → LogiQA test | 47.57% |
+| LogiQA ckpt@1844 → Reclor val (OOD) | 54.20% |
+| GSM8K ckpt@934 → GSM8K test | 74.37% |
+| Reclor ckpt@579 → Reclor val | 58.27% |
+
+**1.5B GRPO Baselines**
+
+| 训练数据 | 测试数据 | 结果 |
+|---------|---------|------|
+| GRPO LogiQA ckpt@1844 → LogiQA test | 42.50% ± 0.47% |
+| GRPO LogiQA ckpt@1844 → LogiQA val | 38.45% ± 0.47% |
+| GRPO Reclor ckpt@579 → Reclor val | 59.00% ± 0.00% |
+| GRPO GSM8K ckpt@934 → GSM8K test | 73.74% ± 0.41% |
+| FOL 1.5B Reclor ckpt@579 → Reclor val | 57.87% ± 0.19% |
+
+---
+
+## Historical Priority TODO, 2026-05-05
+
+The section below is from an earlier session. Items that conflict with the 2026-05-16 section above are superseded.
 
 ### Active / Latest Runs
 
