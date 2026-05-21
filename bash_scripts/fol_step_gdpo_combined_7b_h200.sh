@@ -1,8 +1,8 @@
 #!/bin/bash
 set -x
 
-# 7B FOL Step GDPO on Combined Logic (LogiQA+Reclor+AR-LSAT) — 2x H200: GPU 0 = judge, GPU 1 = training
-# For Paratera: srun -G2 -p gpu_h200 -t 480 bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
+# 7B FOL Step GDPO on Combined Logic (LogiQA+Reclor+AR-LSAT) — 3x H200: GPU 0 = judge, GPU 1-2 = FSDP training
+# For Paratera: srun -G3 -p gpu_h200 -t 480 bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
 
 source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh
 conda activate verl
@@ -21,8 +21,9 @@ unset HIP_VISIBLE_DEVICES
 
 JUDGE_MODEL=/data/home/scyb676/run/models/Qwen3.6-35B-A3B
 JUDGE_PORT=4873
-TRAIN_MODEL=/data/home/scyb676/run/models/Qwen2.5-7B-Instruct
+TRAIN_MODEL=${MODEL_PATH:-/data/home/scyb676/run/models/Qwen3-8B}
 DATA_DIR=/data/home/scyb676/run/work/verl/data/combined_logic
+MODEL_TAG=$(basename "$TRAIN_MODEL" | tr '[:upper:]' '[:lower:]')
 
 export OPENAI_BASE_URL="http://127.0.0.1:${JUDGE_PORT}/v1"
 export FOL_MODEL="Qwen3.6-35B-A3B"
@@ -60,7 +61,7 @@ fi
 
 # --- Start training on GPU 1 ---
 echo "Starting 7B Combined Logic training on GPU 1... logs: $LOG_DIR/train.log"
-CUDA_VISIBLE_DEVICES=1 python3 -u -m verl.trainer.main_ppo \
+CUDA_VISIBLE_DEVICES=1,2 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_gdpo \
     +algorithm.step_reward_type=fol \
     +algorithm.fol_max_tries=1 \
@@ -96,13 +97,12 @@ CUDA_VISIBLE_DEVICES=1 python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    '+actor_rollout_ref.actor.optim.override_optimizer_config={foreach: false}' \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.20 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.40 \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.max_num_seqs=128 \
@@ -110,16 +110,15 @@ CUDA_VISIBLE_DEVICES=1 python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.rollout.top_p=0.95 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=verl-fol-2 \
-    trainer.experiment_name=qwen7b_step_gdpo_fol_combined_h200_v1 \
-    trainer.default_local_dir=checkpoints/verl-fol/qwen7b_step_gdpo_fol_combined_h200_v1 \
-    trainer.n_gpus_per_node=1 \
+    trainer.experiment_name=${MODEL_TAG}_step_gdpo_fol_combined_h200_v1 \
+    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_step_gdpo_fol_combined_h200_v1 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=1 \

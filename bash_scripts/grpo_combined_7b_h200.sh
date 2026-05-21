@@ -1,8 +1,8 @@
 #!/bin/bash
 set -x
 
-# 7B GRPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT) — 1x H200
-# For Paratera: srun -G1 -p gpu_h200 -t 480 bash bash_scripts/grpo_combined_7b_h200.sh
+# 7B GRPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT) — 2x H200 FSDP
+# For Paratera: srun -G2 -p gpu_h200 -t 480 bash bash_scripts/grpo_combined_7b_h200.sh
 
 source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh
 conda activate verl
@@ -19,8 +19,9 @@ export no_proxy="127.0.0.1,localhost"
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
-MODEL_PATH=/data/home/scyb676/run/models/Qwen2.5-7B-Instruct
+MODEL_PATH=${MODEL_PATH:-/data/home/scyb676/run/models/Qwen3-8B}
 DATA_DIR=/data/home/scyb676/run/work/verl/data/combined_logic
+MODEL_TAG=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -50,13 +51,12 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    '+actor_rollout_ref.actor.optim.override_optimizer_config={foreach: false}' \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.20 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.40 \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.max_num_seqs=128 \
@@ -64,15 +64,14 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.rollout.top_p=0.95 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    ++actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=verl-fol-2 \
-    trainer.experiment_name=qwen7b_grpo_combined_h200_v1 \
-    trainer.default_local_dir=checkpoints/verl-fol/qwen7b_grpo_combined_h200_v1 \
-    trainer.n_gpus_per_node=1 \
+    trainer.experiment_name=${MODEL_TAG}_grpo_combined_h200_v1 \
+    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_grpo_combined_h200_v1 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=1 \
