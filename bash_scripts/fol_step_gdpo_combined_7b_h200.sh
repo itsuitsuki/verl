@@ -1,67 +1,79 @@
 #!/bin/bash
 set -x
 
-# 7B FOL Step GDPO on Combined Logic (LogiQA+Reclor+AR-LSAT) — 3x H200: GPU 0 = judge, GPU 1-2 = FSDP training
-# For Paratera: srun -G3 -p gpu_h200 -t 480 bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
+# 7B FOL Step GDPO on Combined Logic (LogiQA+Reclor+AR-LSAT)
+# Env setup (conda, WANDB_API_KEY, LD_PRELOAD etc.) should be done before running this script.
+#
+# Mode 1 - embedded judge (same node, e.g. 3x GPU srun):
+#   JUDGE_MODEL=/path/to/model bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
+#   GPU 0 = judge, remaining GPUs = FSDP training
+#
+# Mode 2 - external judge (cross-node, judge already running):
+#   OPENAI_BASE_URL=http://<judge-host>:4873/v1 bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
 
-source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh
-conda activate verl
-cd /data/home/scyb676/run/work/verl
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
-
-export WANDB_API_KEY=${WANDB_API_KEY:-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}
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-online}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
-JUDGE_MODEL=/data/home/scyb676/run/models/Qwen3.6-35B-A3B
-JUDGE_PORT=4873
-TRAIN_MODEL=${MODEL_PATH:-/data/home/scyb676/run/models/Qwen3-8B}
-DATA_DIR=/data/home/scyb676/run/work/verl/data/combined_logic
+TRAIN_MODEL=${MODEL_PATH:?'MODEL_PATH must be set'}
+DATA_DIR=${DATA_DIR:-data/combined_logic}
 MODEL_TAG=$(basename "$TRAIN_MODEL" | tr '[:upper:]' '[:lower:]')
+JUDGE_PORT=${JUDGE_PORT:-4873}
 
-export OPENAI_BASE_URL="http://127.0.0.1:${JUDGE_PORT}/v1"
 export FOL_MODEL="Qwen3.6-35B-A3B"
 
-LOG_DIR="logs/combined_7b_h200_$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="logs/fol_combined_${MODEL_TAG}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p $LOG_DIR
 
-# --- Start judge on GPU 0 ---
-echo "Starting judge on GPU 0... logs: $LOG_DIR/judge.log"
-CUDA_VISIBLE_DEVICES=0 vllm serve $JUDGE_MODEL \
-    --served-model-name Qwen3.6-35B-A3B \
-    --port $JUDGE_PORT \
-    --max-model-len 12288 \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.90 \
-    --enable-prefix-caching \
-    --max-num-seqs 256 \
-    > "$LOG_DIR/judge.log" 2>&1 &
-JUDGE_PID=$!
+# --- Judge setup ---
+JUDGE_PID=""
+if [ -z "$OPENAI_BASE_URL" ]; then
+    # Mode 1: start local judge
+    JUDGE_MODEL=${JUDGE_MODEL:?'JUDGE_MODEL or OPENAI_BASE_URL must be set'}
+    echo "Starting local judge on GPU 0... logs: $LOG_DIR/judge.log"
+    CUDA_VISIBLE_DEVICES=0 vllm serve $JUDGE_MODEL \
+        --served-model-name Qwen3.6-35B-A3B \
+        --port $JUDGE_PORT \
+        --max-model-len 12288 \
+        --tensor-parallel-size 1 \
+        --gpu-memory-utilization 0.90 \
+        --enable-prefix-caching \
+        --max-num-seqs 256 \
+        > "$LOG_DIR/judge.log" 2>&1 &
+    JUDGE_PID=$!
+    export OPENAI_BASE_URL="http://127.0.0.1:${JUDGE_PORT}/v1"
 
-echo "Waiting for judge to be ready..."
-for i in $(seq 1 300); do
-    if curl -s http://127.0.0.1:$JUDGE_PORT/health > /dev/null 2>&1; then
-        echo "Judge ready after ${i}s"
-        break
+    echo "Waiting for judge to be ready..."
+    for i in $(seq 1 300); do
+        if curl -s http://127.0.0.1:$JUDGE_PORT/health > /dev/null 2>&1; then
+            echo "Judge ready after ${i}s"
+            break
+        fi
+        sleep 1
+    done
+
+    if ! curl -s http://127.0.0.1:$JUDGE_PORT/health > /dev/null 2>&1; then
+        echo "ERROR: Judge failed to start within 300s"
+        kill $JUDGE_PID 2>/dev/null
+        exit 1
     fi
-    sleep 1
-done
-
-if ! curl -s http://127.0.0.1:$JUDGE_PORT/health > /dev/null 2>&1; then
-    echo "ERROR: Judge failed to start within 300s"
-    kill $JUDGE_PID 2>/dev/null
-    exit 1
+    TRAIN_DEVICES=${TRAIN_DEVICES:-1,2}
+else
+    # Mode 2: external judge
+    echo "Using external judge at $OPENAI_BASE_URL"
+    TRAIN_DEVICES=${TRAIN_DEVICES:-0,1}
 fi
 
-# --- Start training on GPU 1 ---
-echo "Starting 7B Combined Logic training on GPU 1... logs: $LOG_DIR/train.log"
-CUDA_VISIBLE_DEVICES=1,2 python3 -u -m verl.trainer.main_ppo \
+# --- Count training GPUs ---
+N_GPUS=$(echo "$TRAIN_DEVICES" | tr ',' '\n' | wc -l)
+echo "Training on GPUs: $TRAIN_DEVICES ($N_GPUS GPUs)"
+
+# --- Start training ---
+CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_gdpo \
     +algorithm.step_reward_type=fol \
     +algorithm.fol_max_tries=1 \
@@ -77,7 +89,7 @@ CUDA_VISIBLE_DEVICES=1,2 python3 -u -m verl.trainer.main_ppo \
     +algorithm.validate_with_step_reward=false \
     reward_model.reward_manager=step \
     reward.num_workers=64 \
-    +algorithm.step_reward_max_workers=32 \
+    +algorithm.step_reward_max_workers=128 \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/validation.parquet \
     data.train_batch_size=8 \
@@ -116,15 +128,16 @@ CUDA_VISIBLE_DEVICES=1,2 python3 -u -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=verl-fol-2 \
-    trainer.experiment_name=${MODEL_TAG}_step_gdpo_fol_combined_h200_v1 \
-    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_step_gdpo_fol_combined_h200_v1 \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name=${MODEL_TAG}_step_gdpo_fol_combined_v1 \
+    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_step_gdpo_fol_combined_v1 \
+    trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.test_freq=50 \
     trainer.total_epochs=1 \
     trainer.val_before_train=true \
+    trainer.resume_mode=auto \
     ++data.seed=42 \
     actor_rollout_ref.actor.data_loader_seed=42 \
     critic.data_loader_seed=42 \
@@ -134,6 +147,8 @@ CUDA_VISIBLE_DEVICES=1,2 python3 -u -m verl.trainer.main_ppo \
 
 TRAIN_EXIT=$?
 echo "Training finished with exit code $TRAIN_EXIT"
-echo "Judge log: $LOG_DIR/judge.log"
-kill $JUDGE_PID 2>/dev/null
+if [ -n "$JUDGE_PID" ]; then
+    echo "Judge log: $LOG_DIR/judge.log"
+    kill $JUDGE_PID 2>/dev/null
+fi
 exit $TRAIN_EXIT

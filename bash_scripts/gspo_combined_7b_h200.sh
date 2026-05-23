@@ -1,26 +1,20 @@
 #!/bin/bash
 set -x
 
-# 7B GSPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT) — 2x H200 FSDP
-# For Paratera: srun -G2 -p gpu_h200 -t 480 bash bash_scripts/gspo_combined_7b_h200.sh
+# 7B GSPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT) — 2x GPU FSDP
+# Env setup (conda, WANDB_API_KEY, LD_PRELOAD etc.) should be done before running this script.
+# Run from repo root: CUDA_VISIBLE_DEVICES=0,1 bash bash_scripts/gspo_combined_7b_h200.sh
 
-source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh
-conda activate verl
-cd /data/home/scyb676/run/work/verl
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
-
-export WANDB_API_KEY=${WANDB_API_KEY:-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}
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
-export WANDB_MODE=${WANDB_MODE:-offline}
+export WANDB_MODE=${WANDB_MODE:-online}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
-MODEL_PATH=${MODEL_PATH:-/data/home/scyb676/run/models/Qwen3-8B}
-DATA_DIR=/data/home/scyb676/run/work/verl/data/combined_logic
+MODEL_PATH=${MODEL_PATH:?'MODEL_PATH must be set'}
+DATA_DIR=${DATA_DIR:-data/combined_logic}
 MODEL_TAG=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 
 python3 -u -m verl.trainer.main_ppo \
