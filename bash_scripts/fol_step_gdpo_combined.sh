@@ -1,15 +1,15 @@
 #!/bin/bash
 set -x
 
-# 7B FOL Step GDPO on Combined Logic (LogiQA+Reclor+AR-LSAT)
+# FOL Step GDPO on Combined Logic (LogiQA+Reclor+AR-LSAT)
 # Env setup (conda, WANDB_API_KEY, LD_PRELOAD etc.) should be done before running this script.
 #
-# Mode 1 - embedded judge (same node, e.g. 3x GPU srun):
-#   JUDGE_MODEL=/path/to/model bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
-#   GPU 0 = judge, remaining GPUs = FSDP training
+# Mode 1 - embedded judge (same node):
+#   JUDGE_MODEL=/path/to/model bash bash_scripts/fol_step_gdpo_combined.sh
+#   Override: JUDGE_TP, JUDGE_DEVICES, TRAIN_DEVICES
 #
 # Mode 2 - external judge (cross-node, judge already running):
-#   OPENAI_BASE_URL=http://<judge-host>:4873/v1 bash bash_scripts/fol_step_gdpo_combined_7b_h200.sh
+#   OPENAI_BASE_URL=http://<judge-host>:4873/v1 bash bash_scripts/fol_step_gdpo_combined.sh
 
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 export WANDB_MODE=${WANDB_MODE:-online}
@@ -34,12 +34,14 @@ JUDGE_PID=""
 if [ -z "$OPENAI_BASE_URL" ]; then
     # Mode 1: start local judge
     JUDGE_MODEL=${JUDGE_MODEL:?'JUDGE_MODEL or OPENAI_BASE_URL must be set'}
-    echo "Starting local judge on GPU 0... logs: $LOG_DIR/judge.log"
-    CUDA_VISIBLE_DEVICES=0 vllm serve $JUDGE_MODEL \
+    JUDGE_TP=${JUDGE_TP:-2}
+    JUDGE_DEVICES=${JUDGE_DEVICES:-0,1}
+    echo "Starting local judge on GPU $JUDGE_DEVICES (TP=$JUDGE_TP)... logs: $LOG_DIR/judge.log"
+    CUDA_VISIBLE_DEVICES=$JUDGE_DEVICES vllm serve $JUDGE_MODEL \
         --served-model-name Qwen3.6-35B-A3B \
         --port $JUDGE_PORT \
         --max-model-len 12288 \
-        --tensor-parallel-size 1 \
+        --tensor-parallel-size $JUDGE_TP \
         --gpu-memory-utilization 0.90 \
         --enable-prefix-caching \
         --max-num-seqs 256 \
@@ -61,7 +63,7 @@ if [ -z "$OPENAI_BASE_URL" ]; then
         kill $JUDGE_PID 2>/dev/null
         exit 1
     fi
-    TRAIN_DEVICES=${TRAIN_DEVICES:-1,2}
+    TRAIN_DEVICES=${TRAIN_DEVICES:-2,3}
 else
     # Mode 2: external judge
     echo "Using external judge at $OPENAI_BASE_URL"

@@ -1,9 +1,9 @@
 #!/bin/bash
 set -x
 
-# 7B GRPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT) — 2x GPU FSDP
+# GSPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT)
 # Env setup (conda, WANDB_API_KEY, LD_PRELOAD etc.) should be done before running this script.
-# Run from repo root: CUDA_VISIBLE_DEVICES=0,1 bash bash_scripts/grpo_combined_7b_h200.sh
+# Auto-detects GPU count from CUDA_VISIBLE_DEVICES.
 
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 export WANDB_MODE=${WANDB_MODE:-online}
@@ -17,9 +17,21 @@ MODEL_PATH=${MODEL_PATH:?'MODEL_PATH must be set'}
 DATA_DIR=${DATA_DIR:-data/combined_logic}
 MODEL_TAG=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 
+if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+    N_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+else
+    N_GPUS=$(nvidia-smi -L | wc -l)
+fi
+echo "Training on $N_GPUS GPUs"
+
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
+    actor_rollout_ref.actor.policy_loss.loss_mode=gspo \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.actor.clip_ratio_low=0.0003 \
+    actor_rollout_ref.actor.clip_ratio_high=0.0004 \
+    actor_rollout_ref.actor.clip_ratio_c=10.0 \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
@@ -40,8 +52,8 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=8 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.02 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -63,9 +75,9 @@ python3 -u -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=verl-fol-2 \
-    trainer.experiment_name=${MODEL_TAG}_grpo_combined_h200_v1 \
-    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_grpo_combined_h200_v1 \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name=${MODEL_TAG}_gspo_combined_v1 \
+    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_gspo_combined_v1 \
+    trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=1 \

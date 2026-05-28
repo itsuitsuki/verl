@@ -1,9 +1,9 @@
 #!/bin/bash
 set -x
 
-# 7B DAPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT) — 2x GPU FSDP
+# DAPO outcome-only on Combined Logic (LogiQA+Reclor+AR-LSAT)
 # Env setup (conda, WANDB_API_KEY, LD_PRELOAD etc.) should be done before running this script.
-# Run from repo root: CUDA_VISIBLE_DEVICES=0,1 bash bash_scripts/dapo_combined_7b_h200.sh
+# Auto-detects GPU count from CUDA_VISIBLE_DEVICES.
 
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 export WANDB_MODE=${WANDB_MODE:-online}
@@ -16,6 +16,13 @@ unset HIP_VISIBLE_DEVICES
 MODEL_PATH=${MODEL_PATH:?'MODEL_PATH must be set'}
 DATA_DIR=${DATA_DIR:-data/combined_logic}
 MODEL_TAG=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
+
+if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+    N_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+else
+    N_GPUS=$(nvidia-smi -L | wc -l)
+fi
+echo "Training on $N_GPUS GPUs"
 
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -63,9 +70,9 @@ python3 -u -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=verl-fol-2 \
-    trainer.experiment_name=${MODEL_TAG}_dapo_combined_h200_v1 \
-    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_dapo_combined_h200_v1 \
-    trainer.n_gpus_per_node=2 \
+    trainer.experiment_name=${MODEL_TAG}_dapo_combined_v1 \
+    trainer.default_local_dir=checkpoints/verl-fol/${MODEL_TAG}_dapo_combined_v1 \
+    trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=100 \
     trainer.max_actor_ckpt_to_keep=1 \

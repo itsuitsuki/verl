@@ -30,6 +30,7 @@ AGENTS.md
 ### Paratera (Slurm: A800/H100/H200)
 
 - SSH: `ssh paratera-46-ali` (lands on ln01 or ln02; only ln01 has internet)
+- Always run Paratera Slurm/tmux/job commands from ln01 via `ssh paratera-46-ali "ssh ln01 '<command>'"`; do not run them directly on the random login node returned by `ssh paratera-46-ali`.
 - Conda: `source /data/apps/miniforge3/25.11.0-1/etc/profile.d/conda.sh && conda activate verl`
 - Code/data: `~/run/work/verl/`
 - Models: `~/run/models/{Qwen2.5-1.5B-Instruct,Qwen2.5-7B-Instruct,Qwen3.6-35B-A3B}`
