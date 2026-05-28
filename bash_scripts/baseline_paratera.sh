@@ -12,6 +12,7 @@ cd ~/run/work/verl
 export LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
 export MODEL_PATH=~/run/models/Qwen3-4B
 export WANDB_ENTITY=verl-fol
+export WANDB_MODE=offline
 
 METHOD=${1:?'Usage: baseline_paratera.sh {grpo|gspo|dapo}'}
 echo "Node: $(hostname), GPUs: $(nvidia-smi -L | wc -l)"
