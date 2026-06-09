@@ -138,3 +138,8 @@ logs
 log
 outputs
 .history
+
+# local-only (contains secrets or per-machine notes, not for public repo)
+CLAUDE.md
+.playwright-mcp/
+tests/test_siliconflow_concurrency.py
