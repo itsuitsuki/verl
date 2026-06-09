@@ -105,6 +105,7 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         data.filter_overlong_prompts=True \
         data.truncation=error \
         data.dataloader_num_workers=0 \
+        ++data.apply_chat_template_kwargs.enable_thinking=false \
         actor_rollout_ref.model.path="$MODEL_PATH" \
         actor_rollout_ref.actor.optim.lr=1e-6 \
         actor_rollout_ref.model.use_remove_padding=True \
@@ -126,7 +127,7 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         actor_rollout_ref.rollout.max_num_seqs="$MAX_NUM_SEQS" \
         actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
         actor_rollout_ref.rollout.enforce_eager=True \
-        actor_rollout_ref.actor.fsdp_config.model_dtype=auto \
+        actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
         actor_rollout_ref.rollout.val_kwargs.n=1 \
         actor_rollout_ref.rollout.val_kwargs.temperature=0 \
         actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
@@ -153,7 +154,7 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
 
     echo "$run_output"
 
-    acc=$(echo "$run_output" | grep -oP "val-core/[^/]+/acc/mean@1[^0-9]*\K[0-9.]+" | tail -1)
+    acc=$(echo "$run_output" | grep -oP "val-core/.+?/acc/mean@1[^0-9]*\K[0-9.]+" | tail -1)
     if [ -z "$acc" ]; then
         echo "WARNING: could not parse accuracy from run $run_i"
     else

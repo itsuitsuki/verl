@@ -47,6 +47,7 @@ python3 -u -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     data.dataloader_num_workers=0 \
+    ++data.apply_chat_template_kwargs.enable_thinking=false \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
