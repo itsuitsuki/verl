@@ -589,6 +589,24 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         # becomes an assumption instead of a proof obligation
         prop_conj = conjuncts(props_src[k])
         defs_t, claims_t, claims_nodes = [], [], []
+
+        def _conj_carrier(cnode):
+            # Per-conjunct carrier (2026-07-11): the prop-level carrier is
+            # the union of the whole proposition's needs, so a mixed prop
+            # like `x / 2 == 1 and n % 2 == 0` annotated EVERY numeral real
+            # and mistyped the integer half. Each top-level conjunct now
+            # picks the carrier its OWN content requires. (Different-typed
+            # variables inside ONE conjunct still need a typed IR -- known
+            # remaining limitation.)
+            try:
+                from verl.utils.isabelle_utils.pyexpr import analyze as _an
+                cids, _, creal = _an(cnode)
+            except PyExprError:
+                return carrier
+            if creal or any(vt_all.get(i) == "real" for i in cids):
+                return "real"
+            return "int"
+
         for c in prop_conj:
             is_def = (isinstance(c, ast.Compare) and len(c.ops) == 1
                       and isinstance(c.ops[0], ast.Eq)
@@ -602,10 +620,11 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                     is_def = bool(rids & known)
                 except PyExprError:
                     is_def = False
+            ccar = _conj_carrier(c)
             if is_def:
-                defs_t.append(transpile(c, vt_all, carrier))
+                defs_t.append(transpile(c, vt_all, ccar))
             else:
-                claims_t.append(transpile(c, vt_all, carrier))
+                claims_t.append(transpile(c, vt_all, ccar))
                 claims_nodes.append(c)
         entry["n_definitions"] = len(defs_t)
 

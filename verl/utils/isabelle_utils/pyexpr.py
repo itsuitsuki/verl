@@ -43,17 +43,45 @@ CMP = {ast.Eq: "=", ast.NotEq: "~=", ast.Lt: "<", ast.LtE: "<=",
 
 
 def parse_expr(src: str) -> ast.expr:
+    s = src.strip()
     try:
-        tree = ast.parse(src.strip(), mode="eval")
+        tree = ast.parse(s, mode="eval")
     except SyntaxError as e:
         raise PyExprError(f"not a valid Python expression ({e.msg})")
+    # Preserve the ORIGINAL decimal text of float literals (2026-07-11):
+    # ast.parse converts to IEEE float first, so a literal longer than float
+    # precision (0.12345678901234567890) silently rounds before we ever see
+    # it. Fraction(<source text>) is exact; annotate the node so analyze()
+    # and transpile() use the faithful value.
+    for n in ast.walk(tree.body):
+        if isinstance(n, ast.Constant) and isinstance(n.value, float):
+            try:
+                seg = ast.get_source_segment(s, n)
+            except Exception:  # noqa: BLE001
+                seg = None
+            if seg:
+                try:
+                    n._frac_val = Fraction(seg.strip())
+                except (ValueError, ZeroDivisionError):
+                    pass
     return tree.body
 
 
 def _frac(value) -> Fraction:
+    if isinstance(value, Fraction):
+        return value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise PyExprError(f"unsupported constant {value!r}")
     return Fraction(str(value))
+
+
+def _const_frac(n: "ast.Constant") -> Fraction:
+    """Faithful Fraction of a Constant node: prefers the exact source-text
+    annotation from parse_expr over the (possibly rounded) float value."""
+    v = getattr(n, "_frac_val", None)
+    if v is not None:
+        return v
+    return _frac(n.value)
 
 
 def analyze(node):
@@ -110,7 +138,7 @@ def analyze(node):
         elif isinstance(n, ast.Name):
             idents.add(n.id)
         elif isinstance(n, ast.Constant):
-            v = _frac(n.value)
+            v = _const_frac(n)
             consts.add(v)
             if isinstance(n.value, float):
                 needs_real = True
@@ -128,7 +156,7 @@ def _const_eval(n):
     """Fraction value of a pure-constant subtree, else None."""
     if isinstance(n, ast.Constant):
         try:
-            return _frac(n.value)
+            return _const_frac(n)
         except PyExprError:
             return None
     if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
@@ -188,15 +216,30 @@ def transpile(node, var_types: dict, carrier: str) -> str:
                         return f"({a} ^ {k})"
                     return f"(1 / ({a} ^ {abs(k)}))"
                 # int-valued variable exponents (2 ** (T + 1) with T int)
-                # stay in computable ^ via nat coercion; powr would freeze
-                # simp/eval (the OlympiadBench power-identity failure class)
+                # stay in computable ^; powr would freeze simp/eval (the
+                # OlympiadBench power-identity failure class).
+                # 2026-07-11 soundness fix: a bare `nat e` silently maps a
+                # NEGATIVE exponent to 0 (2^(T-5) with T=3 became 2^0 = 1,
+                # changing the math). Emit a sign-guarded form instead --
+                # correct for both signs and still simp/eval-computable.
                 try:
                     eids, _, ereal = analyze(n.right)
                 except PyExprError:
                     eids, ereal = set(), True
                 if not ereal and eids and all(
                         var_types.get(i) == "int" for i in eids):
-                    return f"({a} ^ (nat {t(n.right)}))"
+                    e_t = t(n.right)
+                    if carrier == "real":
+                        return (f"(if {e_t} >= 0 then ({a} ^ (nat {e_t})) "
+                                f"else (1 / ({a} ^ (nat (- {e_t})))))")
+                    # A possibly-negative exponent under a non-real carrier
+                    # has no faithful integer encoding (a^-k is fractional);
+                    # fail closed rather than silently change the meaning.
+                    # (Unreachable via py_to_isabelle: a symbolic exponent
+                    # forces needs_real -> real carrier.)
+                    raise PyExprError(
+                        "symbolic integer exponent requires a real carrier "
+                        "(may be negative)")
                 return f"({a} powr {t(n.right)})"
             if isinstance(n.op, ast.Mod):
                 return f"({a} mod {b})"
@@ -234,7 +277,7 @@ def transpile(node, var_types: dict, carrier: str) -> str:
         if isinstance(n, ast.Name):
             return n.id
         if isinstance(n, ast.Constant):
-            return num(n.value)
+            return num(_const_frac(n))   # exact source-text value if annotated
         raise PyExprError(f"untranspilable node {type(n).__name__}")
 
     return t(node)

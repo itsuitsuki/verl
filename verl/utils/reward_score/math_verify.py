@@ -311,6 +311,32 @@ def _mv_child(reboxed, ground_truth, timeout_score, q):
     # zeroing EVERY forked grade (found by the value-asserting test). The
     # wall timeout + PDEATHSIG bound runtime and orphans; memory growth
     # within the 15s wall is at most ~1GB (bignum spins grow ~1GB/min).
+    #
+    # Silence ONLY math-verify's per-process "Timeout is disabled" warnings:
+    # they fire once per process, and with fork-per-grade EVERY grade is a
+    # fresh process -- 2 lines x 256 grades/step flooded the logs
+    # (2026-07-11). The external 15s wall satisfies what the warning asks
+    # for, so the message is moot here. Targeted filters only (review
+    # feedback): other child warnings (sympy changes, parser issues,
+    # resource warnings) must stay visible. Parent-side guard logs (wall
+    # timeout culprits) are unaffected -- they are emitted by the parent.
+    try:
+        import warnings as _warnings
+        _warnings.filterwarnings(
+            "ignore", message=r".*Timeout is disabled.*")
+
+        def _drop_timeout_disabled(record):
+            return "Timeout is disabled" not in record.getMessage()
+
+        root = _logging.getLogger()
+        root.addFilter(_drop_timeout_disabled)
+        for h in root.handlers:
+            h.addFilter(_drop_timeout_disabled)
+        for _n in list(_logging.root.manager.loggerDict):
+            if _n.startswith("math_verify"):
+                _logging.getLogger(_n).addFilter(_drop_timeout_disabled)
+    except Exception:
+        pass
     try:
         q.put(compute_score(reboxed, ground_truth, timeout_score=timeout_score))
     except BaseException:
@@ -334,6 +360,7 @@ def _compute_score_subproc(reboxed, ground_truth, timeout_score, wall):
             str(ground_truth)[:100])
         return timeout_score                # grader saturated by degenerates
     p = None
+    q = None
     try:
         ctx = _mp.get_context("fork")
         q = ctx.Queue()
@@ -360,6 +387,16 @@ def _compute_score_subproc(reboxed, ground_truth, timeout_score, wall):
                 if p.is_alive():
                     p.kill()
                 p.join(5)
+        except Exception:
+            pass
+        # Explicit queue teardown (2026-07-11 review): every grade creates a
+        # Queue = a feeder thread + a pipe (2 FDs) in the PARENT; without
+        # close()+join_thread() they linger until GC and can accumulate over
+        # a long run's ~hundreds of thousands of grades.
+        try:
+            if q is not None:
+                q.close()
+                q.join_thread()
         except Exception:
             pass
         _MV_FORK_SEM.release()

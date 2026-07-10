@@ -213,15 +213,44 @@ _THM_ENV_FPRINT: str | None = None
 def _thm_env_fprint() -> str:
     """Environment fingerprint for the theorem-verdict cache key (2026-07-11):
     a verdict depends not only on the theorem text but on the SESSION, its
-    imports and options (watchdog, quick_and_dirty, delays). Keying them in
-    means a session/import change invalidates old verdicts automatically
-    instead of silently replaying them. Computed lazily because the constants
-    are defined later in this module."""
+    imports and options (watchdog, quick_and_dirty, delays), the Isabelle
+    executable, the prebuilt heap images, and the verdict-classification
+    schema of check(). Keying them all in means an upgrade or logic change
+    invalidates old verdicts automatically instead of silently replaying
+    them. Computed lazily because the constants are defined later in this
+    module; identity reads are best-effort (a missing stat degrades to a
+    marker string, never an exception)."""
     global _THM_ENV_FPRINT
     if _THM_ENV_FPRINT is None:
-        _THM_ENV_FPRINT = hashlib.sha1("\0".join(
-            [SESSION, THEORY_IMPORTS] + list(SESSION_OPTIONS)
-        ).encode("utf-8")).hexdigest()[:16]
+        parts = [SESSION, THEORY_IMPORTS] + list(SESSION_OPTIONS)
+        # bump when check()'s outcome classification changes meaning
+        parts.append("verdict-schema=v2")
+        try:
+            st = os.stat(ISABELLE_BIN)
+            parts.append(f"bin={ISABELLE_BIN}:{st.st_size}:{int(st.st_mtime)}")
+        except OSError:
+            parts.append(f"bin={ISABELLE_BIN}:unknown")
+        try:
+            import glob as _glob
+            ihu = os.environ.get(
+                "ISABELLE_HOME_USER",
+                os.path.expanduser("~/.isabelle/Isabelle2025"))
+            heaps = sorted(
+                _glob.glob(os.path.join(ihu, "heaps", "*", SESSION))
+                + _glob.glob(os.path.join(ihu, "Isabelle2025", "heaps",
+                                          "*", SESSION)))
+            hp = []
+            for h in heaps[:4]:
+                try:
+                    hst = os.stat(h)
+                    hp.append(f"{h}:{hst.st_size}:{int(hst.st_mtime)}")
+                except OSError:
+                    pass
+            parts.append("heaps=" + (";".join(hp) if hp else "none"))
+        except Exception:  # noqa: BLE001
+            parts.append("heaps=err")
+        _THM_ENV_FPRINT = hashlib.sha1(
+            "\0".join(parts).encode("utf-8")).hexdigest()[:16]
     return _THM_ENV_FPRINT
 
 
@@ -691,6 +720,14 @@ class IsabelleWorker:
                         "errors": [f"{kind}: {str(payload)[:200]}"]}
             errors = [e.get("message", str(e)) if isinstance(e, dict) else str(e)
                       for e in payload.get("errors", [])]
+            # bookkeeping FIRST: the theory was submitted regardless of how
+            # the outcome classifies below, so it must always be purged
+            self.pending_names.append(name)
+            if self.counter % self.purge_every == 0:
+                batch = list(self.pending_names)
+                self.pending_names.clear()
+                threading.Thread(target=self._purge_async, args=(batch,),
+                                 daemon=True).start()
             # 2026-06-12 soundness fix #2: payload "ok" means "no errors SO
             # FAR", not "fully processed". A tactic still running when the
             # headless watchdog (15s) aborts the theory yields ok=true,
@@ -699,25 +736,42 @@ class IsabelleWorker:
             # used to count as a successful proof (this is how the bogus
             # "sqrt metis rung" was born). Require the checked node to be
             # fully finished AND consolidated.
-            node_ok = False
+            #
+            # 2026-07-11 typed-outcome completion (external review): the
+            # target node MISSING from the payload, appearing TWICE, or
+            # CANCELED are protocol/infrastructure states, not verdicts --
+            # mark worker_error (never cacheable, retried on a fresh
+            # worker). A found-but-not-consolidated node is an INCOMPLETE
+            # outcome: structurally excluded from caching (previously only a
+            # string match on the error text kept it out).
+            node_st = None
+            node_seen = 0
             for nd in payload.get("nodes", []):
                 if nd.get("theory_name", "").endswith(name):
-                    st = nd.get("status", {})
-                    node_ok = bool(st.get("ok") and st.get("consolidated")
-                                   and not st.get("canceled")
-                                   and st.get("failed", 1) == 0
-                                   and st.get("percentage") == 100)
-                    if not node_ok and not errors:
-                        errors = [f"node not consolidated: {st}"]
-                    break
-            self.pending_names.append(name)
-            if self.counter % self.purge_every == 0:
-                batch = list(self.pending_names)
-                self.pending_names.clear()
-                threading.Thread(target=self._purge_async, args=(batch,),
-                                 daemon=True).start()
-            return {"success": bool(payload.get("ok")) and node_ok,
-                    "elapsed": elapsed, "errors": errors}
+                    node_seen += 1
+                    node_st = nd.get("status", {})
+            if node_seen != 1:
+                reason = ("target node missing from PIDE payload"
+                          if node_seen == 0
+                          else f"duplicate target nodes ({node_seen})")
+                return {"success": False, "elapsed": elapsed,
+                        "worker_error": True, "errors": [reason]}
+            st = node_st
+            if st.get("canceled"):
+                return {"success": False, "elapsed": elapsed,
+                        "worker_error": True,
+                        "errors": [f"node canceled: {st}"]}
+            consolidated_full = bool(st.get("consolidated")
+                                     and st.get("percentage") == 100)
+            node_ok = bool(st.get("ok") and consolidated_full
+                           and st.get("failed", 1) == 0)
+            if not node_ok and not errors:
+                errors = [f"node not consolidated: {st}"]
+            out = {"success": bool(payload.get("ok")) and node_ok,
+                   "elapsed": elapsed, "errors": errors}
+            if not node_ok and not consolidated_full:
+                out["incomplete"] = True
+            return out
 
     def _purge_async(self, names: list[str]):
         """Unload checked theories via the management connection.
@@ -1058,6 +1112,7 @@ class IsabelleServerPool:
             elapsed = float(result.get("elapsed", 0.0) or 0.0)
             cacheable = result.get("success") or (
                 not result.get("worker_error")
+                and not result.get("incomplete")   # structural (2026-07-11)
                 and elapsed < self.CACHE_FAIL_FAST_S
                 and not any("not consolidated" in str(e)
                             for e in result.get("errors", [])))

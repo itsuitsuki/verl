@@ -81,18 +81,46 @@ _TR_INFLIGHT: dict = {}
 _TR_STATS = {"hits": 0, "misses": 0}
 
 
+_FN_DIGESTS: dict = {}
+
+
+def _fn_digest(fn) -> str:
+    """Digest of a function's COMPILED CODE (marshal covers the bytecode,
+    consts -- incl. nested code objects -- names and line info). Catches
+    body edits that __qualname__ cannot: the same-named validator with
+    changed rules would otherwise keep hitting stale cache entries
+    (2026-07-11 review). Known limit: closures sharing one code object with
+    different captured VALUES share a digest -- in this pipeline the
+    captured values derive from the prompt itself, which is already in the
+    key. Cached per code object (code objects are compile-time constants,
+    never collected)."""
+    co = getattr(fn, "__code__", None)
+    if co is None:
+        return repr(fn)
+    d = _FN_DIGESTS.get(id(co))
+    if d is None:
+        try:
+            import marshal
+            d = hashlib.sha1(marshal.dumps(co)).hexdigest()[:16]
+        except Exception:  # noqa: BLE001
+            d = "nodigest"
+        _FN_DIGESTS[id(co)] = d
+    return d
+
+
 def _tr_key(prompt_base, judge_model, max_model_len, parse_fn, validate_fn,
             soft_prefix) -> str:
     """Cache identity covers EVERYTHING that determines the parsed result:
-    prompt, model, token budget, parser/validator code identity, and the
-    soft-accept policy. (2026-07-11 fix: the old key was only
-    (version, model, prompt) -- a hit silently bypassed the CURRENT parser
-    and validator, so changed validation logic kept replaying stale
-    objects.)"""
+    prompt, model, token budget, parser/validator CODE identity (qualname +
+    compiled-code digest), and the soft-accept policy. (2026-07-11: the old
+    key was only (version, model, prompt) -- a hit silently bypassed the
+    CURRENT parser and validator; qualname alone still missed body edits.)"""
     ident = "\0".join((
         _TR_CACHE_VERSION, judge_model, str(max_model_len),
         getattr(parse_fn, "__qualname__", repr(parse_fn)),
+        _fn_digest(parse_fn),
         getattr(validate_fn, "__qualname__", repr(validate_fn)),
+        _fn_digest(validate_fn),
         repr(soft_prefix), prompt_base,
     ))
     return hashlib.sha1(ident.encode("utf-8")).hexdigest()

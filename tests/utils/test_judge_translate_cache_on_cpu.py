@@ -138,6 +138,32 @@ def test_key_covers_parser_identity(monkeypatch, tmp_path):
     assert calls["n"] == 2                        # different key -> no reuse
 
 
+def test_key_covers_function_body(monkeypatch, tmp_path):
+    # 2026-07-11 review: __qualname__ alone misses BODY edits -- two
+    # same-named parsers with different code must not share a cache entry.
+    monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
+    _reset()
+    calls = {"n": 0}
+
+    def fake(prompt, thinking, **kw):
+        calls["n"] += 1
+        return "T:" + prompt
+
+    monkeypatch.setattr(judge, "call_judge", fake)
+
+    def parse_v1(r):
+        return r + ":V1"
+
+    def parse_v2(r):
+        return r + ":V2"
+
+    parse_v2.__qualname__ = parse_v1.__qualname__   # force identical names
+    r1 = judge.translate("P", parse_v1, _ok_validate, judge_url="u", judge_model="m")
+    r2 = judge.translate("P", parse_v2, _ok_validate, judge_url="u", judge_model="m")
+    assert r1[0] == "T:P:V1" and r2[0] == "T:P:V2"  # v2 body actually ran
+    assert calls["n"] == 2                           # digest split the keys
+
+
 def test_disk_cache_survives_cold_memory(monkeypatch, tmp_path):
     monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
     _reset()

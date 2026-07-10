@@ -73,6 +73,20 @@ def test_infra_failure_never_persisted(tmp_path, monkeypatch):
     assert c1["n"] == 2                     # recomputed both times
 
 
+def test_incomplete_outcome_never_persisted(tmp_path, monkeypatch):
+    # 2026-07-11: a found-but-not-consolidated node (watchdog abort mid-
+    # proof) is structurally excluded from caching -- previously only a
+    # string match on the error text kept it out, and an incomplete outcome
+    # with EMPTY errors could be cached as a fast theorem failure.
+    inc = {"success": False, "elapsed": 1.0, "incomplete": True, "errors": []}
+    cache_dir = tmp_path / "thm"
+    p1, c1 = _pool(tmp_path / "a", monkeypatch, inc, cache_dir)
+    p1.check(THM)
+    p1._cache.clear()
+    p1.check(THM)
+    assert c1["n"] == 2                     # recomputed both times
+
+
 def test_kill_switch(tmp_path, monkeypatch):
     ok = {"success": True, "elapsed": 0.5, "errors": []}
     cache_dir = tmp_path / "thm"
