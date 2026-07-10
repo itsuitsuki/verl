@@ -27,6 +27,7 @@ Protocol facts (probed 2026-06-11 on Isabelle 2025, see probe_server.py):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -195,6 +196,54 @@ def _poly_cpu_state(pid):
         return f[0].decode(), int(f[11]) + int(f[12]), int(f[19])
     except (ValueError, IndexError):
         return None
+
+
+# --- Theorem-verdict disk cache (2026-07-10). The in-memory theorem memo dies
+# with the process, and this training restarts often (resume replays the same
+# problems with the same fixed data seed) -- every restart re-proves thousands
+# of already-settled theorems. Persist EXACTLY what the memory memo caches
+# (success always; failure only when fast and not a consolidation flake), keyed
+# on the full theorem text (which embeds the tactic string, so tactic changes
+# change the key). Bump ISABELLE_THEOREM_CACHE_VERSION if SESSION/THEORY_IMPORTS
+# change (those alter verdicts without changing theorem text). ---
+_THM_CACHE_VERSION = os.environ.get("ISABELLE_THEOREM_CACHE_VERSION", "v1")
+
+
+def _thm_disk_enabled():
+    return os.environ.get("ISABELLE_THEOREM_DISK_CACHE", "1") not in (
+        "0", "false", "False")
+
+
+def _thm_disk_path(theorem_code):
+    key = hashlib.sha1(
+        (_THM_CACHE_VERSION + "\0" + theorem_code).encode("utf-8")).hexdigest()
+    base = os.environ.get("ISABELLE_THEOREM_CACHE_DIR",
+                          "/tmp/verl_isabelle_theorem_cache")
+    return os.path.join(base, _THM_CACHE_VERSION, key[:2], f"{key}.json")
+
+
+def _thm_disk_load(theorem_code):
+    if not _thm_disk_enabled():
+        return None
+    try:
+        with open(_thm_disk_path(theorem_code)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _thm_disk_store(theorem_code, value):
+    if not _thm_disk_enabled():
+        return
+    path = _thm_disk_path(theorem_code)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(value, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def _find_jvm_pid(server_name):
@@ -827,15 +876,23 @@ class IsabelleServerPool:
                     w.reap_targets.pop(pgid, None)
 
     def _reap_runaway_polys_once(self):
-        """SIGKILL any `poly` spinning ~100% CPU for longer than a legit proof
-        (verify_timeout) can run -- a native tactic that ignored Isabelle's
-        cooperative interrupt. Left alone these leak, starve cores, and hang
-        every worker.start() (session reload) -> full-pool wedge (2026-07-09
-        step-135, ~130min). Kill ONLY the spinning poly: usually an abandoned
-        zombie the JVM already moved past (freeing a core, no worker touched);
-        if it happened to be a worker's live ML, that worker's next check fails
-        and _run_one_check restarts it cleanly. We never stop/start a worker
-        from the monitor thread -- that would race the owning check thread."""
+        """SIGKILL abandoned "zombie proof" polys: a native tactic that ignored
+        Isabelle's cooperative interrupt keeps spinning ~100% CPU inside a
+        still-healthy JVM after the check already returned; these accumulate,
+        starve cores, and hang every worker.start() -> full-pool wedge
+        (2026-07-09 step-135, ~130min).
+
+        DISCRIMINATOR (2026-07-10 fix): sustained 100% CPU alone is NOT enough
+        -- a healthy ML poly grinding a QUEUE of checks back to back also
+        sustains 100% for minutes, and v1 of this reaper mass-killed live
+        provers mid-burst (8 kills in 12min incl. 3-at-once = a whole pool's
+        provers) and wedged the run. A true zombie is distinguishable by its
+        JVM's poly tree: a healthy worker runs ~2 polys; when a tactic thread
+        is abandoned, the JVM spawns a REPLACEMENT for the next check, so the
+        tree grows to >= 3. Reap only spinning polys in an oversized tree,
+        always protecting the 2 newest-started (the live prover pair). A
+        runaway that IS the current prover needs no reaping here: its check
+        hits the hard timeout and the worker restart killpg's its group."""
         interval = self.MONITOR_INTERVAL_S
         denom = interval * self._clk_tck
         seen: dict[int, tuple] = {}
@@ -843,6 +900,7 @@ class IsabelleServerPool:
         for w in self.workers:
             if w.jvm_pid is None or _read_stat(w.jvm_pid) is None:
                 continue
+            tree: list[tuple] = []   # (pid, start, streak)
             for pid in _descendants(w.jvm_pid):
                 ps = _poly_cpu_state(pid)
                 if ps is None:
@@ -854,6 +912,11 @@ class IsabelleServerPool:
                     busy = (cpu - prev[0]) / denom
                     streak = prev[2] + 1 if busy >= self.RUNAWAY_BUSY_FRAC else 0
                 seen[pid] = (cpu, start, streak)
+                tree.append((pid, start, streak))
+            if len(tree) <= 2:
+                continue             # healthy-sized tree: never reap
+            tree.sort(key=lambda t: t[1], reverse=True)
+            for pid, _start, streak in tree[2:]:   # protect 2 newest
                 if streak >= self._runaway_streak:
                     runaways.append(pid)
         self._poly_cpu = seen
@@ -866,8 +929,8 @@ class IsabelleServerPool:
             self.restart_reasons["runaway_poly"] = (
                 self.restart_reasons.get("runaway_poly", 0) + len(runaways))
             _POOL_LOG.warning(
-                "runaway-poly reaper: SIGKILLed %d poly %s (>= %.0fs sustained "
-                "100%% CPU -- native tactic ignored verify_timeout)",
+                "runaway-poly reaper: SIGKILLed %d zombie poly %s (>= %.0fs "
+                "sustained 100%% CPU in an oversized (>2) poly tree)",
                 len(runaways), runaways, self._runaway_streak * interval)
 
     def check(self, theorem_code: str) -> dict:
@@ -900,6 +963,20 @@ class IsabelleServerPool:
                     if self._inflight.get(theorem_code) is ev:
                         self._inflight.pop(theorem_code, None)
         try:
+            # disk layer: a verdict persisted by a previous run/process (same
+            # policy as the memory memo). Hit -> promote to memory and return.
+            disk = _thm_disk_load(theorem_code)
+            if disk is not None and "success" in disk:
+                with self._cache_lock:
+                    self._cache[theorem_code] = dict(disk)
+                    while len(self._cache) > self.CACHE_MAX_ENTRIES:
+                        self._cache.popitem(last=False)
+                    self.cache_hits += 1
+                out = dict(disk)
+                out["cache_hit"] = True
+                out["queue_wait"] = 0.0
+                out["check_time"] = 0.0
+                return out
             result = self._check_uncached(theorem_code)
             elapsed = float(result.get("elapsed", 0.0) or 0.0)
             cacheable = result.get("success") or (
@@ -908,12 +985,13 @@ class IsabelleServerPool:
                 and not any("not consolidated" in str(e)
                             for e in result.get("errors", [])))
             if cacheable:
+                entry = {k: result[k] for k in ("success", "elapsed", "errors")
+                         if k in result}
                 with self._cache_lock:
-                    self._cache[theorem_code] = {
-                        k: result[k] for k in ("success", "elapsed", "errors")
-                        if k in result}
+                    self._cache[theorem_code] = entry
                     while len(self._cache) > self.CACHE_MAX_ENTRIES:
                         self._cache.popitem(last=False)
+                _thm_disk_store(theorem_code, entry)
             return result
         finally:
             with self._cache_lock:
@@ -965,7 +1043,15 @@ class IsabelleServerPool:
                 except Exception:
                     pass
                 th.join(10.0)
-                worker.start()
+                try:
+                    worker.start()
+                except Exception as se:  # noqa: BLE001 -- a failed session
+                    # restart must NOT propagate out of the check (it would
+                    # bubble an exception through the reward path); the broken
+                    # worker goes back to idle and the NEXT check on it fails
+                    # fast and retries the restart.
+                    _POOL_LOG.warning("worker %d restart failed: %r",
+                                      worker.wid, se)
                 return {"success": False, "elapsed": CHECK_DEADLINE + 15.0,
                         "worker_error": True,
                         "errors": ["hard timeout: worker force-restarted"]}
@@ -976,7 +1062,11 @@ class IsabelleServerPool:
                     worker.stop(graceful=False)  # fast kill + killpg reap
                 except Exception:
                     pass
-                worker.start()
+                try:
+                    worker.start()
+                except Exception as se:  # noqa: BLE001 -- see above
+                    _POOL_LOG.warning("worker %d restart failed: %r",
+                                      worker.wid, se)
                 return {"success": False, "elapsed": 0.0, "worker_error": True,
                         "errors": [f"worker error: {e!r}"]}
             return box["r"]

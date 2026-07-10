@@ -207,7 +207,14 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
             _TR_INFLIGHT[key] = inflight
 
     if not owner:
-        inflight["event"].wait()
+        # BOUNDED wait: a wedged leader must never deadlock its followers
+        # (same lesson as the pool's single-flight, 2026-07-08 step-135). The
+        # leader is itself bounded (api_timeout x retries), so a timeout here
+        # means it died un-cleanly -- drop its stale marker and compute alone.
+        if not inflight["event"].wait(900.0):
+            with _TR_LOCK:
+                if _TR_INFLIGHT.get(key) is inflight:
+                    _TR_INFLIGHT.pop(key, None)
         r = inflight["result"]
         if r is not None:
             parsed, soft = r

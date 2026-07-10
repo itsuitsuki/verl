@@ -81,10 +81,13 @@ class _FakeProc:
 
 class _RecordingWorker:
     """Worker whose check() succeeds instantly; records stop()/start() so a
-    test can assert whether _run_one_check recycled it."""
+    test can assert whether _run_one_check recycled it. Mirrors the real
+    IsabelleWorker contract: jvm_pid is set (start_server resolves the real
+    java pid) and refreshed on restart."""
     def __init__(self, wid=0, pid=999000):
         self.wid = wid
         self.proc = _FakeProc(pid)
+        self.jvm_pid = pid
         self.events = []
 
     def check(self, code):
@@ -96,6 +99,7 @@ class _RecordingWorker:
     def start(self):
         self.events.append(("start",))
         self.proc = _FakeProc(self.proc.pid + 1)  # fresh JVM after recycle
+        self.jvm_pid = self.proc.pid
 
 
 def _bare_pool(base):

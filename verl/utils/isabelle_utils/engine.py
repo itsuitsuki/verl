@@ -6,6 +6,7 @@ transpiles to Isabelle terms.
 """
 import ast
 import json
+import os
 import re
 import time
 from fractions import Fraction
@@ -546,10 +547,27 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
              "givens": given_terms, "props": [t for t, _ in terms],
              "steps_xml": steps_xml}, indent=2))
 
+    # ---- Step verification in 3 phases (2026-07-10 straggler fix). The old
+    # single loop ran every prover check strictly serially per response, so a
+    # 12-step straggler held the whole training step (~365s of the tail was
+    # serial pool.check chains while other pool workers idled). Split:
+    #   phase 1 (serial, pure CPU): per-step prep. Every cross-step input --
+    #     premise lists, known ids, concl_nums, var_vals -- derives from the
+    #     TRANSLATIONS only, never from verdicts, so it can be precomputed in
+    #     step order without touching the prover.
+    #   phase 2 (parallel): each step's prover work (consistency probe, nz
+    #     checks, claim cascade, tolerance fallback) is an independent task.
+    #   phase 3 (serial): premise-inconsistency latch = MIN step whose probe
+    #     proved False (identical to the sequential first-hit latch, because
+    #     each probe's verdict depends only on that step's premise list), then
+    #     rewards. Semantics are byte-identical to the sequential loop
+    #     (regression-verified); the only difference is that probes past the
+    #     latch also run (their results are discarded, memo absorbs the cost).
     var_vals = {}
     for g in givens_src:
         pin_from(g, var_vals)
     concl_nums = set()
+    prepped = []
     for k, (s, (term, carrier)) in enumerate(zip(steps_xml, terms)):
         entry = {"step": k, "neutral": False}
         entry["transcription_missing"] = transcription_missing_py(
@@ -617,31 +635,29 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         prem = g_prem + [(f"s{j}", terms[j][0]) for j in range(k)]
         prem += [(f"p{k}_{i}", t) for i, t in enumerate(admitted)]
         prem += [(f"d{k}_{i}", t) for i, t in enumerate(defs_t)]
-        if rec["premise_inconsistent_at"] is None:
-            rf = pool.check(make_theorem(fixes_all, prem, "False",
-                                       ALTERNATION))
-            if rf["success"]:
-                rec["premise_inconsistent_at"] = k
-        entry["premises_inconsistent"] = (
-            rec["premise_inconsistent_at"] is not None
-            and k >= rec["premise_inconsistent_at"])
+        nz_list = (nz_divisors(props_src[k], vt_all, carrier)
+                   if claims_t else [])
+        rec["steps"].append(entry)
+        prepped.append({"k": k, "entry": entry, "prem": prem,
+                        "claims_t": claims_t, "claims_nodes": claims_nodes,
+                        "nz_list": nz_list, "carrier": carrier})
+        # cross-step state advances on TRANSLATIONS, exactly as before
+        try:
+            known |= py_to_isabelle(props_src[k], vt_all)[1]
+        except PyExprError:
+            pass
+        concl_nums |= consts_per[k]
 
+    def _check_step(p):
+        prem, claims_t = p["prem"], p["claims_t"]
+        out = {"consistent_false": False, "verified": None,
+               "tolerance": False}
+        rf = pool.check(make_theorem(fixes_all, prem, "False", ALTERNATION))
+        out["consistent_false"] = bool(rf["success"])
         if not claims_t:
-            # definition-only step: nothing to prove (conservative), but
-            # also nothing to reward - neutral, excluded from the metric
-            entry["neutral"] = True
-            entry["verified"] = True
-            entry["rewarded"] = False
-            rec["steps"].append(entry)
-            try:
-                known |= py_to_isabelle(props_src[k], vt_all)[1]
-            except PyExprError:
-                pass
-            concl_nums |= consts_per[k]
-            continue
-
+            return out
         nz_prem = []
-        for d in nz_divisors(props_src[k], vt_all, carrier):
+        for d in p["nz_list"]:
             rnz = pool.check(make_theorem(fixes_all, prem,
                                         f"{d} \\<noteq> 0", ALTERNATION))
             if rnz["success"]:
@@ -660,11 +676,11 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             return r_eval["success"]
 
         if len(claims_t) > 1:
-            entry["verified"] = all(_verify_single(g) for g in claims_t)
+            out["verified"] = all(_verify_single(g) for g in claims_t)
         else:
-            entry["verified"] = _verify_single(claims_t[0])
-        if not entry["verified"]:
-            tol = tolerance_goal(claims_nodes, vt_all, carrier)
+            out["verified"] = _verify_single(claims_t[0])
+        if not out["verified"]:
+            tol = tolerance_goal(p["claims_nodes"], vt_all, p["carrier"])
             if tol:
                 rt = pool.check(make_theorem(fixes_all, prem + nz_prem, tol,
                                            "(approximation 20)"))
@@ -672,17 +688,45 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                     rt = pool.check(make_theorem(fixes_all, prem + nz_prem,
                                                tol, ALTERNATION))
                 if rt["success"]:
-                    entry["verified"] = True
-                    entry["tolerance"] = True
+                    out["verified"] = True
+                    out["tolerance"] = True
+        return out
+
+    par = max(1, int(os.environ.get("ISABELLE_STEP_CHECK_PAR", "4")))
+    if prepped:
+        if par == 1 or len(prepped) == 1:
+            results = [_check_step(p) for p in prepped]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                    max_workers=min(par, len(prepped))) as ex:
+                results = list(ex.map(_check_step, prepped))
+    else:
+        results = []
+
+    latch = None
+    for p, res in zip(prepped, results):
+        if res["consistent_false"]:
+            latch = p["k"]
+            break
+    rec["premise_inconsistent_at"] = latch
+    for p, res in zip(prepped, results):
+        entry = p["entry"]
+        entry["premises_inconsistent"] = (latch is not None
+                                          and p["k"] >= latch)
+        if not p["claims_t"]:
+            # definition-only step: nothing to prove (conservative), but
+            # also nothing to reward - neutral, excluded from the metric
+            entry["neutral"] = True
+            entry["verified"] = True
+            entry["rewarded"] = False
+            continue
+        entry["verified"] = res["verified"]
+        if res["tolerance"]:
+            entry["tolerance"] = True
         entry["rewarded"] = (entry["verified"] and entry["guard_ok"]
                              and not entry["premises_inconsistent"]
                              and not entry["transcription_missing"])
-        rec["steps"].append(entry)
-        try:
-            known |= py_to_isabelle(props_src[k], vt_all)[1]
-        except PyExprError:
-            pass
-        concl_nums |= consts_per[k]
 
     # Per-step symbol string (priority o>c>m>g>x): o=rewarded,
     # c=premises-inconsistent, m=verified-but-transcription-missing,
