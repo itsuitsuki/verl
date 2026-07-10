@@ -83,6 +83,61 @@ def test_failed_translation_not_cached(monkeypatch, tmp_path):
     assert calls["n"] >= 2               # failures not cached -> judge re-called
 
 
+def test_failing_leader_shares_failure(monkeypatch, tmp_path):
+    # 2026-07-11 fix: 16 concurrent callers of a FAILING prompt used to each
+    # run their own 3-retry loop after the leader failed (48 judge calls
+    # observed). Now failure is shared: at most 2 flights x MAX_TRIES calls.
+    monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
+    _reset()
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    def failing(prompt, thinking, **kw):
+        with lock:
+            calls["n"] += 1
+        time.sleep(0.05)
+        return "unparseable"
+
+    monkeypatch.setattr(judge, "call_judge", failing)
+    outs = []
+
+    def work():
+        outs.append(judge.translate("FAILPROMPT", lambda r: None, _ok_validate,
+                                    judge_url="u", judge_model="m")[0])
+
+    ts = [threading.Thread(target=work) for _ in range(16)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(outs) == 16 and all(o is None for o in outs)
+    assert calls["n"] <= 2 * judge.MAX_TRIES   # was 16 x MAX_TRIES pre-fix
+
+
+def test_key_covers_parser_identity(monkeypatch, tmp_path):
+    # 2026-07-11 fix: a cache hit must NOT bypass a DIFFERENT parser.
+    monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
+    _reset()
+    calls = {"n": 0}
+
+    def fake(prompt, thinking, **kw):
+        calls["n"] += 1
+        return "T:" + prompt
+
+    monkeypatch.setattr(judge, "call_judge", fake)
+
+    def parse_a(r):
+        return r
+
+    def parse_b(r):
+        return r + ":B"
+
+    r1 = judge.translate("P", parse_a, _ok_validate, judge_url="u", judge_model="m")
+    r2 = judge.translate("P", parse_b, _ok_validate, judge_url="u", judge_model="m")
+    assert r1[0] == "T:P" and r2[0] == "T:P:B"   # second parser actually ran
+    assert calls["n"] == 2                        # different key -> no reuse
+
+
 def test_disk_cache_survives_cold_memory(monkeypatch, tmp_path):
     monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
     _reset()

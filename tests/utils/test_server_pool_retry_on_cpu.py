@@ -84,14 +84,15 @@ class _RecordingWorker:
     test can assert whether _run_one_check recycled it. Mirrors the real
     IsabelleWorker contract: jvm_pid is set (start_server resolves the real
     java pid) and refreshed on restart."""
-    def __init__(self, wid=0, pid=999000):
+    def __init__(self, wid=0, pid=999000, elapsed=1.0):
         self.wid = wid
         self.proc = _FakeProc(pid)
         self.jvm_pid = pid
+        self.elapsed = elapsed
         self.events = []
 
     def check(self, code):
-        return {"success": True, "elapsed": 1.0, "errors": []}
+        return {"success": True, "elapsed": self.elapsed, "errors": []}
 
     def stop(self, graceful=True):
         self.events.append(("stop", graceful))
@@ -109,11 +110,14 @@ def _bare_pool(base):
     return pool
 
 
-def test_recycle_when_poly_rss_over_cap(monkeypatch):
+def test_recycle_slow_check_scans_immediately(monkeypatch):
+    # The RSS scan is gated (every 5th check OR after a slow one); a SLOW
+    # check (>5s) scans right away, so a leak born of a heavy proof is caught
+    # on the very next turnaround.
     pool = _bare_pool("/tmp/rss_unit_over")
     monkeypatch.setattr(sp, "_poly_tree_rss_kb",
                         lambda pid: pool.WORKER_RSS_CAP_KB + 1)
-    w = _RecordingWorker()
+    w = _RecordingWorker(elapsed=6.0)
     r = pool._run_one_check(w, "thm")
     assert r["success"] is True            # result still delivered to caller
     assert ("stop", False) in w.events     # recycled with fast-kill (killpg)
@@ -121,11 +125,26 @@ def test_recycle_when_poly_rss_over_cap(monkeypatch):
     assert pool.idle.qsize() == 1          # returned to the pool afterwards
 
 
+def test_recycle_fast_checks_scan_every_fifth(monkeypatch):
+    # Fast checks skip the full-/proc scan until the 5th turnaround.
+    pool = _bare_pool("/tmp/rss_unit_gate")
+    monkeypatch.setattr(sp, "_poly_tree_rss_kb",
+                        lambda pid: pool.WORKER_RSS_CAP_KB + 1)
+    w = _RecordingWorker(elapsed=1.0)
+    for i in range(4):
+        pool._run_one_check(w, "thm")
+        pool.idle.get()                    # drain for the next round
+        assert w.events == [], f"scanned too early at check {i + 1}"
+    pool._run_one_check(w, "thm")          # 5th check -> scan fires
+    assert ("stop", False) in w.events and ("start",) in w.events
+
+
 def test_no_recycle_when_poly_rss_under_cap(monkeypatch):
     pool = _bare_pool("/tmp/rss_unit_under")
     monkeypatch.setattr(sp, "_poly_tree_rss_kb", lambda pid: 1024)  # 1 MB
-    w = _RecordingWorker()
-    r = pool._run_one_check(w, "thm")
-    assert r["success"] is True
+    w = _RecordingWorker(elapsed=6.0)      # slow -> scans every time
+    for _ in range(6):
+        r = pool._run_one_check(w, "thm")
+        pool.idle.get()
+        assert r["success"] is True
     assert w.events == []                  # healthy worker NOT recycled
-    assert pool.idle.qsize() == 1

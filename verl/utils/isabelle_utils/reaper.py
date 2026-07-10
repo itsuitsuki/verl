@@ -92,6 +92,22 @@ def main():
                     os.killpg(pgid, signal.SIGKILL)
                 except OSError:
                     pass
+        # 2026-07-11: also kill the daemonized JVM itself. It reparented to
+        # init and belongs to NO recorded prover group, so the killpg loop
+        # above never reached it -- one java (plus the fresh poly it spawns)
+        # leaked per crashed run. The .reap record has carried its identity
+        # (jvm_pid + jvm_start) all along; starttime match defeats pid reuse.
+        try:
+            jp, js = int(rec.get("jvm_pid", 0)), int(rec.get("jvm_start", 0))
+        except (ValueError, TypeError):
+            jp, js = 0, 0
+        if jp:
+            st = _stat(jp)
+            if st is not None and st[3] == js and st[4] != "Z":
+                try:
+                    os.kill(jp, signal.SIGKILL)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

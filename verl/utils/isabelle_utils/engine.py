@@ -648,14 +648,30 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             pass
         concl_nums |= consts_per[k]
 
-    def _check_step(p):
+    def _canonical_fixes(goal):
+        """Minimal, sorted fixes for a premise-free goal: only the variables
+        that actually occur in the goal text. Unused universally-quantified
+        fixes are vacuous for provability, but they make otherwise-identical
+        bare theorems (the same arithmetic claim across rollouts) textually
+        different, defeating the theorem cache. Sorting canonicalizes the
+        text across responses, so identical bare claims share ONE cache
+        entry (memory + disk) instead of 16."""
+        toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", goal))
+        return sorted((n, t) for (n, t) in fixes_all if n in toks)
+
+    def _probe_step(p):
+        """Premise-consistency probe only (goal False from the accumulated
+        axioms). Split from the claim cascade so the inconsistency point can
+        be resolved BEFORE cascades run: steps at/after that point are forced
+        to rewarded=False / pattern 'c' regardless of their proofs, so their
+        cascades (3-6 prover calls each) are dead work."""
+        rf = pool.check(make_theorem(fixes_all, p["prem"], "False",
+                                     ALTERNATION))
+        return bool(rf["success"])
+
+    def _cascade_step(p):
         prem, claims_t = p["prem"], p["claims_t"]
-        out = {"consistent_false": False, "verified": None,
-               "tolerance": False}
-        rf = pool.check(make_theorem(fixes_all, prem, "False", ALTERNATION))
-        out["consistent_false"] = bool(rf["success"])
-        if not claims_t:
-            return out
+        out = {"verified": None, "tolerance": False}
         nz_prem = []
         for d in p["nz_list"]:
             rnz = pool.check(make_theorem(fixes_all, prem,
@@ -668,11 +684,13 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             r = pool.check(make_theorem(fixes_all, full_prem, g, ALTERNATION))
             if r["success"]:
                 return True
-            r0 = pool.check(make_theorem(fixes_all, [], g, ALTERNATION))
+            r0 = pool.check(make_theorem(_canonical_fixes(g), [], g,
+                                         ALTERNATION))
             if r0["success"]:
                 return True
             # EVAL_RESCUE already imported at module level
-            r_eval = pool.check(make_theorem(fixes_all, [], g, EVAL_RESCUE))
+            r_eval = pool.check(make_theorem(_canonical_fixes(g), [], g,
+                                             EVAL_RESCUE))
             return r_eval["success"]
 
         if len(claims_t) > 1:
@@ -693,24 +711,39 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         return out
 
     par = max(1, int(os.environ.get("ISABELLE_STEP_CHECK_PAR", "4")))
-    if prepped:
-        if par == 1 or len(prepped) == 1:
-            results = [_check_step(p) for p in prepped]
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(
-                    max_workers=min(par, len(prepped))) as ex:
-                results = list(ex.map(_check_step, prepped))
-    else:
-        results = []
 
+    def _pmap(fn, items):
+        if not items:
+            return []
+        if par == 1 or len(items) == 1:
+            return [fn(p) for p in items]
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(par, len(items))) as ex:
+            return list(ex.map(fn, items))
+
+    # Wave 1: consistency probes for every step; the inconsistency point is
+    # the FIRST step whose probe proves False (identical to the sequential
+    # first-hit rule -- each probe depends only on its own premise list).
+    probe_hits = _pmap(_probe_step, prepped)
     latch = None
-    for p, res in zip(prepped, results):
-        if res["consistent_false"]:
+    for p, hit in zip(prepped, probe_hits):
+        if hit:
             latch = p["k"]
             break
     rec["premise_inconsistent_at"] = latch
-    for p, res in zip(prepped, results):
+
+    # Wave 2: claim cascades ONLY for steps before the inconsistency point.
+    # Steps at/after it get rewarded=False and pattern 'c' regardless of any
+    # proof result (reward reads only `rewarded`), so their cascades are
+    # skipped entirely; their `verified` stays False. This changes ONLY the
+    # verified_steps diagnostic metric for post-inconsistency steps, never a
+    # reward.
+    to_cascade = [p for p in prepped
+                  if p["claims_t"] and (latch is None or p["k"] < latch)]
+    cascade_out = dict(zip((p["k"] for p in to_cascade),
+                           _pmap(_cascade_step, to_cascade)))
+
+    for p in prepped:
         entry = p["entry"]
         entry["premises_inconsistent"] = (latch is not None
                                           and p["k"] >= latch)
@@ -721,9 +754,13 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             entry["verified"] = True
             entry["rewarded"] = False
             continue
-        entry["verified"] = res["verified"]
-        if res["tolerance"]:
-            entry["tolerance"] = True
+        res = cascade_out.get(p["k"])
+        if res is None:
+            entry["verified"] = False   # cascade skipped past the latch
+        else:
+            entry["verified"] = res["verified"]
+            if res["tolerance"]:
+                entry["tolerance"] = True
         entry["rewarded"] = (entry["verified"] and entry["guard_ok"]
                              and not entry["premises_inconsistent"]
                              and not entry["transcription_missing"])

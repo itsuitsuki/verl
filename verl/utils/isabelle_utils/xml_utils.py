@@ -21,9 +21,36 @@ def parse_xml_steps(response: str):
 
 
 def boxed_answer(response: str):
-    """Extract the last \\boxed{...} value from the response."""
-    m = re.findall(r"\\boxed\{([^{}]+)\}", response)
-    return m[-1].strip() if m else None
+    """Extract the LAST \\boxed{...} value with balanced-brace scanning.
+
+    2026-07-11 fix: the old flat regex ([^{}]+) rejected ANY nested braces,
+    so common answers like \\boxed{\\frac{1}{2}} silently failed the boxed
+    gate and fail-closed the whole response's process reward. Balanced
+    scanning accepts arbitrary nesting; an unterminated box is ignored."""
+    out = None
+    i = 0
+    marker = "\\boxed{"
+    while True:
+        j = response.find(marker, i)
+        if j < 0:
+            break
+        k = j + len(marker)
+        depth = 1
+        m = k
+        while m < len(response) and depth:
+            c = response[m]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            m += 1
+        if depth != 0:
+            break                       # unterminated box: ignore the tail
+        content = response[k:m - 1].strip()
+        if content:
+            out = content
+        i = m
+    return out
 
 
 def corrupt_steps(steps_xml, ground_truth):

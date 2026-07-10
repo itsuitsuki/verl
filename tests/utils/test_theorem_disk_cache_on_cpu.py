@@ -60,6 +60,19 @@ def test_fast_failure_persisted(tmp_path, monkeypatch):
     assert c1["n"] == 1 and r.get("cache_hit") and not r["success"]
 
 
+def test_infra_failure_never_persisted(tmp_path, monkeypatch):
+    # 2026-07-11 fix: a fast PIDE FAILED/protocol error (worker_error) must
+    # NOT be cached as a permanent theorem-failure verdict.
+    infra = {"success": False, "elapsed": 0.5, "worker_error": True,
+             "errors": ["FAILED: protocol"]}
+    cache_dir = tmp_path / "thm"
+    p1, c1 = _pool(tmp_path / "a", monkeypatch, infra, cache_dir)
+    p1.check(THM)
+    p1._cache.clear()
+    p1.check(THM)
+    assert c1["n"] == 2                     # recomputed both times
+
+
 def test_kill_switch(tmp_path, monkeypatch):
     ok = {"success": True, "elapsed": 0.5, "errors": []}
     cache_dir = tmp_path / "thm"

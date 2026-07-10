@@ -13,12 +13,14 @@
 # limitations under the License.
 
 import ctypes as _ctypes
+import logging as _logging
 import multiprocessing as _mp
 import os as _os
 import re as _re
-import resource as _resource
 import signal as _signal
 import threading as _threading
+
+_MV_LOG = _logging.getLogger("math_verify_guard")
 
 try:
     from math_verify.errors import TimeoutException
@@ -40,10 +42,10 @@ _MV_WALL_TIMEOUT = float(_os.environ.get("MATH_VERIFY_WALL_TIMEOUT_S", "15"))
 # node memory (each pathological child can allocate GBs before the wall kill).
 _MV_FORK_SEM = _threading.BoundedSemaphore(
     int(_os.environ.get("MATH_VERIFY_MAX_FORKS", "4")))
-# Hard address-space cap for a grading child: a giant-number materialization
-# fails fast with MemoryError instead of eating node RAM (2026-07-09: one
-# orphaned grader grew to 189GB and OOM-killed the training).
-_MV_CHILD_AS_BYTES = int(_os.environ.get("MATH_VERIFY_CHILD_AS_GB", "8")) * (1024 ** 3)
+# (2026-07-11) RLIMIT_AS on the child was removed: a forked child inherits the
+# parent's ~50GB virtual address space, so any useful cap is exceeded at birth
+# and every forked grade silently zeroes. Orphans are prevented by PDEATHSIG;
+# runtime is bounded by the wall timeout.
 
 _GOLD_TARGETS = (LatexExtractionConfig(),)
 _PRED_TARGETS = (ExprExtractionConfig(), LatexExtractionConfig())
@@ -302,13 +304,13 @@ def _mv_child(reboxed, ground_truth, timeout_score, q):
         _ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _signal.SIGKILL, 0, 0, 0)
     except Exception:
         pass
-    # Hard memory cap: giant-number materialization dies fast with MemoryError
-    # (caught below -> timeout_score) instead of eating node RAM for 15s.
-    try:
-        _resource.setrlimit(_resource.RLIMIT_AS,
-                            (_MV_CHILD_AS_BYTES, _MV_CHILD_AS_BYTES))
-    except Exception:
-        pass
+    # NOTE (2026-07-11): do NOT set RLIMIT_AS here. A forked child INHERITS
+    # the parent's address space (a reward worker maps ~50GB virtual), so any
+    # RLIMIT_AS below that is exceeded from birth -- the first malloc raises
+    # MemoryError and even the result queue cannot be written, silently
+    # zeroing EVERY forked grade (found by the value-asserting test). The
+    # wall timeout + PDEATHSIG bound runtime and orphans; memory growth
+    # within the 15s wall is at most ~1GB (bignum spins grow ~1GB/min).
     try:
         q.put(compute_score(reboxed, ground_truth, timeout_score=timeout_score))
     except BaseException:
@@ -326,6 +328,10 @@ def _compute_score_subproc(reboxed, ground_truth, timeout_score, wall):
     to grading in-thread: an answer routed here is a suspected giant-number
     spin, and grading it in-thread would wedge the whole step (2026-07-09)."""
     if not _MV_FORK_SEM.acquire(timeout=4 * wall):
+        _MV_LOG.warning(
+            "math-verify grader saturated (no fork slot in %.0fs); "
+            "scored 0: answer=%r gt=%r", 4 * wall, reboxed[:200],
+            str(ground_truth)[:100])
         return timeout_score                # grader saturated by degenerates
     p = None
     try:
@@ -338,6 +344,12 @@ def _compute_score_subproc(reboxed, ground_truth, timeout_score, wall):
         try:
             result = q.get(timeout=wall)
         except Exception:
+            # THE culprit-sample log (2026-07-11): every grade that outruns
+            # the wall is exactly the pathological answer we could never
+            # identify during the freezes -- make it visible.
+            _MV_LOG.warning(
+                "math-verify wall timeout (%.0fs), scored 0: answer=%r gt=%r",
+                wall, reboxed[:200], str(ground_truth)[:100])
             result = timeout_score          # spun past the deadline
         return result
     except Exception:
@@ -380,6 +392,11 @@ def compute_score_boxed(solution_str, ground_truth, timeout_score: float = 0) ->
     # Re-wrap so math-verify's LatexExtractionConfig parses exactly the boxed
     # payload, not stray expressions elsewhere in the response.
     reboxed = "\\boxed{" + answer + "}"
-    if _mv_safe_inthread(answer):
-        return compute_score(reboxed, ground_truth, timeout_score=timeout_score)
+    # EVERY grade goes through the killable subprocess (2026-07-11). The
+    # in-thread fast path for "safe-looking" answers was a hole: the step-134
+    # batch produced answers that pass the giant-number predicate yet still
+    # spin sympy for 40+ minutes in C (GIL held, uninterruptible) -- the exact
+    # class the fork exists to bound. A fork costs ~0.1s per grade
+    # (~seconds/step through the 4-slot semaphore), which is cheap insurance
+    # for a hard 15s bound on EVERY answer shape.
     return _compute_score_subproc(reboxed, ground_truth, timeout_score, _MV_WALL_TIMEOUT)

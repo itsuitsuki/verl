@@ -204,6 +204,16 @@ if __name__ == "__main__":
         # checks past the latch); semantics = the records themselves.
         for v in list(base.values()) + list(cur.values()):
             v.pop("n_pool_calls", None)
+            # DOCUMENTED EXCEPTION (2026-07-10): claim cascades are skipped
+            # for steps at/after the premise-inconsistency point -- those
+            # steps are forced to rewarded=False / pattern 'c' regardless, so
+            # only the `verified`/`tolerance` DIAGNOSTIC fields can differ
+            # there. Mask them on both sides; `rewarded` and the pattern are
+            # still compared strictly.
+            for e in (v.get("rec", {}).get("steps") or []):
+                if e.get("premises_inconsistent") and not e.get("neutral"):
+                    e["verified"] = "MASKED"
+                    e.pop("tolerance", None)
         if cur == base:
             print("REGRESSION: IDENTICAL — semantics preserved")
         else:

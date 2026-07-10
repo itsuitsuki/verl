@@ -207,6 +207,22 @@ def _poly_cpu_state(pid):
 # change the key). Bump ISABELLE_THEOREM_CACHE_VERSION if SESSION/THEORY_IMPORTS
 # change (those alter verdicts without changing theorem text). ---
 _THM_CACHE_VERSION = os.environ.get("ISABELLE_THEOREM_CACHE_VERSION", "v1")
+_THM_ENV_FPRINT: str | None = None
+
+
+def _thm_env_fprint() -> str:
+    """Environment fingerprint for the theorem-verdict cache key (2026-07-11):
+    a verdict depends not only on the theorem text but on the SESSION, its
+    imports and options (watchdog, quick_and_dirty, delays). Keying them in
+    means a session/import change invalidates old verdicts automatically
+    instead of silently replaying them. Computed lazily because the constants
+    are defined later in this module."""
+    global _THM_ENV_FPRINT
+    if _THM_ENV_FPRINT is None:
+        _THM_ENV_FPRINT = hashlib.sha1("\0".join(
+            [SESSION, THEORY_IMPORTS] + list(SESSION_OPTIONS)
+        ).encode("utf-8")).hexdigest()[:16]
+    return _THM_ENV_FPRINT
 
 
 def _thm_disk_enabled():
@@ -216,7 +232,8 @@ def _thm_disk_enabled():
 
 def _thm_disk_path(theorem_code):
     key = hashlib.sha1(
-        (_THM_CACHE_VERSION + "\0" + theorem_code).encode("utf-8")).hexdigest()
+        (_THM_CACHE_VERSION + "\0" + _thm_env_fprint() + "\0" + theorem_code)
+        .encode("utf-8")).hexdigest()
     base = os.environ.get("ISABELLE_THEOREM_CACHE_DIR",
                           "/tmp/verl_isabelle_theorem_cache")
     return os.path.join(base, _THM_CACHE_VERSION, key[:2], f"{key}.json")
@@ -270,7 +287,13 @@ def _find_jvm_pid(server_name):
                 cl = fh.read()
         except OSError:
             continue
-        if want not in cl or b"/java" not in cl:
+        # EXACT argv-token match (2026-07-11): substring matching could bind
+        # to the WRONG JVM when one server name is a prefix of another
+        # (folpool_123_1 is a substring of folpool_1234_1's cmdline).
+        argv = cl.split(b"\0")
+        if want not in argv:
+            continue
+        if not argv or not (argv[0].endswith(b"/java") or argv[0] == b"java"):
             continue
         st = _read_stat(int(name))
         start = st[3] if st else 0
@@ -309,16 +332,55 @@ def _sweep_stale_pools(base_dir):
             continue
         if _read_stat(int(mm.group(1))) is not None:
             continue  # owner pid still alive -> a concurrent sibling, leave it
+        recs = []
         for reap in d.glob("worker_*.reap"):
             try:
-                rec = json.loads(reap.read_text())
+                recs.append(json.loads(reap.read_text()))
             except (OSError, ValueError):
                 continue
+        for rec in recs:
             for g, s in rec.get("groups", {}).items():
                 try:
                     _kill_pgid(int(g), int(s))
                 except (ValueError, TypeError):
                     pass
+            # 2026-07-11: also kill the daemonized JVM itself -- it reparents
+            # to init and is in NO recorded prover group, so the killpg sweep
+            # never reached it and it leaked (with its next poly) per crash.
+            try:
+                jp, js = int(rec.get("jvm_pid", 0)), int(rec.get("jvm_start", 0))
+            except (ValueError, TypeError):
+                jp, js = 0, 0
+            if jp:
+                st = _read_stat(jp)
+                if st is not None and st[3] == js:
+                    try:
+                        os.kill(jp, signal.SIGKILL)
+                    except OSError:
+                        pass
+        # Evidence retention (2026-07-11): only delete the registry once every
+        # recorded leader/JVM is verifiably gone; otherwise keep the .reap
+        # files so the next sweep (or the crash reaper) can finish the job.
+        residual = False
+        for rec in recs:
+            for g, s in rec.get("groups", {}).items():
+                try:
+                    st = _read_stat(int(g))
+                    if st is not None and st[3] == int(s):
+                        residual = True
+                except (ValueError, TypeError):
+                    pass
+            try:
+                jp, js = int(rec.get("jvm_pid", 0)), int(rec.get("jvm_start", 0))
+                st = _read_stat(jp) if jp else None
+                if st is not None and st[3] == js:
+                    residual = True
+            except (ValueError, TypeError):
+                pass
+        if residual:
+            _POOL_LOG.warning("stale-pool sweep: survivors under %s -- "
+                              "keeping its .reap registry", d)
+            continue
         try:
             shutil.rmtree(d)
         except OSError:
@@ -329,8 +391,8 @@ SESSION_OPTIONS = [
     "quick_and_dirty=true",
     # headless PIDE consolidation polls at 2.0s by default, which puts a
     # ~2.1s floor under every use_theories call regardless of proof size
-    "headless_consolidate_delay=0.05",
-    "headless_check_delay=0.05",
+    "headless_consolidate_delay=0.02",
+    "headless_check_delay=0.02",
     # a theory with a broken header (outer syntax error in the theorem
     # statement) never consolidates; the watchdog is the server-side abort
     # for exactly that case (default 600s -> wedges the worker for the whole
@@ -612,13 +674,20 @@ class IsabelleWorker:
                 "theories": [name],
                 "master_dir": str(self.master_dir),
                 # completion is detected by polling; the default check_delay
-                # of 0.5s quantizes every call to ~2s. 0.05s cuts the idle wait
-                "check_delay": 0.05,
+                # of 0.5s quantizes every call to ~2s. 0.02s cuts the idle wait
+                "check_delay": 0.02,
             })
             kind, payload = self.conn.wait_task(CHECK_DEADLINE, task=task)
             elapsed = time.time() - t0
             if kind != "FINISHED":
+                # Typed outcome (2026-07-11): a FAILED/CANCELED/protocol task
+                # is an INFRASTRUCTURE failure, not a proof verdict. Mark it
+                # worker_error so (a) the cache policy never persists it as a
+                # permanent theorem failure and (b) _check_uncached retries it
+                # once on a fresh worker. (Previously a fast PIDE FAILED was
+                # disk-cached forever as "this theorem is false".)
                 return {"success": False, "elapsed": elapsed,
+                        "worker_error": True,
                         "errors": [f"{kind}: {str(payload)[:200]}"]}
             errors = [e.get("message", str(e)) if isinstance(e, dict) else str(e)
                       for e in payload.get("errors", [])]
@@ -865,8 +934,15 @@ class IsabelleServerPool:
         live = set()
         for w in self.workers:
             if w.jvm_pid is not None and _read_stat(w.jvm_pid) is not None:
-                live.update(_prover_groups(w.jvm_pid, os.getpgrp()).keys())
-                w.reap_targets.update(_prover_groups(w.jvm_pid, os.getpgrp()))
+                groups = _prover_groups(w.jvm_pid, os.getpgrp())
+                live.update(groups.keys())
+                new = set(groups) - set(w.reap_targets)
+                w.reap_targets.update(groups)
+                if new:
+                    # persist immediately (2026-07-11): a crash between
+                    # discovery and the next natural persist would leave the
+                    # new group invisible to the crash reaper
+                    w._persist_reap()
         # any recorded target whose group leader is alive but no live worker
         # claims it (its JVM died) is an orphan -> reap.
         for w in self.workers:
@@ -948,7 +1024,8 @@ class IsabelleServerPool:
                     return out
                 ev = self._inflight.get(theorem_code)
                 if ev is None:
-                    self._inflight[theorem_code] = threading.Event()
+                    ev = threading.Event()   # keep OUR ref for the finally
+                    self._inflight[theorem_code] = ev
                     self.cache_misses += 1
                     break                      # we are the leader: go prove it
             # follower: wait for the leader, then re-read the cache. If the
@@ -995,9 +1072,13 @@ class IsabelleServerPool:
             return result
         finally:
             with self._cache_lock:
-                ev = self._inflight.pop(theorem_code, None)
-            if ev is not None:
-                ev.set()
+                # Identity-checked cleanup (2026-07-11 ABA fix): only remove
+                # the marker if it is still OURS -- a stale leader must never
+                # pop a replacement leader's flight.
+                cur = self._inflight.get(theorem_code)
+                if cur is ev:
+                    self._inflight.pop(theorem_code, None)
+            ev.set()
 
     def _book_restart(self, worker, reason: str):
         """Count a worker restart and log at WARN every WORKER_RESTART_WARN."""
@@ -1010,6 +1091,43 @@ class IsabelleServerPool:
                               worker.wid, n, self.restart_reasons)
         else:
             _POOL_LOG.debug("worker %d restart (%s)", worker.wid, reason)
+
+    def _restart_or_quarantine(self, worker) -> bool:
+        """Restart a stopped worker inline; on failure QUARANTINE it instead
+        of returning it to the idle queue (2026-07-11 fix: a broken worker in
+        rotation error-churned every check that landed on it). A background
+        thread rebuilds the quarantined worker with backoff and only then
+        returns it to idle."""
+        try:
+            worker.start()
+            return True
+        except Exception as se:  # noqa: BLE001
+            _POOL_LOG.warning("worker %d restart failed -> quarantined: %r",
+                              worker.wid, se)
+            worker._quarantined = True
+
+            def _rebuild():
+                delay = 5.0
+                while not self._stop_monitor.is_set():
+                    time.sleep(delay)
+                    try:
+                        worker.stop(graceful=False)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        worker.start()
+                        worker._quarantined = False
+                        self.idle.put(worker)
+                        _POOL_LOG.warning("worker %d rebuilt from quarantine",
+                                          worker.wid)
+                        return
+                    except Exception as re_:  # noqa: BLE001
+                        _POOL_LOG.warning("worker %d rebuild failed: %r",
+                                          worker.wid, re_)
+                        delay = min(delay * 2, 60.0)
+
+            threading.Thread(target=_rebuild, daemon=True).start()
+            return False
 
     def _run_one_check(self, worker, theorem_code: str) -> dict:
         """One check on `worker` behind a HARD wall-clock cap; force-restart the
@@ -1038,20 +1156,19 @@ class IsabelleServerPool:
                 # JVM, which unblocks the wedged thread's socket read so it can
                 # exit and release worker.lock; then rebuild the worker.
                 self._book_restart(worker, "hard_timeout")
+                # Culprit-sample visibility (2026-07-11): the theorem that
+                # wedged the worker was previously invisible -- log its head
+                # so the offending step/proof can be identified from the run
+                # log instead of live forensics.
+                _POOL_LOG.warning(
+                    "hard timeout on worker %d, theorem head: %r",
+                    worker.wid, theorem_code[:300])
                 try:
                     worker.stop(graceful=False)  # fast kill + killpg reap
                 except Exception:
                     pass
                 th.join(10.0)
-                try:
-                    worker.start()
-                except Exception as se:  # noqa: BLE001 -- a failed session
-                    # restart must NOT propagate out of the check (it would
-                    # bubble an exception through the reward path); the broken
-                    # worker goes back to idle and the NEXT check on it fails
-                    # fast and retries the restart.
-                    _POOL_LOG.warning("worker %d restart failed: %r",
-                                      worker.wid, se)
+                self._restart_or_quarantine(worker)
                 return {"success": False, "elapsed": CHECK_DEADLINE + 15.0,
                         "worker_error": True,
                         "errors": ["hard timeout: worker force-restarted"]}
@@ -1062,11 +1179,7 @@ class IsabelleServerPool:
                     worker.stop(graceful=False)  # fast kill + killpg reap
                 except Exception:
                     pass
-                try:
-                    worker.start()
-                except Exception as se:  # noqa: BLE001 -- see above
-                    _POOL_LOG.warning("worker %d restart failed: %r",
-                                      worker.wid, se)
+                self._restart_or_quarantine(worker)
                 return {"success": False, "elapsed": 0.0, "worker_error": True,
                         "errors": [f"worker error: {e!r}"]}
             return box["r"]
@@ -1083,15 +1196,28 @@ class IsabelleServerPool:
             # tick) so a step where every worker stays busy is still bounded.
             # A fresh worker (just restarted above) has tiny RSS -> no-op.
             try:
-                if (worker.jvm_pid is not None
+                # The RSS read walks the FULL host /proc table (shared
+                # container -> thousands of entries, 10-60ms) and runs before
+                # idle.put, delaying worker turnaround. Leaked zombie polys
+                # only appear after SLOW checks, and their RSS ratchets over
+                # many checks -- so scan every 5th check or after a slow one;
+                # a 5-check window still catches a growing tree far below the
+                # cap. (2026-07-10 profiling: ~400 full scans/step removed.)
+                worker._rss_tick = getattr(worker, "_rss_tick", 0) + 1
+                r = box.get("r")
+                slow = (isinstance(r, dict)
+                        and float(r.get("elapsed", 0.0) or 0.0) > 5.0)
+                if ((worker._rss_tick % 5 == 0 or slow)
+                        and worker.jvm_pid is not None
                         and _poly_tree_rss_kb(worker.jvm_pid)
                         > self.WORKER_RSS_CAP_KB):
                     self._book_restart(worker, "rss_cap")
                     worker.stop(graceful=False)
-                    worker.start()
+                    self._restart_or_quarantine(worker)
             except Exception as e:  # noqa: BLE001 -- recycle must never crash
                 _POOL_LOG.debug("rss recycle failed w%d: %r", worker.wid, e)
-            self.idle.put(worker)
+            if not getattr(worker, "_quarantined", False):
+                self.idle.put(worker)
 
     def _check_uncached(self, theorem_code: str) -> dict:
         # Retry a worker_error (transient wedge / crash) on a FRESH worker up to
