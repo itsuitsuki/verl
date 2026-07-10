@@ -1,23 +1,35 @@
 """
-Unified FOL-based step reward.
+Unified formal-verification step reward (dispatch layer).
 
-Uses a configurable engine supporting two preprocessing pipelines
-(direct / structured) and two translation modes (implication / assertion).
-Verification semantics is always entailment: UNSAT -> 1.0.
+This module is the single entry point for all formal-verification step
+rewards. It dispatches on ``fol_task_type`` to one of three backends
+(the ``fol_*`` config prefix is historical: "fol" here means
+"formal-verification step reward", NOT specifically First-Order Logic):
 
-Configurable via api_config keys:
-  - fol_preprocess: "direct" (default) | "structured"
-  - fol_translation: "implication" (default) | "assertion"
-  - fol_task_type: "logic" (default) | "math"
+  - ``logic``    -> Z3/SMT  via FOLEngine       (verl.utils.fol_utils)
+  - ``math_z3``  -> Z3/SMT  via FOLEngine       (deprecated Z3 math path)
+  - ``math``     -> Isabelle via IsabelleEngine (verl.utils.isabelle_utils)
+
+The Z3 path verifies by entailment (premises & NOT(conclusion) UNSAT -> 1.0);
+the Isabelle path verifies a whole solution per-step (see isabelle_utils).
+
+Configurable via api_config keys (``fol_*`` prefix kept for backward
+compatibility with existing training scripts and past W&B runs):
+  - fol_preprocess: "direct" (default) | "structured"   [Z3 only]
+  - fol_translation: "implication" (default) | "assertion"  [Z3 only]
+  - fol_task_type: "logic" (default) | "math" (Isabelle) | "math_z3" (Z3, deprecated)
   - max_tries: int (default 1), used by declaration/expression repair
   - old_max_tries: int (default 0), used by whole-code correction
-  - timeout: float (default 30.0)
+  - timeout: float (default 30.0 Z3 / 60.0 Isabelle) -- per-verification deadline
   - fol_cumulative_mode: "current_only" (default) | "step" | "dependency_graph"
+  - isabelle_pool_workers: int (Isabelle path only)
 
 Exports:
   - check_step_format_fol
   - compute_step_reward_format_fol
-  - compute_step_reward_fol
+  - compute_step_reward_fol             (Z3 path, per-step)
+  - prepare_fol_shared_state            (Z3 path)
+  - compute_solution_reward_isabelle    (Isabelle path, whole-solution)
 """
 
 import atexit
@@ -377,7 +389,7 @@ def prepare_fol_shared_state(
     fol_config = _build_fol_config(api_config)
     if not question:
         return None
-    if fol_config.task_type != TaskType.MATH and not context:
+    if fol_config.task_type not in (TaskType.MATH, TaskType.MATH_Z3) and not context:
         return None
     cache_key = (
         context,
@@ -828,3 +840,180 @@ def compute_step_reward_fol(
                 },
             }
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Isabelle verification path (task_type == "math")
+# ---------------------------------------------------------------------------
+
+_isabelle_engine = None
+_isabelle_engine_lock = threading.Lock()
+
+
+def _get_isabelle_engine(api_config: dict | None = None):
+    """Lazy singleton: one IsabelleEngine per process.
+
+    KNOWN LIMITATION (2026-06-14): the singleton is built from whatever
+    api_config the first caller passes. Subsequent callers' api_config is
+    SILENTLY IGNORED, even if they pass different judge_url / pool_workers
+    / session / fol_timeout. This is fine today because:
+      * a single training run has exactly one fol_task_type=math reward
+        type using Isabelle
+      * the Z3 path uses its own FOLEngine, not IsabelleEngine
+
+    It would break if a future training mixed two reward types both
+    wanting Isabelle with different configs (e.g. one with HOL-Number_Theory
+    and another with HOL-Analysis). In that case, replace this singleton
+    with a config-keyed dict of engines.
+    """
+    global _isabelle_engine
+    if _isabelle_engine is not None:
+        return _isabelle_engine
+    with _isabelle_engine_lock:
+        if _isabelle_engine is not None:
+            return _isabelle_engine
+        from verl.utils.isabelle_utils.engine import IsabelleEngine, IsabelleConfig
+        cfg = api_config or {}
+        # fol_timeout aligns with Z3 path: per-verification deadline in
+        # seconds. Default 60 matches the pool's pre-existing CHECK_DEADLINE.
+        timeout = cfg.get("fol_timeout") or cfg.get("timeout") or 60.0
+        config = IsabelleConfig(
+            judge_url=cfg.get("base_url", "http://127.0.0.1:4873/v1"),
+            judge_model=cfg.get("model", "Qwen3.6-35B-A3B"),
+            pool_workers=int(cfg.get("isabelle_pool_workers", 32)),
+            check_deadline=float(timeout),
+        )
+        _isabelle_engine = IsabelleEngine(config)
+        return _isabelle_engine
+
+
+def compute_solution_reward_isabelle(
+    problem: str,
+    response: str,
+    ground_truth: str,
+    *,
+    api_config: dict | None = None,
+    dataset: str = "math",
+    idx: int = 0,
+    sample: int = 0,
+    return_debug: bool = False,
+    max_steps: int = 0,
+) -> list[float] | tuple[list[float], dict]:
+    """Whole-solution Isabelle verification.
+
+    Returns:
+        list[float]: per-step rewards (0/1). With return_debug=True, returns
+        (rewards, debug_dict) where debug_dict carries judge/verifier
+        statistics for metric aggregation (mirrors Z3 path's debug_info).
+
+    Fast-fail mirrors the Z3 path: if XML is malformed or there is no
+    \\boxed{} answer, skip the expensive judge + Isabelle call entirely.
+    """
+    debug = {
+        "format_ok": False,
+        "givens_ok": False,
+        "steps_ok": False,
+        "outcome_correct": False,
+        "n_steps": 0,
+        "verified_steps": 0,
+        "rewarded_steps": 0,
+        "neutral_steps": 0,
+        "translation_attempts_givens": 0,
+        "translation_attempts_steps": 0,
+        "guard_failed_steps": 0,
+        "premise_inconsistent_at": None,
+        "format_failed_closed": False,
+        "pattern": "",
+        # Per-symbol counts from the pattern (o>c>m>g>x priority). g is ALSO
+        # kept split as neutral_steps/guard_failed_steps above; these are the
+        # combined pattern-symbol tallies for the [Step Rewards] print parity.
+        "o_steps": 0,
+        "x_steps": 0,
+        "c_steps": 0,
+        "g_steps": 0,
+        "m_steps": 0,
+        # t = translation-failed: the XML step existed but never reached
+        # Isabelle (givens/steps translation rejected it, e.g. a bare-value
+        # conclusion that is not a proposition). These carry NO pattern symbol
+        # (engine only tallies steps that reached the prover), so they are
+        # counted here as n_steps - len(pattern). Reward is 0 (fail-closed),
+        # same as x, but kept SEPARATE so x_rate stays "model reasoning
+        # failed" and t_rate is "translator/format could not formalize".
+        # Invariant restored: o + x + c + g + m + t == n_steps.
+        "t_steps": 0,
+        "error": None,
+    }
+    # Fast-fail: malformed XML or missing boxed answer (matches Z3 path).
+    try:
+        from verl.utils.isabelle_utils.xml_utils import (
+            parse_xml_steps, boxed_answer,
+        )
+        steps_xml = parse_xml_steps(response)
+        if steps_xml is None or boxed_answer(response) is None:
+            debug["format_failed_closed"] = True
+            return ([0.0], debug) if return_debug else [0.0]
+    except Exception:
+        # If even the fast-fail check throws, fall through to the engine
+        # so the failure shows up in the structured result rather than here.
+        pass
+    try:
+        engine = _get_isabelle_engine(api_config)
+        result = engine.verify_solution(
+            problem=problem, response=response,
+            ground_truth=ground_truth, dataset=dataset,
+            idx=idx, sample=sample, max_steps=max_steps,
+        )
+        debug["format_ok"] = bool(result.get("format_ok"))
+        debug["givens_ok"] = bool(result.get("givens_ok"))
+        debug["steps_ok"] = bool(result.get("steps_ok"))
+        debug["outcome_correct"] = bool(result.get("outcome_correct"))
+        debug["n_steps"] = int(result.get("n_steps", 0) or 0)
+        debug["pattern"] = str(result.get("pattern") or "")
+        debug["premise_inconsistent_at"] = result.get(
+            "premise_inconsistent_at")
+        # translate_a: single dict OR list of dicts (judge attempts)
+        ta = result.get("translate_a")
+        if isinstance(ta, list):
+            debug["translation_attempts_givens"] = len(ta)
+        elif isinstance(ta, dict):
+            debug["translation_attempts_givens"] = 1
+        # translate_b: list (one entry per chunk) of {"attempts": ...}
+        tb = result.get("translate_b") or []
+        if isinstance(tb, list):
+            debug["translation_attempts_steps"] = sum(
+                len(x) if isinstance(x, list) else 1 for x in tb)
+        steps = result.get("steps", []) or []
+        for s in steps:
+            if s.get("verified"):
+                debug["verified_steps"] += 1
+            if s.get("rewarded"):
+                debug["rewarded_steps"] += 1
+            if s.get("neutral"):
+                debug["neutral_steps"] += 1
+            if not s.get("guard_ok", True):
+                debug["guard_failed_steps"] += 1
+        # Per-symbol counts straight from the pattern string, so every symbol
+        # in the [Step Rewards] print (o/x/c/g/m) has a matching metric with
+        # the SAME priority resolution as the printed pattern (o>c>m>g>x).
+        # rewarded_steps == o_steps by construction; kept for back-compat.
+        pat = debug["pattern"]
+        debug["o_steps"] = pat.count("o")   # rewarded (earned reward 1)
+        debug["x_steps"] = pat.count("x")   # unverified (reached prover, no proof)
+        debug["c_steps"] = pat.count("c")   # premises inconsistent (contaminated)
+        debug["g_steps"] = pat.count("g")   # verified-but-neutral/guard-failed
+        debug["m_steps"] = pat.count("m")   # verified-but-transcription-missing
+        # t = translation-failed: XML steps that never reached the prover.
+        # The pattern only has a symbol per prover-reached step, so any
+        # shortfall against n_steps is a translation/format failure. Clamp at
+        # 0 so a definition-only-neutral quirk can never make this negative.
+        debug["t_steps"] = max(0, debug["n_steps"] - len(pat))
+        if not result.get("steps_ok") or not steps:
+            n = debug["n_steps"] or 1
+            rewards = [0.0] * n
+        else:
+            rewards = [1.0 if s.get("rewarded") else 0.0 for s in steps]
+        return (rewards, debug) if return_debug else rewards
+    except Exception as e:
+        logger.warning("Isabelle reward computation failed: %s", e)
+        debug["error"] = str(e)[:200]
+        return ([0.0], debug) if return_debug else [0.0]

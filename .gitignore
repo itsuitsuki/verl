@@ -5,6 +5,7 @@ probe_outputs/*
 # self-defined
 binlp-impl
 binlp-impl/*
+scripts/isabelle_poc_math500/*
 
 **/*.pt
 **/checkpoints

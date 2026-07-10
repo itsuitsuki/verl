@@ -42,20 +42,48 @@ def default_compute_score(
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
     if data_source == "openai/gsm8k":
-        from . import gsm8k
+        # score (training reward) = math-verify boxed-gated: uniform reward
+        # basis across all three training sources (gsm8k/MATH/Big-Math) and
+        # enforces the \boxed{} contract (bare "#### 18" earns nothing --
+        # empirically a non-issue: feas step200 acc_mathverify 87.2 > regex
+        # acc 86.8, the model boxes everything). acc stays the historical
+        # regex scorer so val-core remains comparable with prior runs.
+        from . import gsm8k, math_verify
 
-        res = gsm8k.compute_score(solution_str, ground_truth)
+        _g = gsm8k.compute_score(solution_str, ground_truth)
+        _mv = math_verify.compute_score_boxed(solution_str, ground_truth)
+        res = {"score": _mv, "acc": _g, "acc_mathverify": _mv}
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
-        from . import math_reward
+        # score (training reward) = math-verify boxed-gated: is_equiv's
+        # string normalization mis-scores ~5% of correct answers on MATH
+        # (feas step200: acc 66.0 vs acc_mathverify 70.6) and that false
+        # negative is pure reward noise. acc stays is_equiv (Hendrycks /
+        # lm-eval-harness standard) so val-core remains comparable with the
+        # community and our own history; both graders logged on every val.
+        from . import math_reward, math_verify
 
-        res = math_reward.compute_score(solution_str, ground_truth)
-        # [Optional] Math-Verify Integration
-        # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
-        # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
-        # To use it, override the `compute_score` function with the following implementation:
+        _equiv = math_reward.compute_score(solution_str, ground_truth)
+        _mv = math_verify.compute_score_boxed(solution_str, ground_truth)
+        res = {"score": _mv, "acc": _equiv, "acc_mathverify": _mv}
+    elif data_source in [
+        "open-r1/Big-Math-RL-Verified-Processed",
+        "math-ai/aime24",
+        "math-ai/aime25",
+        "math-ai/amc23",
+        "math-ai/minervamath",
+        "math-ai/olympiadbench",
+    ]:
+        # Big-Math (train) + the non-MATH eval benches: ground truths mix
+        # currency ($2.50), symbolic (2\sqrt{2}) and fraction forms;
+        # math-verify's sympy equivalence handles all of them (verified
+        # 2026-07-05: 7/7 positive, 6/6 negative smoke cases), where
+        # math_reward.is_equiv's string normalization would misjudge.
+        # Boxed-gated to keep the \boxed{} format contract fail-closed.
+        # Same key set as gsm8k/MATH routes (batch collation uniformity).
+        from . import math_verify
 
-        # from . import math_verify
-        # res = math_verify.compute_score(solution_str, ground_truth)
+        _mv = math_verify.compute_score_boxed(solution_str, ground_truth)
+        res = {"score": _mv, "acc": _mv, "acc_mathverify": _mv}
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 

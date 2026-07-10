@@ -18,7 +18,7 @@ from typing import Any
 from datasets import load_dataset
 from tqdm.auto import tqdm
 
-from verl.utils.reward_score.fol import compute_step_reward_fol
+from verl.utils.reward_score.formal_verify import compute_step_reward_fol
 
 
 def _api_config(args: argparse.Namespace, task_type: str = "logic") -> dict[str, Any]:

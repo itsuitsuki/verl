@@ -1668,10 +1668,10 @@ class RayPPOTrainer:
 
                                 for rt in step_reward_types:
                                     if rt == "format":
-                                        from verl.utils.reward_score.fol import compute_step_reward_format_fol
+                                        from verl.utils.reward_score.formal_verify import compute_step_reward_format_fol
                                         ext_prm_fns["format"] = compute_step_reward_format_fol
                                     elif rt == "fol":
-                                        from verl.utils.reward_score.fol import compute_step_reward_fol
+                                        from verl.utils.reward_score.formal_verify import compute_step_reward_fol
                                         ext_prm_fns["fol"] = partial(
                                             compute_step_reward_fol,
                                             api_config=api_config,
@@ -1919,10 +1919,17 @@ class RayPPOTrainer:
                             print("\n\n[Outcome Reward]")
                             print(f"{outcome_rewards[0]}")
                             sr_sample = []
+                            # Identify the printed sample: dataset + batch index.
+                            _src = batch[0].non_tensor_batch.get("data_source", "?")
+                            sr_sample.append({"source": _src, "batch_idx": 0})
                             for k, v in reward_extra_infos_dict.items():
                                 if k.endswith("_step_reward") and len(v) > 0:
                                     sr_sample.append({k: v[0]})
-                            if sr_sample:
+                            # Isabelle per-step verdict symbols (o/x/c/g/m), if present.
+                            _pat = reward_extra_infos_dict.get("isabelle_pattern")
+                            if _pat is not None and len(_pat) > 0 and _pat[0]:
+                                sr_sample.append({"steps": _pat[0]})
+                            if len(sr_sample) > 1:
                                 print(f"[Step Rewards]: {sr_sample}")
                             tree_debug = {}
                             for k in (
@@ -2215,6 +2222,12 @@ class RayPPOTrainer:
                                     arr = np.array(all_scores, dtype=np.float32)
                                     metrics[f"step_gdpo/{key}/mean"] = float(np.mean(arr))
                                     metrics[f"step_gdpo/{key}/std"] = float(np.std(arr))
+                                    # Backend-neutral display alias (like stepverify/*):
+                                    # fol_step_reward is the formal-verify process
+                                    # reward regardless of Z3/Isabelle backend.
+                                    if key == "fol_step_reward":
+                                        metrics["step_gdpo/step_reward/mean"] = float(np.mean(arr))
+                                        metrics["step_gdpo/step_reward/std"] = float(np.std(arr))
                 # Log num_steps if available (works for step_gdpo, tree_gae, or any
                 # reward manager that populates num_steps in reward_extra_info).
                 # Follows the convention of response_length/* — training metrics have
@@ -2245,6 +2258,29 @@ class RayPPOTrainer:
                     "fol_student_duplicate_steps": "fol_judge/student_duplicate_steps",
                     "fol_declaration_failed_steps": "fol_judge/declaration_failed_steps",
                     "fol_format_failed_steps": "fol_judge/format_failed_steps",
+                    # Isabelle path metrics (fol_task_type=math). Whole-solution
+                    # verification surfaces per-response counts; ray_trainer
+                    # aggregates as mean/max/min over the batch.
+                    "isabelle_format_ok": "isabelle/format_ok",
+                    "isabelle_givens_ok": "isabelle/givens_ok",
+                    "isabelle_steps_ok": "isabelle/steps_ok",
+                    "isabelle_outcome_correct": "isabelle/outcome_correct",
+                    "isabelle_n_steps": "isabelle/n_steps",
+                    "isabelle_verified_steps": "isabelle/verified_steps",
+                    "isabelle_rewarded_steps": "isabelle/rewarded_steps",
+                    "isabelle_neutral_steps": "isabelle/neutral_steps",
+                    "isabelle_guard_failed_steps": "isabelle/guard_failed_steps",
+                    # Per-symbol pattern counts (o/x/c/g/m), match the printed
+                    # [Step Rewards] pattern one-to-one.
+                    "isabelle_o_steps": "isabelle/o_steps",
+                    "isabelle_x_steps": "isabelle/x_steps",
+                    "isabelle_c_steps": "isabelle/c_steps",
+                    "isabelle_g_steps": "isabelle/g_steps",
+                    "isabelle_m_steps": "isabelle/m_steps",
+                    "isabelle_t_steps": "isabelle/t_steps",
+                    "isabelle_judge_calls_givens": "isabelle/judge_calls_givens",
+                    "isabelle_judge_calls_steps": "isabelle/judge_calls_steps",
+                    "isabelle_judge_calls_total": "isabelle/judge_calls",
                 }
                 for batch_key, metric_prefix in fol_judge_metric_map.items():
                     if batch_key in batch.non_tensor_batch:
@@ -2252,6 +2288,74 @@ class RayPPOTrainer:
                         metrics[f"{metric_prefix}/mean"] = float(np.mean(vals))
                         metrics[f"{metric_prefix}/max"] = float(np.max(vals))
                         metrics[f"{metric_prefix}/min"] = float(np.min(vals))
+                if "isabelle_n_steps" in batch.non_tensor_batch:
+                    n_iso = np.asarray(batch.non_tensor_batch["isabelle_n_steps"], dtype=np.float32)
+                    iso_denom = np.maximum(n_iso, 1.0)
+                    isabelle_rate_map = {
+                        "isabelle_verified_steps": "isabelle/verified_rate",
+                        "isabelle_rewarded_steps": "isabelle/rewarded_rate",
+                        "isabelle_neutral_steps": "isabelle/neutral_rate",
+                        "isabelle_guard_failed_steps": "isabelle/guard_failed_rate",
+                        # Per-symbol rates (count / n_steps). By construction
+                        # o+x+c+g+m+t == n_steps, so these six rates sum to 1
+                        # (t = translation-failed steps that never reached the
+                        # prover, hence carry no pattern symbol).
+                        "isabelle_o_steps": "isabelle/o_rate",
+                        "isabelle_x_steps": "isabelle/x_rate",
+                        "isabelle_c_steps": "isabelle/c_rate",
+                        "isabelle_g_steps": "isabelle/g_rate",
+                        "isabelle_m_steps": "isabelle/m_rate",
+                        "isabelle_t_steps": "isabelle/t_rate",
+                    }
+                    for batch_key, metric_name in isabelle_rate_map.items():
+                        if batch_key in batch.non_tensor_batch:
+                            numer = np.asarray(batch.non_tensor_batch[batch_key], dtype=np.float32)
+                            vals = numer / iso_denom
+                            metrics[f"{metric_name}/mean"] = float(np.mean(vals))
+                            metrics[f"{metric_name}/max"] = float(np.max(vals))
+                            metrics[f"{metric_name}/min"] = float(np.min(vals))
+                # --- Unified stepverify/* namespace (backend-agnostic) ---
+                # Same metric names for both verifier backends so Z3 (logic /
+                # math_z3) and Isabelle (math) runs overlay on one W&B panel:
+                #   verified_steps / verified_rate  = verifier accepted the step
+                #                                     (Z3 "entailed", Isabelle "verified")
+                #   proven_steps                    = steps that earned reward 1
+                #                                     (Z3: = entailed; Isabelle: verified
+                #                                      AND guards passed)
+                #   translator_calls                = judge LLM translation calls
+                # Backend-specific namespaces (fol_judge/*, isabelle/*) are kept.
+                if "isabelle_n_steps" in batch.non_tensor_batch:  # Isabelle backend
+                    _sv_src = {
+                        "stepverify/verified_steps": "isabelle_verified_steps",
+                        "stepverify/proven_steps": "isabelle_rewarded_steps",
+                        "stepverify/translator_calls": "isabelle_judge_calls_total",
+                        "stepverify/n_steps": "isabelle_n_steps",
+                    }
+                    _sv_denom_key = "isabelle_n_steps"
+                    _sv_verified_key = "isabelle_verified_steps"
+                elif "fol_verifier_steps" in batch.non_tensor_batch:  # Z3 backend
+                    _sv_src = {
+                        "stepverify/verified_steps": "fol_entailed_steps",
+                        "stepverify/proven_steps": "fol_entailed_steps",
+                        "stepverify/translator_calls": "fol_judge_calls",
+                        "stepverify/n_steps": "fol_verifier_steps",
+                    }
+                    _sv_denom_key = "fol_verifier_steps"
+                    _sv_verified_key = "fol_entailed_steps"
+                else:
+                    _sv_src = None
+                if _sv_src is not None:
+                    for metric_name, batch_key in _sv_src.items():
+                        if batch_key in batch.non_tensor_batch:
+                            vals = np.asarray(batch.non_tensor_batch[batch_key], dtype=np.float32)
+                            metrics[f"{metric_name}/mean"] = float(np.mean(vals))
+                    if (_sv_verified_key in batch.non_tensor_batch
+                            and _sv_denom_key in batch.non_tensor_batch):
+                        _sv_num = np.asarray(batch.non_tensor_batch[_sv_verified_key], dtype=np.float32)
+                        _sv_den = np.maximum(
+                            np.asarray(batch.non_tensor_batch[_sv_denom_key], dtype=np.float32), 1.0)
+                        metrics["stepverify/verified_rate/mean"] = float(np.mean(_sv_num / _sv_den))
+
                 if "fol_verifier_steps" in batch.non_tensor_batch:
                     verifier_steps = np.asarray(batch.non_tensor_batch["fol_verifier_steps"], dtype=np.float32)
                     denom = np.maximum(verifier_steps, 1.0)

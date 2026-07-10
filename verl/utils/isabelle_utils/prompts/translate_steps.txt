@@ -1,0 +1,19 @@
+The given conditions of a problem are formalized as (Python syntax):
+{vars_givens}
+
+Below are the reasoning steps of a model's solution. Each step lists premises and exactly one conclusion. For EACH step, translate its stated premises AND its conclusion into Python boolean expressions. Output ONLY the STEP lines, one per input step, same numbering, nothing else - no explanations, no markdown:
+STEP 1 | premises: <expr> ; <expr> | prop: <expr>
+STEP 2 | premises: - | prop: <expr>
+
+Rules:
+- premises: the facts THIS step's premise lines state, separated by ' ; ' (write - if it states none). Translate them as written; they must come from the problem or from earlier steps, never from this step's own conclusion.
+- prop: the conclusion as ONE Python boolean expression.
+- Python subset: == for equality, explicit *, ** powers, / real division, // integer division, % modulo, and/or to combine facts. Allowed functions only (sqrt abs gcd lcm floor ceil factorial comb log ln exp sin cos tan min max); a_n is a plain variable, never a(n); no sets, tuples, subscripts.
+- Be faithful to the text AS WRITTEN: do not correct arithmetic, do not invent numbers. Every number the conclusion states must appear in prop doing real work - never satisfy this with tautologies (5 == 5) or by restating a given.
+- Use the declared variables; introduce fresh lowercase names for new quantities and reuse them consistently across steps.
+- When the conclusion names an aggregate or derived quantity (total, sum, remaining, difference, average) computed from quantities in this step's premises, write its defining relation explicitly as a conjunct: total_cost == house_cost + repair_cost and total_cost == 130000. The word's meaning is part of the conclusion.
+- If a step concludes the final answer, write: answer == <value>.
+- When correcting a previous output, you may re-output ONLY the STEP lines that were rejected; the other lines are kept automatically.
+
+STEPS:
+{steps}

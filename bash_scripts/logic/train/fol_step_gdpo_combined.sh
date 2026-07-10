@@ -5,11 +5,11 @@ set -x
 # Env setup (conda, WANDB_API_KEY, LD_PRELOAD etc.) should be done before running this script.
 #
 # Mode 1 - embedded judge (same node):
-#   JUDGE_MODEL=/path/to/model bash bash_scripts/fol_step_gdpo_combined.sh
+#   JUDGE_MODEL=/path/to/model bash bash_scripts/logic/train/fol_step_gdpo_combined.sh
 #   Override: JUDGE_TP, JUDGE_DEVICES, TRAIN_DEVICES
 #
 # Mode 2 - external judge (cross-node, judge already running):
-#   OPENAI_BASE_URL=http://<judge-host>:4873/v1 bash bash_scripts/fol_step_gdpo_combined.sh
+#   OPENAI_BASE_URL=http://<judge-host>:4873/v1 bash bash_scripts/logic/train/fol_step_gdpo_combined.sh
 
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 export WANDB_MODE=${WANDB_MODE:-online}

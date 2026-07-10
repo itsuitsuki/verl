@@ -14,7 +14,7 @@ set -x
 #   MODEL_PATH=/2022533109/zhouchuyan/models/Qwen2.5-1.5B-Instruct \
 #   CHECKPOINT_PATH=checkpoints/verl-fol/qwen1.5b_step_gdpo_fol_gpu2_v4/global_step_1844 \
 #   RUN_NAME=qwen1.5b_step_gdpo_fol_logiqa_test_final1844 \
-#   bash bash_scripts/pass_at_1_test.sh 2>&1 | tee test_fol_step_gdpo_logiqa_final1844.log
+#   bash bash_scripts/eval/pass_at_1_test.sh 2>&1 | tee test_fol_step_gdpo_logiqa_final1844.log
 
 HOME_DIR=${HOME:-/root}
 DATA_NAME=${DATA_NAME:-logiqa2k_prompt_v2}

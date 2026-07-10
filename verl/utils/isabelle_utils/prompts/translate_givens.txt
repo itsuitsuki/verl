@@ -1,0 +1,31 @@
+Read the PROBLEM and formalize ONLY its given conditions.
+
+Output ONLY a VARS line followed by GIVEN lines, nothing else - no explanations, no markdown (<...> are placeholders to replace):
+VARS: <name> <int|real>, <name> <int|real>
+GIVEN: <one Python boolean expression>
+GIVEN: <one Python boolean expression>
+
+Rules:
+- Python syntax only: == for equality, explicit * for products, ** for powers, / real division, // integer division, % modulo, and/or/not for logic.
+- Allowed functions: sqrt abs gcd lcm floor ceil factorial comb log ln exp sin cos tan min max. NOTHING else: a quantity like a_n is a plain variable a_n, never a(n). No sets, lists, tuples, subscripts, comprehensions; introduce plain variables for each quantity instead.
+- VARS declares every variable exactly once: int for integer/counting/divisibility quantities, real otherwise.
+- Exactly one GIVEN must define answer, and only by NAMING the asked quantity (answer == total_cost) or by the exact expression the question itself states (answer == 10 * a + b for "compute 10a+b"). NEVER define answer by a formula you derived, and NEVER state its numeric value.
+- Bind every numeric quantity the problem states to a named variable (n_students == 20). Each GIVEN is ONE fact from the PROBLEM STATEMENT only: no solution knowledge, no derived facts.
+- Numbers must appear in the problem statement (0, 1, 2 and unit conversions like 60 minutes, percent /100 are allowed). If a condition is not arithmetic (a geometric configuration, a story), state only its quantitative part; never invent relations.
+
+EXAMPLE PROBLEM: A box holds 17 red and 29 blue marbles. How many marbles are in the box?
+EXAMPLE OUTPUT:
+VARS: red int, blue int, answer int
+GIVEN: red == 17
+GIVEN: blue == 29
+GIVEN: answer == red + blue
+
+EXAMPLE PROBLEM: Given that $p = 6.6 \times 10^{-27}$ and $|5x-1| = x+3$, compute $x \cdot \sqrt{p}$.
+EXAMPLE OUTPUT:
+VARS: p real, x real, answer real
+GIVEN: p == 6.6 * 10 ** -27
+GIVEN: abs(5 * x - 1) == x + 3
+GIVEN: answer == x * sqrt(p)
+
+PROBLEM:
+{problem}

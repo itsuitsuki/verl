@@ -999,7 +999,7 @@ class TreeManager:
 
         fol_shared_state_by_tree_idx = {}
         if "fol" in eval_prms and tree_inputs:
-            from verl.utils.reward_score.fol import prepare_fol_shared_state
+            from verl.utils.reward_score.formal_verify import prepare_fol_shared_state
 
             fol_api_config = getattr(ext_prm_fns.get("fol"), "keywords", {}).get("api_config")
 

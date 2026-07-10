@@ -1779,8 +1779,11 @@ class TranslationMode(Enum):
 
 
 class TaskType(Enum):
-    LOGIC = "logic"  # qualitative predicate logic (LogiQA, FOLIO, AR-LSAT)
-    MATH = "math"    # arithmetic word problems (GSM8K, MATH-500)
+    LOGIC = "logic"      # qualitative predicate logic (LogiQA, FOLIO, AR-LSAT)
+    # 2026-06-14: MATH changed from Z3 to Isabelle verification.
+    # Old Z3 path preserved as MATH_Z3 (deprecated, never used in training).
+    MATH = "math"        # arithmetic word problems → Isabelle verification
+    MATH_Z3 = "math_z3"  # deprecated: old Z3 path for math
 
 
 @dataclass
@@ -1809,7 +1812,7 @@ def _preprocess_direct(
     Returns (context, declarations).
     """
     task_type = (api_config or {}).get("fol_task_type", "logic")
-    prompt_path = Z3_DECLARATION_PROMPT_MATH if task_type == "math" else Z3_DECLARATION_PROMPT
+    prompt_path = Z3_DECLARATION_PROMPT_MATH if task_type == "math_z3" else Z3_DECLARATION_PROMPT
     system_prompt = load_prompt(prompt_path)
     user_input = f"<Context>{context}</Context>\n<Question>{question}</Question>"
     if options:
@@ -1903,7 +1906,7 @@ def _translate_implication(
     Returns executable Z3 Python code string.
     """
     task_type = (api_config or {}).get("fol_task_type", "logic")
-    prompt_path = Z3_IMPLICATION_PROMPT_MATH if task_type == "math" else Z3_IMPLICATION_PROMPT
+    prompt_path = Z3_IMPLICATION_PROMPT_MATH if task_type == "math_z3" else Z3_IMPLICATION_PROMPT
     system_prompt = load_prompt(prompt_path)
     user_input = (
         f"Z3 Declarations:\n```python\n{declarations}\n```\n\n"

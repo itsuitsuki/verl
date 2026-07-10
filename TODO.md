@@ -2,6 +2,42 @@
 
 This note summarizes the current debugging state for the LogiQA2K 1.5B FOL reward runs, so another person can continue without reconstructing the full chat history.
 
+## Math + Isabelle Production (2026-07-05)
+
+### 7-bench val suite baseline (Qwen3-4B base, step 0, greedy@1, full sets)
+
+Run: `qwen3-4b_step_gdpo_isabelle_math_combined_v1` (dt1, log
+`logs/math_combined_qwen3-4b_20260705_125054.log`). acc = each bench's
+standard scorer; mathverify = math-verify boxed-gated (logged alongside).
+Feas column = feasibility run step 300 (gsm8k+MATH only training) for the
+elicitation-gain reference; AIME25 had no feas measurement.
+
+| Bench | base acc | base mathverify | feas@300 acc |
+|---|---|---|---|
+| GSM8K (1319) | 80.5% | 82.3% | 86.9% |
+| MATH-500 (500) | 61.4% | 65.6% | 65.6% |
+| AIME24 (30) | 10.0% | 10.0% | 16.7% |
+| AIME25 (30) | 3.3% | 3.3% | - |
+| AMC23 (40) | 32.5% | 32.5% | 42.5% |
+| Minerva (272) | 31.6% | 31.6% | 35.3% |
+| OlympiadBench (674) | 30.9% | 30.9% | 36.9% |
+
+Notes: AIME25 is the least contamination-suspect bench (2025-02 problems,
+postdates Qwen3 pretraining crawl targets) -> the cleanest signal for the
+production run. gsm8k/MATH are saturated in the Qwen3 base (report tables
+6/7); expect movement mainly on MATH-500/Minerva/OlympiadBench/AIME.
+
+### Production runs
+
+- Train = [gsm8k 7.5k, MATH 7.5k, bigmath 161k (open-r1 processed, source
+  dedup, solve_rate 0-0.9)], batch 16 x rollout 16, 1250 steps, save/test 50,
+  reward = math-verify boxed-gated, W&B project verl-fol-2.
+- 4B: dt1 GPU 0,2 + local judge GPU 4,5 -- RUNNING since 2026-07-05.
+- 8B: dt3 GPU 4 (train) + judge GPU 6,7 -- pending launch.
+- Feasibility (isafeas7, gsm8k+MATH only) stopped at step 303: val plateaued
+  after step 200; infra stable 300+ steps; checkpoints under
+  `checkpoints/verl-fol/qwen3-4b_step_gdpo_isabelle_feas1/`.
+
 ## Current Priority TODO, 2026-05-21
 
 Treat this section as the authoritative next-step list. Older sections below are historical context.
@@ -456,6 +492,8 @@ Z3 的根本限制：
 覆盖不了的步骤 fail-closed（返回 0.0），不产生错误正面奖励，但降低了 process reward 的有效信号密度。
 
 ### TODO: Isabelle/HOL 集成路线
+
+> **2026-06 更新**：详细方案与使用见正本 `verl/utils/isabelle_utils/README.md`（Usage + 融入的原 integration-plan 设计本体；原 `docs/isabelle-integration-plan.md` 已删除并融入，`E:/AMPR/isabelle-integration.md` 软链回该 README）。基于 FoVer 论文+代码一手核实。Isabelle 2025 已装在 datatech 共享盘，sorry trick PoC 已跑通，MATH-500 PoC 进行中（`scripts/isabelle_poc_math500/`）。下面的原始路线分析保留作历史参考；主线已定为方案 C（在线同步验证），PoC 数据集为 MATH-500（FoVer 未覆盖的难度区间）。
 
 参考 FoVer（2505.15960）的 `sorry` trick 实现 step-level 定理证明验证：
 

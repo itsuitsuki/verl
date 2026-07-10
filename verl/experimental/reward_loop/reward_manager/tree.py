@@ -122,13 +122,19 @@ class TreeRewardManager(RewardManagerBase):
         old_max_tries = reward_cfg_fol.get("fol_old_max_tries", algo_cfg_fol.get("fol_old_max_tries", None))
         if old_max_tries is not None:
             self.api_config["old_max_tries"] = int(old_max_tries)
-        z3_timeout = reward_cfg_fol.get("fol_timeout", algo_cfg_fol.get("fol_timeout", None))
+        # New alias `verify_timeout` preferred; `fol_timeout` kept for
+        # backward compatibility (mirrors step.py).
+        z3_timeout = reward_cfg_fol.get("verify_timeout", algo_cfg_fol.get("verify_timeout",
+                     reward_cfg_fol.get("fol_timeout", algo_cfg_fol.get("fol_timeout", None))))
         if z3_timeout is not None:
             self.api_config["timeout"] = int(z3_timeout)
         api_timeout = reward_cfg_fol.get("api_timeout", algo_cfg_fol.get("api_timeout", None))
         if api_timeout is not None:
             self.api_config["api_timeout"] = int(api_timeout)
-        fol_cumulative_mode = reward_cfg_fol.get("fol_cumulative_mode", algo_cfg_fol.get("fol_cumulative_mode", None))
+        # New alias `verify_cumulative_mode` preferred; `fol_cumulative_mode`
+        # kept for backward compatibility (mirrors step.py).
+        fol_cumulative_mode = reward_cfg_fol.get("verify_cumulative_mode", algo_cfg_fol.get("verify_cumulative_mode",
+                              reward_cfg_fol.get("fol_cumulative_mode", algo_cfg_fol.get("fol_cumulative_mode", None))))
         if fol_cumulative_mode is not None:
             self.api_config["fol_cumulative_mode"] = str(fol_cumulative_mode)
         print(f"FOL config 'fol_cumulative_mode' is set to: {self.api_config.get('fol_cumulative_mode', 'current_only')}")
@@ -185,7 +191,7 @@ class TreeRewardManager(RewardManagerBase):
         # Lazy-load built-in extra reward types
         if any(rt in ["fol", "fol_old", "format"] for rt in self.step_reward_types):
             try:
-                from verl.utils.reward_score.fol import compute_step_reward_format_fol, compute_step_reward_fol
+                from verl.utils.reward_score.formal_verify import compute_step_reward_format_fol, compute_step_reward_fol
                 if "format" not in self.step_reward_fns:
                     self.step_reward_fns["format"] = compute_step_reward_format_fol
                 if "fol" not in self.step_reward_fns:
@@ -457,7 +463,7 @@ class TreeRewardManager(RewardManagerBase):
 
                 fol_shared_state = None
                 if reward_type == "fol":
-                    from verl.utils.reward_score.fol import prepare_fol_shared_state
+                    from verl.utils.reward_score.formal_verify import prepare_fol_shared_state
 
                     loop = asyncio.get_event_loop()
                     fol_shared_state = await loop.run_in_executor(

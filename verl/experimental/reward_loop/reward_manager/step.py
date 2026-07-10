@@ -108,15 +108,31 @@ class StepRewardManager(RewardManagerBase):
         old_max_tries = reward_cfg.get("fol_old_max_tries", algo_cfg.get("fol_old_max_tries", None))
         if old_max_tries is not None:
             self.api_config["old_max_tries"] = int(old_max_tries)
-        z3_timeout = reward_cfg.get("fol_timeout", algo_cfg.get("fol_timeout", None))
+        # Per-verification deadline in seconds (Z3 subprocess timeout / Isabelle
+        # check_deadline). New alias `verify_timeout` preferred; `fol_timeout`
+        # kept for backward compatibility with existing scripts.
+        z3_timeout = reward_cfg.get("verify_timeout", algo_cfg.get("verify_timeout",
+                     reward_cfg.get("fol_timeout", algo_cfg.get("fol_timeout", None))))
         if z3_timeout is not None:
             self.api_config["timeout"] = int(z3_timeout)
         api_timeout = reward_cfg.get("api_timeout", algo_cfg.get("api_timeout", None))
         if api_timeout is not None:
             self.api_config["api_timeout"] = int(api_timeout)
-        fol_cumulative_mode = reward_cfg.get("fol_cumulative_mode", algo_cfg.get("fol_cumulative_mode", None))
+        # New alias `verify_cumulative_mode` preferred; `fol_cumulative_mode`
+        # kept for backward compatibility.
+        fol_cumulative_mode = reward_cfg.get("verify_cumulative_mode", algo_cfg.get("verify_cumulative_mode",
+                              reward_cfg.get("fol_cumulative_mode", algo_cfg.get("fol_cumulative_mode", None))))
         if fol_cumulative_mode is not None:
             self.api_config["fol_cumulative_mode"] = str(fol_cumulative_mode)
+        # New alias `verify_task_type` preferred; `fol_task_type` kept for
+        # backward compatibility ("fol" prefix = formal-verification, not FOL).
+        fol_task_type = reward_cfg.get("verify_task_type", algo_cfg.get("verify_task_type",
+                        reward_cfg.get("fol_task_type", algo_cfg.get("fol_task_type", None))))
+        if fol_task_type is not None:
+            self.api_config["fol_task_type"] = str(fol_task_type)
+        isabelle_pool_workers = reward_cfg.get("isabelle_pool_workers", algo_cfg.get("isabelle_pool_workers", None))
+        if isabelle_pool_workers is not None:
+            self.api_config["isabelle_pool_workers"] = int(isabelle_pool_workers)
         print(f"FOL config 'fol_cumulative_mode' is set to: {self.api_config.get('fol_cumulative_mode', 'current_only')}")
 
         # FOL pipeline / translation mode
@@ -170,7 +186,7 @@ class StepRewardManager(RewardManagerBase):
         # Built-in extra reward types if requested (Lazy loading)
         if any(rt in ["fol", "fol_old", "format"] for rt in self.step_reward_types):
             try:
-                from verl.utils.reward_score.fol import compute_step_reward_format_fol, compute_step_reward_fol
+                from verl.utils.reward_score.formal_verify import compute_step_reward_format_fol, compute_step_reward_fol
                 if "format" not in self.step_reward_fns:
                     self.step_reward_fns["format"] = compute_step_reward_format_fol
                 if "fol" not in self.step_reward_fns:
@@ -290,6 +306,37 @@ class StepRewardManager(RewardManagerBase):
                     "fol_format_failed_steps": 0,
                 }
             )
+            # Isabelle backend keys must be prefilled too: hard-penalized /
+            # validation-skipped responses return before the Isabelle branch,
+            # and a key-set mismatch across a batch turns the whole batch's
+            # isabelle/* metrics into NaN (missing keys collate as None).
+            # Zeros are also semantically right for penalized responses
+            # (bad format => format_ok=0, nothing verified).
+            if (self.api_config or {}).get("fol_task_type") == "math":
+                reward_extra_info.update(
+                    {
+                        "isabelle_format_ok": 0,
+                        "isabelle_givens_ok": 0,
+                        "isabelle_steps_ok": 0,
+                        "isabelle_outcome_correct": 0,
+                        "isabelle_n_steps": 0,
+                        "isabelle_verified_steps": 0,
+                        "isabelle_rewarded_steps": 0,
+                        "isabelle_neutral_steps": 0,
+                        "isabelle_guard_failed_steps": 0,
+                        "isabelle_judge_calls_givens": 0,
+                        "isabelle_judge_calls_steps": 0,
+                        "isabelle_judge_calls_total": 0,
+                        "isabelle_o_steps": 0,
+                        "isabelle_x_steps": 0,
+                        "isabelle_c_steps": 0,
+                        "isabelle_g_steps": 0,
+                        "isabelle_m_steps": 0,
+                        "isabelle_t_steps": 0,
+                        "isabelle_pattern": "",
+                        "isabelle_error": "",
+                    }
+                )
         return reward_extra_info
 
     async def run_single(self, data: DataProto) -> dict:
@@ -442,8 +489,76 @@ class StepRewardManager(RewardManagerBase):
                 raise ValueError(f"Unknown step reward type: {reward_type}")
 
             fol_shared_state = None
+            if reward_type == "fol" and (self.api_config or {}).get("fol_task_type") == "math":
+                from verl.utils.reward_score.formal_verify import compute_solution_reward_isabelle
+                loop = asyncio.get_event_loop()
+                isabelle_rewards, isabelle_debug = await loop.run_in_executor(
+                    self._executor,
+                    lambda: compute_solution_reward_isabelle(
+                        problem=prompt_text,
+                        response=response_str,
+                        ground_truth=(extra_info or {}).get(
+                            "math_final_answer",
+                            (extra_info or {}).get("answer", "")),
+                        api_config=self.api_config,
+                        return_debug=True,
+                        # Steps beyond penalty_max_steps get penalty_score and
+                        # their verdicts are discarded (see mapping below) --
+                        # don't waste judge/prover time computing them.
+                        max_steps=self.penalty_max_steps,
+                    ),
+                )
+                step_rewards = []
+                ri = 0
+                for i, (_step_text, token_end_pos) in enumerate(step_positions):
+                    if i in penalty_step_indices:
+                        step_rewards.append((int(token_end_pos), self.penalty_score))
+                    elif ri < len(isabelle_rewards):
+                        step_rewards.append((int(token_end_pos), float(isabelle_rewards[ri])))
+                        ri += 1
+                    else:
+                        step_rewards.append((int(token_end_pos), 0.0))
+                step_rewards.sort(key=lambda item: item[0])
+                reward_extra_info[f"{reward_type}_step_reward"] = step_rewards
+                # Per-response Isabelle metrics (mirror Z3 fol_judge/* pattern).
+                # Reward manager aggregates across batch; single-value scalars
+                # are averaged downstream.
+                d = isabelle_debug or {}
+                reward_extra_info["isabelle_format_ok"] = int(bool(d.get("format_ok")))
+                reward_extra_info["isabelle_givens_ok"] = int(bool(d.get("givens_ok")))
+                reward_extra_info["isabelle_steps_ok"] = int(bool(d.get("steps_ok")))
+                reward_extra_info["isabelle_outcome_correct"] = int(bool(d.get("outcome_correct")))
+                reward_extra_info["isabelle_n_steps"] = int(d.get("n_steps") or 0)
+                reward_extra_info["isabelle_verified_steps"] = int(d.get("verified_steps") or 0)
+                reward_extra_info["isabelle_rewarded_steps"] = int(d.get("rewarded_steps") or 0)
+                reward_extra_info["isabelle_neutral_steps"] = int(d.get("neutral_steps") or 0)
+                reward_extra_info["isabelle_guard_failed_steps"] = int(d.get("guard_failed_steps") or 0)
+                # Per-symbol pattern counts (o/x/c/g/m), same priority as the
+                # printed pattern. g is also kept split above (neutral/guard).
+                reward_extra_info["isabelle_o_steps"] = int(d.get("o_steps") or 0)
+                reward_extra_info["isabelle_x_steps"] = int(d.get("x_steps") or 0)
+                reward_extra_info["isabelle_c_steps"] = int(d.get("c_steps") or 0)
+                reward_extra_info["isabelle_g_steps"] = int(d.get("g_steps") or 0)
+                reward_extra_info["isabelle_m_steps"] = int(d.get("m_steps") or 0)
+                reward_extra_info["isabelle_t_steps"] = int(d.get("t_steps") or 0)
+                reward_extra_info["isabelle_judge_calls_givens"] = int(d.get("translation_attempts_givens") or 0)
+                reward_extra_info["isabelle_judge_calls_steps"] = int(d.get("translation_attempts_steps") or 0)
+                reward_extra_info["isabelle_judge_calls_total"] = int(
+                    (d.get("translation_attempts_givens") or 0)
+                    + (d.get("translation_attempts_steps") or 0))
+                # Per-step verdict symbols (o=rewarded, x=unverified,
+                # c=premises-inconsistent, m=transcription-missing,
+                # g=guard-failed) for the [Step Rewards] sample print.
+                reward_extra_info["isabelle_pattern"] = str(d.get("pattern") or "")
+                # ALWAYS set the key (empty string when no error): batch
+                # collation asserts every response has the same
+                # reward_extra_info keys, so a conditional key crashes the
+                # step whenever only some responses error.
+                reward_extra_info["isabelle_error"] = str(d.get("error") or "")
+                continue
+
             if reward_type == "fol":
-                from verl.utils.reward_score.fol import (
+                from verl.utils.reward_score.formal_verify import (
                     _has_student_premise_conclusion_duplicate,
                     check_step_format_fol,
                     prepare_fol_shared_state,

@@ -20,7 +20,7 @@ from datasets import load_dataset
 from tqdm.auto import tqdm
 
 from verl.utils.fol_utils.common import call_llm_structured
-from verl.utils.reward_score.fol import compute_step_reward_fol
+from verl.utils.reward_score.formal_verify import compute_step_reward_fol
 
 
 _CLAIM_EXTRACTION_SCHEMA = {
@@ -63,6 +63,8 @@ def _api_config(args: argparse.Namespace) -> dict[str, Any]:
         "timeout": args.fol_timeout,
         "max_tries": args.max_tries,
         "old_max_tries": args.old_max_tries,
+        # 2026-06-14: "math" now routes to Isabelle verification (was Z3).
+        # Use "math_z3" to get the old Z3 math path (deprecated).
         "fol_task_type": "math",
         "fol_cumulative_mode": "current_only",
         "fol_judge_use_outlines": args.outlines,
