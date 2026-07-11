@@ -205,6 +205,7 @@ def test_http_posts_counted_not_cache_markers(monkeypatch, tmp_path):
     assert r[0] == "T:ok"
     atts = r[1]
     assert atts[0]["http_posts"] == 2       # 1 failed + 1 successful post
+    assert atts[0]["http_wall_s"] >= 0.0
     # cached second call: marker only, no http_posts key
     r2 = judge.translate("HTTPCOUNT", _ok_parse, _ok_validate,
                          judge_url="u", judge_model="m")

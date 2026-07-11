@@ -53,8 +53,14 @@ def call_judge(prompt: str, thinking: bool, *,
                 # count REAL HTTP posts (2026-07-11 review: judge_calls_*
                 # counted cache markers as judge load; this is the truth)
                 stats["posts"] = stats.get("posts", 0) + 1
-            r = requests.post(f"{url}/chat/completions",
-                              json=payload, timeout=timeout)
+            _http_t0 = time.time()
+            try:
+                r = requests.post(f"{url}/chat/completions",
+                                  json=payload, timeout=timeout)
+            finally:
+                if stats is not None:
+                    stats["wall_s"] = (stats.get("wall_s", 0.0)
+                                       + time.time() - _http_t0)
             r.raise_for_status()
             choice = r.json()["choices"][0]
             reply = choice["message"]["content"]
@@ -265,7 +271,7 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
     for t in range(MAX_TRIES):
         prompt = prompt_base if fb is None else prompt_base + fb
         t0 = time.time()
-        http = {"posts": 0}
+        http = {"posts": 0, "wall_s": 0.0}
         try:
             reply = call_judge(prompt, thinking=(t > 0),
                                judge_url=judge_url, judge_model=judge_model,
@@ -274,11 +280,12 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
         except Exception as e:
             attempts.append({"attempt": t, "fail": "judge_error",
                              "error": str(e)[:200],
-                             "http_posts": http["posts"]})
+                             "http_posts": http["posts"],
+                             "http_wall_s": http["wall_s"]})
             break
         rec = {"attempt": t, "thinking": t > 0,
                "elapsed": time.time() - t0, "reply_head": reply[:1200],
-               "http_posts": http["posts"]}
+               "http_posts": http["posts"], "http_wall_s": http["wall_s"]}
         if reply.endswith("[TRUNCATED]"):
             rec["fail"] = "truncated"
             fb = feedback(reply[-1500:], [

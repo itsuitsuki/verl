@@ -17,6 +17,7 @@ Design points:
   constants stay faithful and computable.
 """
 import ast
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 
 
@@ -60,9 +61,16 @@ def parse_expr(src: str) -> ast.expr:
             except Exception:  # noqa: BLE001
                 seg = None
             if seg:
+                text = seg.strip()
                 try:
-                    n._frac_val = Fraction(seg.strip())
-                except (ValueError, ZeroDivisionError):
+                    n._frac_val = Fraction(text)
+                    # Preserve written precision for tolerance semantics.
+                    # Decimal handles trailing zeros and scientific notation:
+                    # 0.250 -> 3 places; 2.50e-3 -> 5 decimal places.
+                    dec = Decimal(text)
+                    n._decimal_text = text
+                    n._decimal_places = max(0, -dec.as_tuple().exponent)
+                except (ValueError, ZeroDivisionError, InvalidOperation):
                     pass
     return tree.body
 
@@ -205,10 +213,12 @@ def transpile(node, var_types: dict, carrier: str) -> str:
             sign = "-" if isinstance(n.op, ast.USub) else ""
             return f"({sign}{t(n.operand)})"
         if isinstance(n, ast.BinOp):
-            a, b = t(n.left), t(n.right)
             if isinstance(n.op, ast.Pow):
-                # constant-foldable integer exponents stay computable: ^ for
-                # k >= 0, exact reciprocal for k < 0; powr only as last resort
+                # The base/result use the proposition carrier. A symbolic
+                # integer exponent must be emitted independently as int;
+                # reusing the real carrier produces ill-typed terms such as
+                # T - (5::real) when T :: int.
+                a = t(n.left)
                 ev = _const_eval(n.right)
                 if ev is not None and ev.denominator == 1:
                     k = ev.numerator
@@ -228,10 +238,11 @@ def transpile(node, var_types: dict, carrier: str) -> str:
                     eids, ereal = set(), True
                 if not ereal and eids and all(
                         var_types.get(i) == "int" for i in eids):
-                    e_t = t(n.right)
+                    e_t = transpile(n.right, var_types, "int")
                     if carrier == "real":
-                        return (f"(if {e_t} >= 0 then ({a} ^ (nat {e_t})) "
-                                f"else (1 / ({a} ^ (nat (- {e_t})))))")
+                        return (f"(if {e_t} >= (0::int) then "
+                                f"({a} ^ (nat {e_t})) else "
+                                f"(1 / ({a} ^ (nat (- {e_t})))))")
                     # A possibly-negative exponent under a non-real carrier
                     # has no faithful integer encoding (a^-k is fractional);
                     # fail closed rather than silently change the meaning.
@@ -241,6 +252,7 @@ def transpile(node, var_types: dict, carrier: str) -> str:
                         "symbolic integer exponent requires a real carrier "
                         "(may be negative)")
                 return f"({a} powr {t(n.right)})"
+            a, b = t(n.left), t(n.right)
             if isinstance(n.op, ast.Mod):
                 return f"({a} mod {b})"
             if isinstance(n.op, ast.FloorDiv):

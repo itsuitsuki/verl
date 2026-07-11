@@ -333,7 +333,8 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_g_steps": 0,
                         "isabelle_m_steps": 0,
                         "isabelle_t_steps": 0,
-                        "isabelle_translate_wall_s": 0.0,
+                        "isabelle_judge_http_wall_s": 0.0,
+                        "isabelle_translate_validate_wall_s": 0.0,
                         "isabelle_prove_calls": 0,
                         "isabelle_prove_queue_s": 0.0,
                         "isabelle_prove_run_s": 0.0,
@@ -563,7 +564,10 @@ class StepRewardManager(RewardManagerBase):
                     (d.get("translation_attempts_givens") or 0)
                     + (d.get("translation_attempts_steps") or 0))
                 # Wall profile + cache/restart gauges (2026-07-11 review #6).
-                reward_extra_info["isabelle_translate_wall_s"] = float(d.get("translate_wall_s") or 0.0)
+                reward_extra_info["isabelle_judge_http_wall_s"] = float(
+                    d.get("judge_http_wall_s") or 0.0)
+                reward_extra_info["isabelle_translate_validate_wall_s"] = float(
+                    d.get("translate_validate_wall_s") or 0.0)
                 reward_extra_info["isabelle_prove_calls"] = int(d.get("prove_calls") or 0)
                 reward_extra_info["isabelle_prove_queue_s"] = float(d.get("prove_queue_s") or 0.0)
                 reward_extra_info["isabelle_prove_run_s"] = float(d.get("prove_run_s") or 0.0)

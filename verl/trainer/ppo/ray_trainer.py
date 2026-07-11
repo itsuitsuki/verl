@@ -2281,11 +2281,11 @@ class RayPPOTrainer:
                     "isabelle_judge_calls_givens": "isabelle/judge_calls_givens",
                     "isabelle_judge_calls_steps": "isabelle/judge_calls_steps",
                     "isabelle_judge_calls_total": "isabelle/judge_calls",
-                    # Wall profile (2026-07-11 review #6): mean shows the
-                    # typical response, max shows the step-time tail. The
-                    # cache/restart gauges are process-cumulative (mean IS
-                    # the current value; max/min spread = per-process skew).
-                    "isabelle_translate_wall_s": "isabelle/translate_wall_s",
+                    # Wall profile (2026-07-11 review #6): pure judge HTTP
+                    # wall is disjoint from prover queue/run; end-to-end
+                    # translate+validate wall is also kept for latency analysis.
+                    "isabelle_judge_http_wall_s": "isabelle/judge_http_wall_s",
+                    "isabelle_translate_validate_wall_s": "isabelle/translate_validate_wall_s",
                     "isabelle_prove_calls": "isabelle/prove_calls",
                     "isabelle_prove_queue_s": "isabelle/prove_queue_s",
                     "isabelle_prove_run_s": "isabelle/prove_run_s",
@@ -2303,12 +2303,22 @@ class RayPPOTrainer:
                     "isabelle_translation_xproc_hits": "isabelle/translation_xproc_hits",
                     "isabelle_translation_failures": "isabelle/translation_failures",
                 }
+                isabelle_cumulative_gauges = {
+                    "isabelle_pool_restarts",
+                    "isabelle_thm_cache_hit_rate",
+                    "isabelle_tr_cache_hit_rate",
+                }
                 for batch_key, metric_prefix in fol_judge_metric_map.items():
                     if batch_key in batch.non_tensor_batch:
                         vals = np.asarray(batch.non_tensor_batch[batch_key], dtype=np.float32)
                         metrics[f"{metric_prefix}/mean"] = float(np.mean(vals))
                         metrics[f"{metric_prefix}/max"] = float(np.max(vals))
                         metrics[f"{metric_prefix}/min"] = float(np.min(vals))
+                        if batch_key in isabelle_cumulative_gauges:
+                            # These are per-process cumulative snapshots taken
+                            # as responses finish; max is the closest available
+                            # batch-end value. Keep mean/min for skew diagnosis.
+                            metrics[f"{metric_prefix}/current"] = float(np.max(vals))
                 if "isabelle_n_steps" in batch.non_tensor_batch:
                     n_iso = np.asarray(batch.non_tensor_batch["isabelle_n_steps"], dtype=np.float32)
                     iso_denom = np.maximum(n_iso, 1.0)

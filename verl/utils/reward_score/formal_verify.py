@@ -943,13 +943,13 @@ def compute_solution_reward_isabelle(
         # failed" and t_rate is "translator/format could not formalize".
         # Invariant restored: o + x + c + g + m + t == n_steps.
         "t_steps": 0,
-        # Per-response wall profile (2026-07-11 review #6): decomposes the
-        # reward tail. translate_wall_s = judge translation wall (all calls);
-        # prove_queue_s / prove_run_s = summed idle-worker wait vs in-worker
-        # check time over this response's prover calls; reward_wall_s = whole
-        # verify_solution wall. Cache/restart gauges are process-CUMULATIVE
-        # (same value across a batch's responses; the W&B mean IS the value).
-        "translate_wall_s": 0.0,
+        # Per-response wall profile (2026-07-11 review #6). judge_http_wall_s
+        # is pure HTTP wall and does not overlap prover time;
+        # translate_validate_wall_s is end-to-end translation/validation wall
+        # and may include prover-backed validation. Cache/restart gauges are
+        # process-cumulative snapshots; batch max is the meaningful endpoint.
+        "judge_http_wall_s": 0.0,
+        "translate_validate_wall_s": 0.0,
         "prove_calls": 0,
         "prove_queue_s": 0.0,
         "prove_run_s": 0.0,
@@ -1038,7 +1038,10 @@ def compute_solution_reward_isabelle(
         # Wall profile from the engine (review #6). Guarded: an old cached
         # rec or an early-return path may lack keys; defaults stay 0.
         prof = result.get("prof") or {}
-        debug["translate_wall_s"] = float(prof.get("translate_s") or 0.0)
+        debug["judge_http_wall_s"] = float(
+            prof.get("judge_http_s") or 0.0)
+        debug["translate_validate_wall_s"] = float(
+            prof.get("translate_validate_s") or 0.0)
         debug["prove_calls"] = int(prof.get("prove_calls") or 0)
         debug["prove_queue_s"] = float(prof.get("prove_queue_s") or 0.0)
         debug["prove_run_s"] = float(prof.get("prove_run_s") or 0.0)

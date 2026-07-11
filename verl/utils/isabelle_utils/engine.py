@@ -24,7 +24,7 @@ from verl.utils.isabelle_utils.xml_utils import (
     block_stats, boxed_answer, corrupt_steps, parse_xml_steps,
 )
 from verl.utils.isabelle_utils.pyexpr import (
-    FUNCS, PyExprError, parse_expr, py_to_isabelle, transpile,
+    FUNCS, PyExprError, analyze, parse_expr, py_to_isabelle, transpile,
 )
 
 _PKG_DIR = Path(__file__).parent.resolve()
@@ -162,6 +162,40 @@ def conjuncts(src: str):
     return [node]
 
 
+def _node_carrier(node, var_types: dict, fallback: str = "real") -> str:
+    """Choose the numeral carrier for one typed expression subtree."""
+    try:
+        ids, _, needs_real = analyze(node)
+    except PyExprError:
+        return fallback
+    if needs_real or any(var_types.get(i) == "real" for i in ids):
+        return "real"
+    return "int"
+
+
+def _transpile_conjunctive(src: str, var_types: dict):
+    """Transpile top-level conjunctions with a carrier per conjunct.
+
+    A proposition such as ``x / 2 == 1 and n % 2 == 0`` cannot use one global
+    carrier: the first conjunct is real while the second must remain int.
+    The combined term is used both as the current claim and as a later step's
+    premise, so it must preserve both sorts at construction time.
+    """
+    node = parse_expr(src)
+    nodes = (node.values if isinstance(node, ast.BoolOp)
+             and isinstance(node.op, ast.And) else [node])
+    terms = []
+    carriers = []
+    for part in nodes:
+        carrier = _node_carrier(part, var_types)
+        terms.append(transpile(part, var_types, carrier))
+        carriers.append(carrier)
+    term = "(" + " & ".join(terms) + ")" if len(terms) > 1 else terms[0]
+    ids, consts, _ = analyze(node)
+    carrier = carriers[0] if len(set(carriers)) == 1 else "mixed"
+    return term, ids, consts, carrier
+
+
 def is_vacuous_node(n) -> bool:
     if isinstance(n, ast.Constant) and n.value is True:
         return True
@@ -226,38 +260,51 @@ def transcription_missing_py(src, con_text, var_vals, premise_text,
 
 
 def tolerance_goal(claims_nodes, var_types, carrier):
-    """User-approved rounding semantics (2026-06-14): an equality against a
-    written decimal is read as |lhs - c| < half-ulp of the written
-    precision; when both sides are constants the COARSER precision wins
-    (13.8 == 14 means tolerance 0.5). Returns the rewritten Isabelle goal,
-    or None if no equality involves a written decimal."""
+    """Rewrite decimal equalities using half a written decimal unit.
+
+    Decimal value and precision come from source annotations installed by
+    parse_expr(), not from repr(float): ``0.250`` therefore keeps three places
+    and long/scientific literals retain their exact value.
+    """
     parts, changed = [], False
+
+    def decimal_info(node):
+        if (isinstance(node, ast.Constant)
+                and isinstance(node.value, float)
+                and hasattr(node, "_frac_val")
+                and hasattr(node, "_decimal_places")):
+            return node._frac_val, int(node._decimal_places)
+        return None
+
+    def written_places(node):
+        dec = decimal_info(node)
+        if dec is not None:
+            return dec[1]
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return 0
+        return None
+
     for c in claims_nodes:
         dec = None
+        ccarrier = _node_carrier(c, var_types, carrier)
         if (isinstance(c, ast.Compare) and len(c.ops) == 1
                 and isinstance(c.ops[0], ast.Eq)):
             sides = [c.left, c.comparators[0]]
-            places = []
-            for s in sides:
-                if isinstance(s, ast.Constant) and isinstance(s.value, float):
-                    rep = repr(s.value)
-                    if "." in rep and "e" not in rep and "E" not in rep:
-                        places.append(len(rep.split(".")[1]))
-                elif isinstance(s, ast.Constant) and isinstance(s.value, int):
-                    places.append(0)
-            float_sides = [s for s in sides
-                           if isinstance(s, ast.Constant)
-                           and isinstance(s.value, float)]
-            if float_sides and places:
-                cst = float_sides[0]
-                other = sides[1] if cst is sides[0] else sides[0]
-                dec = (other, Fraction(repr(cst.value)), min(places))
+            decimal_sides = [(i, decimal_info(s))
+                             for i, s in enumerate(sides)
+                             if decimal_info(s) is not None]
+            if decimal_sides:
+                idx, (val, decimal_places) = decimal_sides[0]
+                all_places = [written_places(s) for s in sides]
+                all_places = [p for p in all_places if p is not None]
+                places = min(all_places) if all_places else decimal_places
+                dec = (sides[1 - idx], val, places)
         if dec is None:
-            parts.append(transpile(c, var_types, carrier))
+            parts.append(transpile(c, var_types, ccarrier))
             continue
-        other, val, pl = dec
+        other, val, places = dec
         lhs_t = transpile(other, var_types, "real")
-        tol_den = 2 * 10 ** pl
+        tol_den = 2 * 10 ** places
         parts.append(f"(abs ({lhs_t} - (({val.numerator}::real) / "
                      f"({val.denominator}::real))) < "
                      f"(1::real) / ({tol_den}::real))")
@@ -326,12 +373,12 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
            box is not None and box == item["ground_truth"].strip(),
            "givens_ok": False, "steps_ok": False, "n_steps": 0, "steps": [],
            "premise_inconsistent_at": None, "corrupt_info": None}
-    # Per-response wall profile (2026-07-11 review #6): where the reward time
-    # actually goes -- translation wall vs prover queue wait vs prover run --
-    # so the step-time tail is attributable from W&B instead of live
-    # forensics. Mutated by _check/translate wrappers below; threaded through
-    # rec["prof"] -> formal_verify debug -> isabelle/* metrics.
-    prof = {"translate_s": 0.0, "prove_calls": 0, "prove_queue_s": 0.0,
+    # Per-response wall profile (2026-07-11 review #6). judge_http_s measures
+    # only requests.post wall time and therefore does not overlap prover queue
+    # or run time. translate_validate_s is retained as the end-to-end cached
+    # translate+parse+validate wall and may include prover-backed validation.
+    prof = {"judge_http_s": 0.0, "translate_validate_s": 0.0,
+            "prove_calls": 0, "prove_queue_s": 0.0,
             "prove_run_s": 0.0, "prove_cache_hits": 0}
     rec["prof"] = prof
     _prof_lock = threading.Lock()
@@ -428,7 +475,10 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         max_model_len=config.max_model_len,
         api_timeout=config.api_timeout,
         soft_prefix=("GIVEN uses numbers", "No GIVEN defines answer"))
-    prof["translate_s"] += time.time() - _t_tr
+    prof["translate_validate_s"] += time.time() - _t_tr
+    prof["judge_http_s"] += sum(
+        float(a.get("http_wall_s") or 0.0) for a in att_a
+        if isinstance(a, dict))
     rec["translate_a"] = att_a
     if parsed_a is None:
         # No per-response print: surfaced via givens_ok=0 in metrics.
@@ -555,7 +605,10 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             max_model_len=config.max_model_len,
             api_timeout=config.api_timeout,
             soft_prefix="STEP TRANSCRIPTION")
-        prof["translate_s"] += time.time() - _t_tr
+        prof["translate_validate_s"] += time.time() - _t_tr
+        prof["judge_http_s"] += sum(
+            float(a.get("http_wall_s") or 0.0) for a in att_b
+            if isinstance(a, dict))
         att_b_list.append(att_b)
         if parsed_b is None:
             failed_b = True
@@ -582,7 +635,7 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
     fixes_all = list(vt_all.items())
     terms, consts_per = [], []
     for p in props_src:
-        term, ids, consts, carrier = py_to_isabelle(p, vt_all)
+        term, ids, consts, carrier = _transpile_conjunctive(p, vt_all)
         terms.append((term, carrier))
         consts_per.append(consts)
     given_terms = [py_to_isabelle(g, vt_all)[0] for g in givens_src]
@@ -647,22 +700,6 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         prop_conj = conjuncts(props_src[k])
         defs_t, claims_t, claims_nodes = [], [], []
 
-        def _conj_carrier(cnode):
-            # Per-conjunct carrier (2026-07-11): the prop-level carrier is
-            # the union of the whole proposition's needs, so a mixed prop
-            # like `x / 2 == 1 and n % 2 == 0` annotated EVERY numeral real
-            # and mistyped the integer half. Each top-level conjunct now
-            # picks the carrier its OWN content requires. (Different-typed
-            # variables inside ONE conjunct still need a typed IR -- known
-            # remaining limitation.)
-            try:
-                from verl.utils.isabelle_utils.pyexpr import analyze as _an
-                cids, _, creal = _an(cnode)
-            except PyExprError:
-                return carrier
-            if creal or any(vt_all.get(i) == "real" for i in cids):
-                return "real"
-            return "int"
 
         for c in prop_conj:
             is_def = (isinstance(c, ast.Compare) and len(c.ops) == 1
@@ -677,7 +714,7 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                     is_def = bool(rids & known)
                 except PyExprError:
                     is_def = False
-            ccar = _conj_carrier(c)
+            ccar = _node_carrier(c, vt_all, "real")
             if is_def:
                 defs_t.append(transpile(c, vt_all, ccar))
             else:
@@ -711,8 +748,16 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         prem = g_prem + [(f"s{j}", terms[j][0]) for j in range(k)]
         prem += [(f"p{k}_{i}", t) for i, t in enumerate(admitted)]
         prem += [(f"d{k}_{i}", t) for i, t in enumerate(defs_t)]
-        nz_list = (nz_divisors(props_src[k], vt_all, carrier)
-                   if claims_t else [])
+        nz_list = []
+        if claims_t:
+            for claim_node in claims_nodes:
+                claim_carrier = _node_carrier(claim_node, vt_all, "real")
+                try:
+                    claim_src = ast.unparse(claim_node)
+                except AttributeError:
+                    claim_src = props_src[k]
+                nz_list.extend(nz_divisors(
+                    claim_src, vt_all, claim_carrier))
         rec["steps"].append(entry)
         prepped.append({"k": k, "entry": entry, "prem": prem,
                         "claims_t": claims_t, "claims_nodes": claims_nodes,

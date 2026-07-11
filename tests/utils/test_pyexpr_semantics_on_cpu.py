@@ -15,7 +15,9 @@ from verl.utils.isabelle_utils.pyexpr import (
 def test_symbolic_exponent_sign_guarded():
     term, _, _, carrier = py_to_isabelle("2 ** (T - 5) == 8", {"T": "int"})
     assert carrier == "real"          # symbolic exponent forces real
-    assert "if" in term and ">= 0" in term and "nat" in term
+    assert "if" in term and ">= (0::int)" in term and "nat" in term
+    assert "T - (5::int)" in term
+    assert "T - (5::real)" not in term
     # both branches present: positive uses ^, negative uses the reciprocal
     assert "1 /" in term
 
