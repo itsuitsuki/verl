@@ -47,6 +47,17 @@ if [ -f /2022533109/zhouchuyan/isabelle/env.sh ]; then
     source /2022533109/zhouchuyan/isabelle/env.sh
 fi
 
+# fontconfig lives in the ephemeral container overlay and vanishes on every
+# container restart (2026-07-11 incident: every session_start FAILED with
+# "Fontconfig head is null"). Unlike the user-dir (fixed persistently via
+# ISABELLE_HOME_USER in env.sh) there is no shared-disk persistence for an
+# apt package, so self-heal idempotently at launch.
+if ! command -v fc-list >/dev/null 2>&1; then
+    echo "fontconfig missing (container restart) -- reinstalling"
+    apt-get install -y fontconfig >/dev/null 2>&1 || {
+        echo "ERROR: fontconfig install failed; Isabelle session_start will fail"; exit 1; }
+fi
+
 # Ensure the node-local ISABELLE_HOME_USER symlink points at the shared user
 # dir. /root/.isabelle is node-local and is WIPED on a container/tmux-server
 # restart; if it is missing or gets recreated as a plain dir, the prebuilt
