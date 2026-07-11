@@ -2281,6 +2281,27 @@ class RayPPOTrainer:
                     "isabelle_judge_calls_givens": "isabelle/judge_calls_givens",
                     "isabelle_judge_calls_steps": "isabelle/judge_calls_steps",
                     "isabelle_judge_calls_total": "isabelle/judge_calls",
+                    # Wall profile (2026-07-11 review #6): mean shows the
+                    # typical response, max shows the step-time tail. The
+                    # cache/restart gauges are process-cumulative (mean IS
+                    # the current value; max/min spread = per-process skew).
+                    "isabelle_translate_wall_s": "isabelle/translate_wall_s",
+                    "isabelle_prove_calls": "isabelle/prove_calls",
+                    "isabelle_prove_queue_s": "isabelle/prove_queue_s",
+                    "isabelle_prove_run_s": "isabelle/prove_run_s",
+                    "isabelle_prove_cache_hits": "isabelle/prove_cache_hits",
+                    "isabelle_reward_wall_s": "isabelle/reward_wall_s",
+                    "isabelle_pool_restarts": "isabelle/pool_restarts",
+                    "isabelle_thm_cache_hit_rate": "isabelle/thm_cache_hit_rate",
+                    "isabelle_tr_cache_hit_rate": "isabelle/tr_cache_hit_rate",
+                    # Real judge HTTP load vs per-layer cache reuse.
+                    "isabelle_judge_http_calls": "isabelle/judge_http_calls",
+                    "isabelle_judge_retry_calls": "isabelle/judge_retry_calls",
+                    "isabelle_translation_mem_hits": "isabelle/translation_mem_hits",
+                    "isabelle_translation_disk_hits": "isabelle/translation_disk_hits",
+                    "isabelle_translation_flight_hits": "isabelle/translation_flight_hits",
+                    "isabelle_translation_xproc_hits": "isabelle/translation_xproc_hits",
+                    "isabelle_translation_failures": "isabelle/translation_failures",
                 }
                 for batch_key, metric_prefix in fol_judge_metric_map.items():
                     if batch_key in batch.non_tensor_batch:

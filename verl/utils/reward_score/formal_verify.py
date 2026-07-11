@@ -59,12 +59,12 @@ _PREMISE_PATTERN = re.compile(r"<premise>(.*?)</premise>", re.DOTALL)
 _CONCLUSION_PATTERN = re.compile(r"<conclusion>(.*?)</conclusion>", re.DOTALL)
 
 _FOL_SHARED_STATE_CACHE_MAX_SIZE = max(1, int(os.environ.get("FOL_SHARED_PREPROCESS_CACHE_SIZE", "512")))
-_FOL_SHARED_STATE_DISK_CACHE_VERSION = os.environ.get("FOL_SHARED_PREPROCESS_DISK_CACHE_VERSION", "v1")
+_FOL_SHARED_STATE_DISK_CACHE_VERSION = os.environ.get("FOL_SHARED_PREPROCESS_DISK_CACHE_VERSION", "v2")
 _fol_shared_state_cache: OrderedDict[tuple, dict] = OrderedDict()
 _fol_shared_state_cache_lock = threading.Lock()
 _fol_shared_state_inflight: dict[tuple, dict] = {}
 _FOL_VERIFY_CACHE_MAX_SIZE = max(1, int(os.environ.get("FOL_VERIFY_CACHE_SIZE", "4096")))
-_FOL_VERIFY_DISK_CACHE_VERSION = os.environ.get("FOL_VERIFY_DISK_CACHE_VERSION", "v1")
+_FOL_VERIFY_DISK_CACHE_VERSION = os.environ.get("FOL_VERIFY_DISK_CACHE_VERSION", "v2")
 _fol_verify_cache: OrderedDict[tuple, float] = OrderedDict()
 _fol_verify_cache_lock = threading.Lock()
 _fol_verify_inflight: dict[tuple, dict] = {}
@@ -882,6 +882,8 @@ def _get_isabelle_engine(api_config: dict | None = None):
             judge_model=cfg.get("model", "Qwen3.6-35B-A3B"),
             pool_workers=int(cfg.get("isabelle_pool_workers", 32)),
             check_deadline=float(timeout),
+            # Judge HTTP deadline; wired (2026-07-11), operational value 240.
+            api_timeout=float(cfg.get("api_timeout") or 240.0),
         )
         _isabelle_engine = IsabelleEngine(config)
         return _isabelle_engine
@@ -941,6 +943,32 @@ def compute_solution_reward_isabelle(
         # failed" and t_rate is "translator/format could not formalize".
         # Invariant restored: o + x + c + g + m + t == n_steps.
         "t_steps": 0,
+        # Per-response wall profile (2026-07-11 review #6): decomposes the
+        # reward tail. translate_wall_s = judge translation wall (all calls);
+        # prove_queue_s / prove_run_s = summed idle-worker wait vs in-worker
+        # check time over this response's prover calls; reward_wall_s = whole
+        # verify_solution wall. Cache/restart gauges are process-CUMULATIVE
+        # (same value across a batch's responses; the W&B mean IS the value).
+        "translate_wall_s": 0.0,
+        "prove_calls": 0,
+        "prove_queue_s": 0.0,
+        "prove_run_s": 0.0,
+        "prove_cache_hits": 0,
+        "reward_wall_s": 0.0,
+        "pool_restarts": 0,
+        "thm_cache_hit_rate": 0.0,
+        "tr_cache_hit_rate": 0.0,
+        # Real judge load vs cache reuse (2026-07-11 review): the legacy
+        # judge_calls_* counted cache MARKERS as judge calls. http calls
+        # count actual requests.post attempts; the *_hits split says which
+        # cache layer answered instead.
+        "judge_http_calls": 0,
+        "judge_retry_calls": 0,
+        "translation_mem_hits": 0,
+        "translation_disk_hits": 0,
+        "translation_flight_hits": 0,
+        "translation_xproc_hits": 0,
+        "translation_failures": 0,
         "error": None,
     }
     # Fast-fail: malformed XML or missing boxed answer (matches Z3 path).
@@ -1007,6 +1035,62 @@ def compute_solution_reward_isabelle(
         # shortfall against n_steps is a translation/format failure. Clamp at
         # 0 so a definition-only-neutral quirk can never make this negative.
         debug["t_steps"] = max(0, debug["n_steps"] - len(pat))
+        # Wall profile from the engine (review #6). Guarded: an old cached
+        # rec or an early-return path may lack keys; defaults stay 0.
+        prof = result.get("prof") or {}
+        debug["translate_wall_s"] = float(prof.get("translate_s") or 0.0)
+        debug["prove_calls"] = int(prof.get("prove_calls") or 0)
+        debug["prove_queue_s"] = float(prof.get("prove_queue_s") or 0.0)
+        debug["prove_run_s"] = float(prof.get("prove_run_s") or 0.0)
+        debug["prove_cache_hits"] = int(prof.get("prove_cache_hits") or 0)
+        debug["reward_wall_s"] = float(prof.get("reward_wall_s") or 0.0)
+        try:
+            debug["pool_restarts"] = int(engine.pool.restart_count)
+            _ch = int(engine.pool.cache_hits)
+            _cm = int(engine.pool.cache_misses)
+            debug["thm_cache_hit_rate"] = _ch / max(1, _ch + _cm)
+        except Exception:  # noqa: BLE001 -- gauges must never fail scoring
+            pass
+        try:
+            from verl.utils.isabelle_utils.judge import translate_cache_stats
+            _ts = translate_cache_stats()
+            debug["tr_cache_hit_rate"] = _ts["hits"] / max(
+                1, _ts["hits"] + _ts["misses"])
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Split real judge HTTP load from cache reuse (review round 2).
+        def _tr_attempt_entries(x):
+            # translate_a is a list (or single dict); translate_b is one
+            # chunk's list or a list of per-chunk lists.
+            if isinstance(x, dict):
+                return [x]
+            out = []
+            for e in (x or []):
+                if isinstance(e, list):
+                    out.extend(a for a in e if isinstance(a, dict))
+                elif isinstance(e, dict):
+                    out.append(e)
+            return out
+
+        for a in (_tr_attempt_entries(result.get("translate_a"))
+                  + _tr_attempt_entries(result.get("translate_b"))):
+            marker = a.get("cache")
+            if marker == "mem":
+                debug["translation_mem_hits"] += 1
+            elif marker == "disk":
+                debug["translation_disk_hits"] += 1
+            elif marker == "flight":
+                debug["translation_flight_hits"] += 1
+            elif marker == "xproc":
+                debug["translation_xproc_hits"] += 1
+            posts = int(a.get("http_posts") or 0)
+            debug["judge_http_calls"] += posts
+            debug["judge_retry_calls"] += max(0, posts - 1)
+        # response-level FINAL translation failures (not per-retry noise)
+        debug["translation_failures"] = int(
+            (1 if debug["format_ok"] and not debug["givens_ok"] else 0)
+            + (1 if debug["givens_ok"] and not debug["steps_ok"] else 0))
         if not result.get("steps_ok") or not steps:
             n = debug["n_steps"] or 1
             rewards = [0.0] * n

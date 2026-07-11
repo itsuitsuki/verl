@@ -333,6 +333,22 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_g_steps": 0,
                         "isabelle_m_steps": 0,
                         "isabelle_t_steps": 0,
+                        "isabelle_translate_wall_s": 0.0,
+                        "isabelle_prove_calls": 0,
+                        "isabelle_prove_queue_s": 0.0,
+                        "isabelle_prove_run_s": 0.0,
+                        "isabelle_prove_cache_hits": 0,
+                        "isabelle_reward_wall_s": 0.0,
+                        "isabelle_pool_restarts": 0,
+                        "isabelle_thm_cache_hit_rate": 0.0,
+                        "isabelle_tr_cache_hit_rate": 0.0,
+                        "isabelle_judge_http_calls": 0,
+                        "isabelle_judge_retry_calls": 0,
+                        "isabelle_translation_mem_hits": 0,
+                        "isabelle_translation_disk_hits": 0,
+                        "isabelle_translation_flight_hits": 0,
+                        "isabelle_translation_xproc_hits": 0,
+                        "isabelle_translation_failures": 0,
                         "isabelle_pattern": "",
                         "isabelle_error": "",
                     }
@@ -546,6 +562,24 @@ class StepRewardManager(RewardManagerBase):
                 reward_extra_info["isabelle_judge_calls_total"] = int(
                     (d.get("translation_attempts_givens") or 0)
                     + (d.get("translation_attempts_steps") or 0))
+                # Wall profile + cache/restart gauges (2026-07-11 review #6).
+                reward_extra_info["isabelle_translate_wall_s"] = float(d.get("translate_wall_s") or 0.0)
+                reward_extra_info["isabelle_prove_calls"] = int(d.get("prove_calls") or 0)
+                reward_extra_info["isabelle_prove_queue_s"] = float(d.get("prove_queue_s") or 0.0)
+                reward_extra_info["isabelle_prove_run_s"] = float(d.get("prove_run_s") or 0.0)
+                reward_extra_info["isabelle_prove_cache_hits"] = int(d.get("prove_cache_hits") or 0)
+                reward_extra_info["isabelle_reward_wall_s"] = float(d.get("reward_wall_s") or 0.0)
+                reward_extra_info["isabelle_pool_restarts"] = int(d.get("pool_restarts") or 0)
+                reward_extra_info["isabelle_thm_cache_hit_rate"] = float(d.get("thm_cache_hit_rate") or 0.0)
+                reward_extra_info["isabelle_tr_cache_hit_rate"] = float(d.get("tr_cache_hit_rate") or 0.0)
+                # Real HTTP judge load vs per-layer cache reuse (2026-07-11).
+                reward_extra_info["isabelle_judge_http_calls"] = int(d.get("judge_http_calls") or 0)
+                reward_extra_info["isabelle_judge_retry_calls"] = int(d.get("judge_retry_calls") or 0)
+                reward_extra_info["isabelle_translation_mem_hits"] = int(d.get("translation_mem_hits") or 0)
+                reward_extra_info["isabelle_translation_disk_hits"] = int(d.get("translation_disk_hits") or 0)
+                reward_extra_info["isabelle_translation_flight_hits"] = int(d.get("translation_flight_hits") or 0)
+                reward_extra_info["isabelle_translation_xproc_hits"] = int(d.get("translation_xproc_hits") or 0)
+                reward_extra_info["isabelle_translation_failures"] = int(d.get("translation_failures") or 0)
                 # Per-step verdict symbols (o=rewarded, x=unverified,
                 # c=premises-inconsistent, m=transcription-missing,
                 # g=guard-failed) for the [Step Rewards] sample print.

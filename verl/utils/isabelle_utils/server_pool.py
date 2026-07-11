@@ -42,7 +42,9 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Full, Queue
+
+from verl.utils.isabelle_utils import xlock
 
 # Worker-restart events (usually verify_timeout hits) go here at DEBUG instead
 # of stdout, to keep training logs readable. Bump to DEBUG to see each restart.
@@ -568,6 +570,16 @@ class IsabelleWorker:
         # by this worker's JVM; killpg'd at stop/restart. Persisted to disk so a
         # crash reaper / next-run sweep can act without our in-memory state.
         self.reap_targets: dict[int, int] = {}
+        # Bounded purge pipeline (2026-07-11 review #3): ONE long-lived purge
+        # thread per worker fed by a bounded queue, replacing a fresh thread
+        # every PURGE_EVERY checks -- when purge_theories stalled (it can block
+        # 60-70s against the server's background cleanup), threads accumulated
+        # without bound. The thread survives worker restarts (it reads the
+        # CURRENT mgmt_conn on each batch).
+        self._purge_q: Queue = Queue(maxsize=8)
+        self._purge_thread = threading.Thread(
+            target=self._purge_loop, daemon=True, name=f"isa-purge-w{wid}")
+        self._purge_thread.start()
 
     def start(self):
         self.start_server()
@@ -726,8 +738,7 @@ class IsabelleWorker:
             if self.counter % self.purge_every == 0:
                 batch = list(self.pending_names)
                 self.pending_names.clear()
-                threading.Thread(target=self._purge_async, args=(batch,),
-                                 daemon=True).start()
+                self._enqueue_purge(batch)
             # 2026-06-12 soundness fix #2: payload "ok" means "no errors SO
             # FAR", not "fully processed". A tactic still running when the
             # headless watchdog (15s) aborts the theory yields ok=true,
@@ -773,13 +784,37 @@ class IsabelleWorker:
                 out["incomplete"] = True
             return out
 
+    def _enqueue_purge(self, batch: list[str]):
+        """Hand a name batch to the purge thread without ever blocking the
+        verification path. On a full queue (purge thread stalled), merge the
+        OLDEST pending batch into ours instead of dropping it -- an unpurged
+        name leaks in the server's document model until the JVM recycles."""
+        while True:
+            try:
+                self._purge_q.put_nowait(batch)
+                return
+            except Full:
+                try:
+                    batch = self._purge_q.get_nowait() + batch
+                except Empty:
+                    continue   # raced with the purge thread; retry the put
+
+    def _purge_loop(self):
+        while True:
+            batch = self._purge_q.get()
+            try:
+                self._purge_async(batch)
+            except Exception as e:  # noqa: BLE001 -- the loop must never die
+                print(f"[pool] worker {self.wid} purge loop error: {e!r}",
+                      flush=True)
+
     def _purge_async(self, names: list[str]):
         """Unload checked theories via the management connection.
 
-        Runs in a background thread so the verification path never blocks:
-        purge_theories occasionally stalls ~60-70s when it coincides with the
-        server's background document cleanup (headless_prune_delay /
-        headless_commit_cleanup_delay).
+        Runs on the worker's single purge thread so the verification path
+        never blocks: purge_theories occasionally stalls ~60-70s when it
+        coincides with the server's background document cleanup
+        (headless_prune_delay / headless_commit_cleanup_delay).
 
         Purges only explicit V-theory names (+ master_dir, name resolution is
         master_dir-relative). NEVER purge-and-resubmit a reused node name:
@@ -923,6 +958,14 @@ class IsabelleServerPool:
         self._runaway_streak = max(2, int(
             (self.RUNAWAY_CPU_S + self.MONITOR_INTERVAL_S - 1)
             // self.MONITOR_INTERVAL_S))
+        # Unified check scheduling (2026-07-11 review #1): submit() feeds one
+        # process-wide FIFO; num_workers dispatcher threads execute checks in
+        # arrival order. Callers park on Futures instead of stampeding
+        # idle.get(), so scheduling is fair across responses and the true
+        # queue delay becomes measurable (injected into queue_wait).
+        self._reqq: Queue = Queue()
+        self._dispatchers: list[threading.Thread] = []
+        self._disp_lock = threading.Lock()
 
     def start(self):
         t0 = time.time()
@@ -1093,6 +1136,7 @@ class IsabelleServerPool:
                 with self._cache_lock:
                     if self._inflight.get(theorem_code) is ev:
                         self._inflight.pop(theorem_code, None)
+        xl_lock, xl_leader = None, False
         try:
             # disk layer: a verdict persisted by a previous run/process (same
             # policy as the memory memo). Hit -> promote to memory and return.
@@ -1108,6 +1152,30 @@ class IsabelleServerPool:
                 out["queue_wait"] = 0.0
                 out["check_time"] = 0.0
                 return out
+            # Cross-process single-flight (2026-07-11 review #4): identical
+            # theorems fan out across the 4 reward workers (one problem's
+            # givens skeleton, canonical bare rungs shared by rollouts). One
+            # process proves; the others poll its disk entry. Bounded: a
+            # None wait outcome falls through to a local proof.
+            if _thm_disk_enabled():
+                xl_lock = _thm_disk_path(theorem_code) + ".lock"
+                xl_leader = xlock.acquire(xl_lock, stale_s=3 * CHECK_DEADLINE)
+                if not xl_leader:
+                    got = xlock.wait(xl_lock,
+                                     lambda: _thm_disk_load(theorem_code),
+                                     deadline_s=CHECK_DEADLINE + 45.0,
+                                     poll_s=0.25)
+                    if got is not None and "success" in got:
+                        with self._cache_lock:
+                            self._cache[theorem_code] = dict(got)
+                            while len(self._cache) > self.CACHE_MAX_ENTRIES:
+                                self._cache.popitem(last=False)
+                            self.cache_hits += 1
+                        out = dict(got)
+                        out["cache_hit"] = True
+                        out["queue_wait"] = 0.0
+                        out["check_time"] = 0.0
+                        return out
             result = self._check_uncached(theorem_code)
             elapsed = float(result.get("elapsed", 0.0) or 0.0)
             cacheable = result.get("success") or (
@@ -1124,8 +1192,14 @@ class IsabelleServerPool:
                     while len(self._cache) > self.CACHE_MAX_ENTRIES:
                         self._cache.popitem(last=False)
                 _thm_disk_store(theorem_code, entry)
+            elif xl_leader:
+                # timeout / worker_error / incomplete: nothing stored, so
+                # tell cross-process waiters to stop polling and recompute
+                xlock.mark_failed(xl_lock)
             return result
         finally:
+            if xl_leader:
+                xlock.release(xl_lock)
             with self._cache_lock:
                 # Identity-checked cleanup (2026-07-11 ABA fix): only remove
                 # the marker if it is still OURS -- a stale leader must never
@@ -1134,6 +1208,62 @@ class IsabelleServerPool:
                 if cur is ev:
                     self._inflight.pop(theorem_code, None)
             ev.set()
+
+    def submit(self, theorem_code: str):
+        """Queue a check and return a concurrent.futures.Future (review #1).
+
+        FIFO across every caller of this process, so an early straggler's
+        checks are served before a late arrival's -- fairness the raw
+        idle-queue could not give. Memory-memo hits resolve immediately
+        without touching the queue. Dispatchers run self.check, so the
+        single-flight / disk / cross-process layers all still apply.
+        """
+        from concurrent.futures import Future
+        fut = Future()
+        with self._cache_lock:
+            cached = self._cache.get(theorem_code)
+            if cached is not None:
+                self._cache.move_to_end(theorem_code)
+                self.cache_hits += 1
+                out = dict(cached)
+                out["cache_hit"] = True
+                out["queue_wait"] = 0.0
+                out["check_time"] = 0.0
+                fut.set_result(out)
+                return fut
+        self._ensure_dispatchers()
+        self._reqq.put((theorem_code, fut, time.time()))
+        return fut
+
+    def _ensure_dispatchers(self):
+        if self._dispatchers:
+            return
+        with self._disp_lock:
+            if self._dispatchers:
+                return
+            for i in range(self.num_workers):
+                t = threading.Thread(target=self._dispatch_loop, daemon=True,
+                                     name=f"isa-dispatch-{i}")
+                t.start()
+                self._dispatchers.append(t)
+
+    def _dispatch_loop(self):
+        while not self._stop_monitor.is_set():
+            try:
+                thm, fut, t_enq = self._reqq.get(timeout=1.0)
+            except Empty:
+                continue
+            t0 = time.time()
+            try:
+                r = self.check(thm)
+                if isinstance(r, dict):
+                    # true scheduling delay = time in the request FIFO plus
+                    # any idle-queue wait _check_uncached measured itself
+                    r["queue_wait"] = (float(r.get("queue_wait") or 0.0)
+                                       + (t0 - t_enq))
+                fut.set_result(r)
+            except BaseException as e:  # noqa: BLE001 -- deliver, don't die
+                fut.set_exception(e)
 
     def _book_restart(self, worker, reason: str):
         """Count a worker restart and log at WARN every WORKER_RESTART_WARN."""
@@ -1280,20 +1410,27 @@ class IsabelleServerPool:
         # (it verifies fine on a healthy worker), so one retry recovers the
         # verification instead of losing the step to a fail-closed `x`. A real
         # proof failure or a success is final -- never retried.
-        t0 = time.time()
-        queue_wait = None
+        # Timing contract (2026-07-11 review): queue_wait and check_time
+        # NEVER overlap. queue_wait sums every idle.get() wait (including
+        # retries); check_time is stamped from AFTER the worker was obtained,
+        # so it covers only in-worker execution (PIDE check + any restart /
+        # RSS-recycle overhead of that attempt). The dispatcher additionally
+        # adds its FIFO delay into queue_wait -- also disjoint.
+        queue_wait = 0.0
+        run_s = 0.0
         result = None
         for attempt in range(self.MAX_CHECK_ATTEMPTS):
+            t0 = time.time()
             worker = self.idle.get()
-            if queue_wait is None:
-                queue_wait = time.time() - t0
+            queue_wait += time.time() - t0
             t1 = time.time()
             result = self._run_one_check(worker, theorem_code)
+            run_s += time.time() - t1
             result["worker"] = worker.wid
-            result["check_time"] = time.time() - t1
             result["attempts"] = attempt + 1
             if result.get("success") or not result.get("worker_error"):
                 break
+        result["check_time"] = run_s      # ALL attempts' in-worker time
         result["queue_wait"] = queue_wait
         return result
 

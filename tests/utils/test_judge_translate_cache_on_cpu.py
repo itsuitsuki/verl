@@ -164,6 +164,54 @@ def test_key_covers_function_body(monkeypatch, tmp_path):
     assert calls["n"] == 2                           # digest split the keys
 
 
+def test_fn_digest_ignores_line_shifts():
+    # 2026-07-11 review round 2: marshal.dumps(code) serialized line-number
+    # info, so ANY unrelated line shift in engine.py invalidated the whole
+    # translate cache. The digest must depend on behavior only.
+    src = "def f(x):\n    return x + 1\n"
+    ns_a, ns_b, ns_c = {}, {}, {}
+    exec(compile(src, "m", "exec"), ns_a)
+    exec(compile("\n" * 50 + src, "m", "exec"), ns_b)      # shifted 50 lines
+    exec(compile("def f(x):\n    return x + 2\n", "m", "exec"), ns_c)
+    assert judge._fn_digest(ns_a["f"]) == judge._fn_digest(ns_b["f"])
+    assert judge._fn_digest(ns_a["f"]) != judge._fn_digest(ns_c["f"])
+
+
+def test_http_posts_counted_not_cache_markers(monkeypatch, tmp_path):
+    # 2026-07-11 review round 2: judge_calls_* counted cache markers as
+    # judge load. http_posts must count actual requests.post attempts.
+    monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
+    _reset()
+    posts = {"n": 0}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "T:ok"},
+                                 "finish_reason": "stop"}]}
+
+    def fake_post(url, json=None, timeout=None):
+        posts["n"] += 1
+        if posts["n"] == 1:
+            raise OSError("first endpoint down")     # forces one retry
+        return _Resp()
+
+    monkeypatch.setattr(judge.requests, "post", fake_post)
+    monkeypatch.setattr(judge.time, "sleep", lambda s: None)
+    r = judge.translate("HTTPCOUNT", _ok_parse, _ok_validate,
+                        judge_url="u", judge_model="m")
+    assert r[0] == "T:ok"
+    atts = r[1]
+    assert atts[0]["http_posts"] == 2       # 1 failed + 1 successful post
+    # cached second call: marker only, no http_posts key
+    r2 = judge.translate("HTTPCOUNT", _ok_parse, _ok_validate,
+                         judge_url="u", judge_model="m")
+    assert r2[1][0].get("cache") == "mem"
+    assert "http_posts" not in r2[1][0]
+
+
 def test_disk_cache_survives_cold_memory(monkeypatch, tmp_path):
     monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
     _reset()

@@ -16,10 +16,14 @@ from collections import OrderedDict
 
 import requests
 
+from verl.utils.isabelle_utils import xlock
+
 
 def call_judge(prompt: str, thinking: bool, *,
                judge_url: str, judge_model: str,
-               max_model_len: int = 12288) -> str:
+               max_model_len: int = 12288,
+               timeout: float = 240.0,
+               stats: dict | None = None) -> str:
     # judge_url may be a comma-separated list of endpoints (e.g. two vLLM judges
     # on separate GPUs). Pick one per attempt at random -- spreads load evenly
     # across judges with no shared counter (thread-safe), and a retry lands on a
@@ -45,8 +49,12 @@ def call_judge(prompt: str, thinking: bool, *,
     for _ in range(2):
         try:
             url = random.choice(_urls)
+            if stats is not None:
+                # count REAL HTTP posts (2026-07-11 review: judge_calls_*
+                # counted cache markers as judge load; this is the truth)
+                stats["posts"] = stats.get("posts", 0) + 1
             r = requests.post(f"{url}/chat/completions",
-                              json=payload, timeout=240)
+                              json=payload, timeout=timeout)
             r.raise_for_status()
             choice = r.json()["choices"][0]
             reply = choice["message"]["content"]
@@ -85,11 +93,15 @@ _FN_DIGESTS: dict = {}
 
 
 def _fn_digest(fn) -> str:
-    """Digest of a function's COMPILED CODE (marshal covers the bytecode,
-    consts -- incl. nested code objects -- names and line info). Catches
-    body edits that __qualname__ cannot: the same-named validator with
-    changed rules would otherwise keep hitting stale cache entries
-    (2026-07-11 review). Known limit: closures sharing one code object with
+    """Digest of a function's COMPILED CODE, independent of its position in
+    the source file. Catches body edits that __qualname__ cannot: the
+    same-named validator with changed rules would otherwise keep hitting
+    stale cache entries (2026-07-11 review). marshal.dumps(code) was WRONG
+    here: it serializes co_firstlineno and the line table, so any unrelated
+    line shift in engine.py silently invalidated the whole translate cache
+    (review round 2, verified empirically). Hash only behavior-bearing
+    fields: bytecode, arity/flags, names, and consts (nested code objects
+    recursively). Known limit: closures sharing one code object with
     different captured VALUES share a digest -- in this pipeline the
     captured values derive from the prompt itself, which is already in the
     key. Cached per code object (code objects are compile-time constants,
@@ -100,8 +112,24 @@ def _fn_digest(fn) -> str:
     d = _FN_DIGESTS.get(id(co))
     if d is None:
         try:
-            import marshal
-            d = hashlib.sha1(marshal.dumps(co)).hexdigest()[:16]
+            import types
+            h = hashlib.sha1()
+
+            def _feed(c):
+                h.update(c.co_code)
+                h.update(str((c.co_argcount, c.co_kwonlyargcount,
+                              c.co_flags)).encode())
+                for tup in (c.co_names, c.co_varnames, c.co_freevars,
+                            c.co_cellvars):
+                    h.update(repr(tup).encode())
+                for const in c.co_consts:
+                    if isinstance(const, types.CodeType):
+                        _feed(const)
+                    else:
+                        h.update(repr(const).encode())
+
+            _feed(co)
+            d = h.hexdigest()[:16]
         except Exception:  # noqa: BLE001
             d = "nodigest"
         _FN_DIGESTS[id(co)] = d
@@ -229,6 +257,7 @@ MAX_TRIES = 3
 def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
                         judge_url: str, judge_model: str,
                         max_model_len: int = 12288,
+                        api_timeout: float = 240.0,
                         soft_prefix: str | None = None) -> tuple:
     """Call judge with retry loop. Returns (parsed, attempts, soft_flag)."""
     attempts, fb = [], None
@@ -236,16 +265,20 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
     for t in range(MAX_TRIES):
         prompt = prompt_base if fb is None else prompt_base + fb
         t0 = time.time()
+        http = {"posts": 0}
         try:
             reply = call_judge(prompt, thinking=(t > 0),
                                judge_url=judge_url, judge_model=judge_model,
-                               max_model_len=max_model_len)
+                               max_model_len=max_model_len,
+                               timeout=api_timeout, stats=http)
         except Exception as e:
             attempts.append({"attempt": t, "fail": "judge_error",
-                             "error": str(e)[:200]})
+                             "error": str(e)[:200],
+                             "http_posts": http["posts"]})
             break
         rec = {"attempt": t, "thinking": t > 0,
-               "elapsed": time.time() - t0, "reply_head": reply[:1200]}
+               "elapsed": time.time() - t0, "reply_head": reply[:1200],
+               "http_posts": http["posts"]}
         if reply.endswith("[TRUNCATED]"):
             rec["fail"] = "truncated"
             fb = feedback(reply[-1500:], [
@@ -287,6 +320,7 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
 def translate(prompt_base: str, parse_fn, validate_fn, *,
               judge_url: str, judge_model: str,
               max_model_len: int = 12288,
+              api_timeout: float = 240.0,
               soft_prefix: str | None = None) -> tuple:
     """Cached wrapper over _translate_uncached: in-memory LRU + single-flight
     + typed-JSON disk (mirrors the FOL shared_state cache).
@@ -303,6 +337,16 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
     - only SUCCESSFUL translations are cached; failures are never cached."""
     key = _tr_key(prompt_base, judge_model, max_model_len,
                   parse_fn, validate_fn, soft_prefix)
+    # Leader worst-case wall (2026-07-11 review round 2): MAX_TRIES tries x
+    # (2 HTTP posts x api_timeout + 3s inter-post sleep) + parse/validate
+    # slack. Every wait on a leader -- in-process follower wait, the
+    # cross-process lock's stale threshold, and the cross-process result
+    # wait -- MUST exceed this bound: the previous fixed 900s was BELOW it
+    # (1449s at the 240 default), so followers timed out while the leader
+    # was legitimately still working, popped its LIVE flight marker /
+    # stole its live lock, and duplicated judge load exactly when the
+    # judge was slowest.
+    leader_budget = MAX_TRIES * (2.0 * api_timeout + 3.0) + 30.0
     failed_flights = 0
     while True:
         with _TR_LOCK:
@@ -320,10 +364,11 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
 
         if not owner:
             # BOUNDED wait: a wedged leader must never deadlock its followers
-            # (2026-07-08 step-135 lesson). The leader is itself bounded
-            # (api_timeout x retries); on timeout drop the stale marker and
-            # re-enter the flow (one waiter becomes the new leader).
-            if not fl["event"].wait(900.0):
+            # (2026-07-08 step-135 lesson). Bounded by the leader's actual
+            # worst case (leader_budget), so a timeout implies a dead/stuck
+            # leader -- only then drop the stale marker and re-enter the
+            # flow (one waiter becomes the new leader).
+            if not fl["event"].wait(leader_budget):
                 with _TR_LOCK:
                     if _TR_INFLIGHT.get(key) is fl:
                         _TR_INFLIGHT.pop(key, None)
@@ -350,20 +395,54 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
                     _TR_STATS["hits"] += 1
                 cval, out = disk, (disk[0], [{"cache": "disk"}], disk[1])
             else:
-                with _TR_LOCK:
-                    _TR_STATS["misses"] += 1
-                parsed, attempts, soft = _translate_uncached(
-                    prompt_base, parse_fn, validate_fn, judge_url=judge_url,
-                    judge_model=judge_model, max_model_len=max_model_len,
-                    soft_prefix=soft_prefix)
-                out = (parsed, attempts, soft)
-                if parsed is not None:
-                    cval = (parsed, soft)
+                # Cross-process single-flight (2026-07-11 review #4): the 4
+                # reward workers each translate the FIRST occurrence of the
+                # same prompt (e.g. one problem's givens fanned out across
+                # processes). One process takes a lock file next to the disk
+                # entry; the others wait for its stored result. Every wait
+                # is bounded and every None outcome falls through to a local
+                # translation, so the worst case is the pre-lock behavior.
+                lock = _tr_disk_path(key) + ".lock"
+                is_leader = (not _tr_disk_enabled()
+                             or xlock.acquire(lock,
+                                              stale_s=leader_budget + 60.0))
+                if not is_leader:
+                    got = xlock.wait(lock, lambda: _tr_disk_load(key),
+                                     deadline_s=leader_budget, poll_s=1.0)
+                    if got is not None:
+                        with _TR_LOCK:
+                            _TR_CACHE[key] = got
+                            while len(_TR_CACHE) > _TR_CACHE_MAX:
+                                _TR_CACHE.popitem(last=False)
+                            _TR_STATS["hits"] += 1
+                        cval, out = got, (got[0], [{"cache": "xproc"}],
+                                          got[1])
+                if out is None:
                     with _TR_LOCK:
-                        _TR_CACHE[key] = cval
-                        while len(_TR_CACHE) > _TR_CACHE_MAX:
-                            _TR_CACHE.popitem(last=False)
-                    _tr_disk_store(key, parsed, soft)
+                        _TR_STATS["misses"] += 1
+                    try:
+                        parsed, attempts, soft = _translate_uncached(
+                            prompt_base, parse_fn, validate_fn,
+                            judge_url=judge_url, judge_model=judge_model,
+                            max_model_len=max_model_len,
+                            api_timeout=api_timeout, soft_prefix=soft_prefix)
+                        out = (parsed, attempts, soft)
+                        if parsed is not None:
+                            cval = (parsed, soft)
+                            with _TR_LOCK:
+                                _TR_CACHE[key] = cval
+                                while len(_TR_CACHE) > _TR_CACHE_MAX:
+                                    _TR_CACHE.popitem(last=False)
+                            _tr_disk_store(key, parsed, soft)
+                        elif is_leader and _tr_disk_enabled():
+                            xlock.mark_failed(lock)
+                    except BaseException:
+                        if is_leader and _tr_disk_enabled():
+                            xlock.mark_failed(lock)
+                        raise
+                    finally:
+                        if is_leader and _tr_disk_enabled():
+                            xlock.release(lock)
         finally:
             with _TR_LOCK:
                 fl["result"] = cval

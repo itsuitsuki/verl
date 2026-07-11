@@ -40,6 +40,18 @@ class MockPool:
         ok = self._decide(code)
         return {"success": ok, "elapsed": 0.01, "errors": [] if ok else ["mock fail"]}
 
+    def submit(self, code):
+        """Synchronous stand-in for IsabelleServerPool.submit (2026-07-11
+        review #1) so the regression exercises the engine's submit path;
+        determinism is preserved (resolved before return)."""
+        from concurrent.futures import Future
+        fut = Future()
+        try:
+            fut.set_result(self.check(code))
+        except Exception as e:  # noqa: BLE001 -- mirror dispatcher behavior
+            fut.set_exception(e)
+        return fut
+
     def _decide(self, code):
         premise_ids = set(re.findall(r"\bs(\d+)\b", code))
         has_assumes = "assumes" in code
@@ -150,7 +162,7 @@ def run_scenarios(engine):
     for sc in SCENARIOS:
         def mock_translate(prompt_base, parse_fn, validate_fn, *, judge_url,
                            judge_model, max_model_len=12288, soft_prefix=None,
-                           _sc=sc):
+                           _sc=sc, **_kw):   # absorbs api_timeout etc.
             if "VARS line followed by GIVEN" in prompt_base:
                 parsed = ([tuple(f) for f in _sc["fixes"]], list(_sc["givens"]))
                 return parsed, [{"mock": "givens"}], False
@@ -204,6 +216,9 @@ if __name__ == "__main__":
         # checks past the latch); semantics = the records themselves.
         for v in list(base.values()) + list(cur.values()):
             v.pop("n_pool_calls", None)
+            # rec["prof"] is a wall-time profile (2026-07-11 review #6):
+            # nondeterministic by nature, absent from older baselines.
+            v.get("rec", {}).pop("prof", None)
             # DOCUMENTED EXCEPTION (2026-07-10): claim cascades are skipped
             # for steps at/after the premise-inconsistency point -- those
             # steps are forced to rewarded=False / pattern 'c' regardless, so

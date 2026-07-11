@@ -8,6 +8,7 @@ import ast
 import json
 import os
 import re
+import threading
 import time
 from fractions import Fraction
 from pathlib import Path
@@ -50,6 +51,11 @@ class IsabelleConfig:
     # Z3 path's fol_timeout: a stuck use_theories call past this limit is
     # treated as failure rather than blocking the reward computation.
     check_deadline: float = 60.0
+    # Per-HTTP-request judge deadline (seconds). Wired from the reward
+    # api_config's api_timeout (2026-07-11: previously hardcoded inside
+    # judge.call_judge, so the configured value silently did nothing).
+    # Operational value stays 240 -- wiring only, per user decision.
+    api_timeout: float = 240.0
 
 
 EXAMPLE_LINES = {
@@ -282,6 +288,25 @@ def nz_divisors(src: str, var_types: dict, carrier: str):
 
 # ---------- per-response pipeline ----------
 
+_CASCADE_EX = None
+_CASCADE_EX_LOCK = threading.Lock()
+
+
+def _cascade_executor(pool_workers: int):
+    """Process-shared cascade executor (2026-07-11 review #1). Sized well
+    above the prover-worker count so the provers never starve; cascade tasks
+    spend most of their life parked on pool futures, so slots are cheap.
+    Sized once at first use (per reward-worker process)."""
+    global _CASCADE_EX
+    with _CASCADE_EX_LOCK:
+        if _CASCADE_EX is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _CASCADE_EX = ThreadPoolExecutor(
+                max_workers=max(32, 8 * int(pool_workers or 4)),
+                thread_name_prefix="isa-cascade")
+    return _CASCADE_EX
+
+
 def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                 max_steps: int = 0):
     problem = item["problem"]
@@ -301,6 +326,32 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
            box is not None and box == item["ground_truth"].strip(),
            "givens_ok": False, "steps_ok": False, "n_steps": 0, "steps": [],
            "premise_inconsistent_at": None, "corrupt_info": None}
+    # Per-response wall profile (2026-07-11 review #6): where the reward time
+    # actually goes -- translation wall vs prover queue wait vs prover run --
+    # so the step-time tail is attributable from W&B instead of live
+    # forensics. Mutated by _check/translate wrappers below; threaded through
+    # rec["prof"] -> formal_verify debug -> isabelle/* metrics.
+    prof = {"translate_s": 0.0, "prove_calls": 0, "prove_queue_s": 0.0,
+            "prove_run_s": 0.0, "prove_cache_hits": 0}
+    rec["prof"] = prof
+    _prof_lock = threading.Lock()
+    # Unified scheduling (2026-07-11 review #1): route every prover call
+    # through pool.submit's process-wide FIFO when available (real pools).
+    # Fallback to direct check for pools without it (mocks, older callers).
+    _submit = getattr(pool, "submit", None)
+
+    def _record(r):
+        with _prof_lock:   # probes/cascades run concurrently
+            prof["prove_calls"] += 1
+            prof["prove_queue_s"] += float(r.get("queue_wait") or 0.0)
+            prof["prove_run_s"] += float(r.get("check_time") or 0.0)
+            if r.get("cache_hit"):
+                prof["prove_cache_hits"] += 1
+
+    def _check(thm):
+        r = _submit(thm).result() if _submit is not None else pool.check(thm)
+        _record(r)
+        return r
     if steps_xml is not None and corrupt:
         rec["corrupt_info"] = corrupt_steps(steps_xml, item["ground_truth"])
         if rec["corrupt_info"] is None:
@@ -364,17 +415,20 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                 terms.append((term, ids))
         thm = make_theorem(fixes, [(f"g{i}", t) for i, (t, _) in
                                  enumerate(terms)], "True", "simp")
-        r = pool.check(thm)
+        r = _check(thm)
         if not r["success"]:
             return r["errors"][:2] or ["givens skeleton rejected"]
         return []
 
+    _t_tr = time.time()
     parsed_a, att_a, _ = translate(
         PROMPT_GIVENS_PY.replace("{problem}", problem), parse_givens_py,
         validate_givens,
         judge_url=config.judge_url, judge_model=config.judge_model,
         max_model_len=config.max_model_len,
+        api_timeout=config.api_timeout,
         soft_prefix=("GIVEN uses numbers", "No GIVEN defines answer"))
+    prof["translate_s"] += time.time() - _t_tr
     rec["translate_a"] = att_a
     if parsed_a is None:
         # No per-response print: surfaced via givens_ok=0 in metrics.
@@ -491,6 +545,7 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         def validate_block(props, _end=block_end):
             return validate_props(props, _end)
 
+        _t_tr = time.time()
         parsed_b, att_b, _ = translate(
             PROMPT_STEPS_PY
             .replace("{vars_givens}", vars_givens_text)
@@ -498,7 +553,9 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             parse_props_merge, validate_block,
             judge_url=config.judge_url, judge_model=config.judge_model,
             max_model_len=config.max_model_len,
+            api_timeout=config.api_timeout,
             soft_prefix="STEP TRANSCRIPTION")
+        prof["translate_s"] += time.time() - _t_tr
         att_b_list.append(att_b)
         if parsed_b is None:
             failed_b = True
@@ -684,8 +741,8 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         be resolved BEFORE cascades run: steps at/after that point are forced
         to rewarded=False / pattern 'c' regardless of their proofs, so their
         cascades (3-6 prover calls each) are dead work."""
-        rf = pool.check(make_theorem(fixes_all, p["prem"], "False",
-                                     ALTERNATION))
+        rf = _check(make_theorem(fixes_all, p["prem"], "False",
+                                 ALTERNATION))
         return bool(rf["success"])
 
     def _cascade_step(p):
@@ -693,23 +750,23 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         out = {"verified": None, "tolerance": False}
         nz_prem = []
         for d in p["nz_list"]:
-            rnz = pool.check(make_theorem(fixes_all, prem,
-                                        f"{d} \\<noteq> 0", ALTERNATION))
+            rnz = _check(make_theorem(fixes_all, prem,
+                                      f"{d} \\<noteq> 0", ALTERNATION))
             if rnz["success"]:
                 nz_prem.append((f"nz{len(nz_prem)}", f"{d} \\<noteq> 0"))
         full_prem = prem + nz_prem
 
         def _verify_single(g):
-            r = pool.check(make_theorem(fixes_all, full_prem, g, ALTERNATION))
+            r = _check(make_theorem(fixes_all, full_prem, g, ALTERNATION))
             if r["success"]:
                 return True
-            r0 = pool.check(make_theorem(_canonical_fixes(g), [], g,
-                                         ALTERNATION))
+            r0 = _check(make_theorem(_canonical_fixes(g), [], g,
+                                     ALTERNATION))
             if r0["success"]:
                 return True
             # EVAL_RESCUE already imported at module level
-            r_eval = pool.check(make_theorem(_canonical_fixes(g), [], g,
-                                             EVAL_RESCUE))
+            r_eval = _check(make_theorem(_canonical_fixes(g), [], g,
+                                         EVAL_RESCUE))
             return r_eval["success"]
 
         if len(claims_t) > 1:
@@ -719,11 +776,11 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         if not out["verified"]:
             tol = tolerance_goal(p["claims_nodes"], vt_all, p["carrier"])
             if tol:
-                rt = pool.check(make_theorem(fixes_all, prem + nz_prem, tol,
-                                           "(approximation 20)"))
+                rt = _check(make_theorem(fixes_all, prem + nz_prem, tol,
+                                         "(approximation 20)"))
                 if not rt["success"]:
-                    rt = pool.check(make_theorem(fixes_all, prem + nz_prem,
-                                               tol, ALTERNATION))
+                    rt = _check(make_theorem(fixes_all, prem + nz_prem,
+                                             tol, ALTERNATION))
                 if rt["success"]:
                     out["verified"] = True
                     out["tolerance"] = True
@@ -743,7 +800,18 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
     # Wave 1: consistency probes for every step; the inconsistency point is
     # the FIRST step whose probe proves False (identical to the sequential
     # first-hit rule -- each probe depends only on its own premise list).
-    probe_hits = _pmap(_probe_step, prepped)
+    # With a submitting pool the whole wave enters the FIFO at once -- no
+    # per-response executor threads; collection order == step order.
+    if _submit is not None:
+        _probe_futs = [_submit(make_theorem(fixes_all, p["prem"], "False",
+                                            ALTERNATION)) for p in prepped]
+        probe_hits = []
+        for _f in _probe_futs:
+            _r = _f.result()
+            _record(_r)
+            probe_hits.append(bool(_r["success"]))
+    else:
+        probe_hits = _pmap(_probe_step, prepped)
     latch = None
     for p, hit in zip(prepped, probe_hits):
         if hit:
@@ -759,8 +827,17 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
     # reward.
     to_cascade = [p for p in prepped
                   if p["claims_t"] and (latch is None or p["k"] < latch)]
-    cascade_out = dict(zip((p["k"] for p in to_cascade),
-                           _pmap(_cascade_step, to_cascade)))
+    if _submit is not None and to_cascade:
+        # Shared cascade executor (review #1): cascades are sequential
+        # chains, so each needs a thread of control -- but a process-wide
+        # bounded pool replaces one fresh 4-thread executor per response
+        # (hundreds of short-lived threads per training step). Slots mostly
+        # park on pool futures, so far fewer than the old peak suffice.
+        _ex = _cascade_executor(getattr(pool, "num_workers", 4))
+        cascade_results = list(_ex.map(_cascade_step, to_cascade))
+    else:
+        cascade_results = _pmap(_cascade_step, to_cascade)
+    cascade_out = dict(zip((p["k"] for p in to_cascade), cascade_results))
 
     for p in prepped:
         entry = p["entry"]
@@ -872,8 +949,14 @@ class IsabelleEngine:
             "idx": idx,
             "sample": sample,
         }
-        return process_one(idx, item, self.pool, self.config,
-                           max_steps=max_steps)
+        t0 = time.time()
+        out = process_one(idx, item, self.pool, self.config,
+                          max_steps=max_steps)
+        # Total reward wall for this response (includes translate + prove +
+        # queue waits + CPU prep); the gap vs the parts is scheduling overhead.
+        if isinstance(out.get("prof"), dict):
+            out["prof"]["reward_wall_s"] = time.time() - t0
+        return out
 
     def shutdown(self):
         self.pool.shutdown()

@@ -153,7 +153,14 @@ echo "Model: $MODEL_PATH | Training GPUs: $TRAIN_DEVICES ($N_GPUS)"
 
 # W&B run name, following the logic-side convention
 # (${MODEL_TAG}_step_gdpo_fol_combined_v1): model_algo_verifier_dataset_ver.
-EXP_NAME=${EXP_NAME:-${MODEL_TAG}_step_gdpo_isabelle_math_combined_v1}
+# v2 (2026-07-11): official from-scratch run with the soundness-fixed reward
+# (pyexpr exponents/decimals/carriers, PIDE outcome typing, cache identity).
+# v1's checkpoints (step 150) are retained but must NOT be auto-resumed into
+# v2 -- hence the separate name AND the RESUME_MODE knob below.
+EXP_NAME=${EXP_NAME:-${MODEL_TAG}_step_gdpo_isabelle_math_combined_v2}
+# disable = train from scratch even if checkpoints exist; auto = resume the
+# LATEST checkpoint under this EXP_NAME (use for crash restarts mid-run).
+RESUME_MODE=${RESUME_MODE:-auto}
 
 # --- Training ---
 # fol_task_type=math routes step rewards to Isabelle verification (not Z3).
@@ -229,7 +236,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     trainer.test_freq=50 \
     trainer.max_actor_ckpt_to_keep=3 \
     trainer.val_before_train=true \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=$RESUME_MODE \
     "$@"
 
 TRAIN_EXIT=$?

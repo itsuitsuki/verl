@@ -46,3 +46,33 @@ def test_normal_float_still_decimal_exact():
     term, _, consts, _ = py_to_isabelle("x == 0.025", {"x": "real"})
     assert Fraction(1, 40) in consts
     assert "/ (40::real)" in term or "(1::real)" in term
+
+
+def test_symbolic_positive_form_also_guarded():
+    # T + 1 is symbolic even though contextually positive: still guarded
+    term, _, _, carrier = py_to_isabelle("2 ** (T + 1) == 8", {"T": "int"})
+    assert carrier == "real" and "if" in term and "nat" in term
+
+
+def test_zero_and_literal_exponents_stay_plain():
+    term, _, _, _ = py_to_isabelle("2 ** 0 == 1", {})
+    assert "^ 0" in term and "if" not in term
+
+
+def test_negative_decimal_exact():
+    _, _, consts, _ = py_to_isabelle("x == -0.5", {"x": "real"})
+    assert Fraction(1, 2) in consts or Fraction(-1, 2) in consts
+
+
+def test_trailing_zero_decimal_exact():
+    _, _, consts, _ = py_to_isabelle("x == 0.250", {"x": "real"})
+    assert Fraction(1, 4) in consts
+
+
+def test_int_mod_stays_int():
+    # checklist #8: integer modulus must not be polluted into real by an
+    # unrelated real elsewhere -- at pyexpr level an int-only prop must
+    # keep the int carrier and int annotations.
+    term, _, _, carrier = py_to_isabelle("n % 2 == 0", {"n": "int"})
+    assert carrier == "int"
+    assert "::int" in term and "::real" not in term
