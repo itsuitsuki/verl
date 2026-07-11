@@ -1241,7 +1241,12 @@ class IsabelleServerPool:
         with self._disp_lock:
             if self._dispatchers:
                 return
-            for i in range(self.num_workers):
+            # 2x workers (review round 2): a dispatcher can park in
+            # NON-worker waits (single-flight follower wait, cross-process
+            # xlock.wait) -- with exactly num_workers lanes one foreign-
+            # locked theorem would idle a prover. Extra lanes absorb those
+            # waits; actual prover use stays bounded by the idle queue.
+            for i in range(max(2 * self.num_workers, self.num_workers + 2)):
                 t = threading.Thread(target=self._dispatch_loop, daemon=True,
                                      name=f"isa-dispatch-{i}")
                 t.start()

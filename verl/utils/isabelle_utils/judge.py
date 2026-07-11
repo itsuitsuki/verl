@@ -353,7 +353,11 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
     # was legitimately still working, popped its LIVE flight marker /
     # stole its live lock, and duplicated judge load exactly when the
     # judge was slowest.
-    leader_budget = MAX_TRIES * (2.0 * api_timeout + 3.0) + 30.0
+    # 180s tail slack: the flight also runs parse/validate, and validators
+    # may issue bounded prover checks (givens skeleton). An underestimate
+    # only duplicates work; an overestimate only delays takeover of a dead
+    # leader -- lean generous.
+    leader_budget = MAX_TRIES * (2.0 * api_timeout + 3.0) + 180.0
     failed_flights = 0
     while True:
         with _TR_LOCK:

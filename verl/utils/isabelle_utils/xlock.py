@@ -28,8 +28,13 @@ def acquire(lock_path: str, stale_s: float) -> bool:
         try:
             os.makedirs(os.path.dirname(lock_path), exist_ok=True)
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
+            try:
+                # write can raise (ENOSPC on a full tmpfs -- data pages fail
+                # even when the dirent fit); the fd MUST still be closed or
+                # every disk miss leaks one fd until EMFILE (review round 2)
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
             # a fresh leader supersedes any previous failure marker
             try:
                 os.unlink(lock_path + ".fail")

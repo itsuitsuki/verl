@@ -39,6 +39,30 @@ def test_submit_resolves_all_and_injects_queue_wait(tmp_path, monkeypatch):
     assert all(float(o.get("queue_wait", -1)) >= 0.0 for o in outs)
 
 
+def test_fifo_delay_lands_in_queue_wait(tmp_path, monkeypatch):
+    # Review round 2: the previous >= 0.0 assertion was vacuous -- deleting
+    # the dispatcher's injection line still passed. Serialize on ONE
+    # dispatcher lane with a slow check: the later submissions MUST show
+    # their time in the request FIFO.
+    import time as _time
+
+    p = _pool(tmp_path, monkeypatch, num_workers=1)
+    monkeypatch.setattr(p, "_ensure_dispatchers", lambda: None)
+
+    def slow_uncached(code):
+        _time.sleep(0.2)
+        return {"success": True, "elapsed": 0.2, "errors": [],
+                "queue_wait": 0.0, "check_time": 0.2}
+
+    monkeypatch.setattr(p, "_check_uncached", slow_uncached)
+    futs = [p.submit(THM.replace("4", str(40 + i))) for i in range(3)]
+    t = threading.Thread(target=p._dispatch_loop, daemon=True)  # one lane
+    t.start()
+    outs = [f.result(timeout=15.0) for f in futs]
+    # 3rd request sat behind two 0.2s checks in the FIFO
+    assert float(outs[2]["queue_wait"]) >= 0.3
+
+
 def test_submit_memo_fast_path(tmp_path, monkeypatch):
     p = _pool(tmp_path, monkeypatch)
     n = {"c": 0}
