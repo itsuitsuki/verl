@@ -133,6 +133,10 @@ class StepRewardManager(RewardManagerBase):
         isabelle_pool_workers = reward_cfg.get("isabelle_pool_workers", algo_cfg.get("isabelle_pool_workers", None))
         if isabelle_pool_workers is not None:
             self.api_config["isabelle_pool_workers"] = int(isabelle_pool_workers)
+        isabelle_rss_cap = reward_cfg.get("isabelle_worker_rss_cap_gb",
+                                          algo_cfg.get("isabelle_worker_rss_cap_gb", None))
+        if isabelle_rss_cap is not None:
+            self.api_config["isabelle_worker_rss_cap_gb"] = float(isabelle_rss_cap)
         print(f"FOL config 'fol_cumulative_mode' is set to: {self.api_config.get('fol_cumulative_mode', 'current_only')}")
 
         # FOL pipeline / translation mode

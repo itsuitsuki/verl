@@ -56,6 +56,9 @@ class IsabelleConfig:
     # judge.call_judge, so the configured value silently did nothing).
     # Operational value stays 240 -- wiring only, per user decision.
     api_timeout: float = 240.0
+    # Per-worker poly-tree RSS cap (GB); Hydra config knob (not env), plumbed
+    # to IsabelleServerPool. 12GB validated safe on the 300GB cgroup.
+    rss_cap_gb: float = 12.0
 
 
 EXAMPLE_LINES = {
@@ -1051,7 +1054,8 @@ class IsabelleEngine:
         import os
         self.pool = IsabelleServerPool(
             num_workers=self.config.pool_workers,
-            base_dir=f"/tmp/isabelle_pool_engine_{os.getpid()}")
+            base_dir=f"/tmp/isabelle_pool_engine_{os.getpid()}",
+            rss_cap_gb=self.config.rss_cap_gb)
         self.pool.start()
         import atexit
         atexit.register(self._safe_shutdown)

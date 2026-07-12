@@ -912,9 +912,12 @@ class IsabelleServerPool:
     # recycles the whole JVM (resets every poly). This is THE bound on host
     # memory (2026-07-08 OOM root cause: leaked zombie-proof polys accumulate,
     # --maxheap does not cap RSS). Total host poly footprint <= num_workers x
-    # cap regardless of step count. 7GB x 8 workers = 56GB steady.
-    WORKER_RSS_CAP_KB = int(
-        os.environ.get("ISABELLE_WORKER_RSS_CAP_GB", "7")) * 1024 * 1024
+    # cap regardless of step count. Class default 12GB (2026-07-11 measurement:
+    # a healthy 2-poly tree sits ~6GB, and 4 workers x 4 procs x 12GB ~= 202GB
+    # under the 300GB cgroup). Overridable per-run via the reward config knob
+    # `algorithm.isabelle_worker_rss_cap_gb` (plumbed through IsabelleConfig ->
+    # __init__ rss_cap_gb), so it is a Hydra CLI setting, not an env var.
+    WORKER_RSS_CAP_KB = 12 * 1024 * 1024
     MAX_CHECK_ATTEMPTS = 2             # 1 retry on a FRESH worker after a
     #                                    worker_error (hard-timeout / crash):
     #                                    the wedge is transient (the theorem
@@ -935,9 +938,14 @@ class IsabelleServerPool:
 
     def __init__(self, num_workers: int = 4,
                  base_dir: Path | str = "/tmp/isabelle_pool",
-                 purge_every: int = PURGE_EVERY):
+                 purge_every: int = PURGE_EVERY,
+                 rss_cap_gb: float | None = None):
         self.base_dir = Path(base_dir)
         self.num_workers = num_workers
+        # Per-run RSS cap override (Hydra config, not env). Falls back to the
+        # class default (12GB) when unset.
+        if rss_cap_gb is not None:
+            self.WORKER_RSS_CAP_KB = int(float(rss_cap_gb) * 1024 * 1024)
         self.workers = [IsabelleWorker(i, self.base_dir, purge_every)
                         for i in range(num_workers)]
         self.idle: Queue[IsabelleWorker] = Queue()

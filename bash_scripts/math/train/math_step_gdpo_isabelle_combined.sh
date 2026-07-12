@@ -76,15 +76,12 @@ fi
 
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 export WANDB_MODE=${WANDB_MODE:-online}
-# Isabelle per-worker poly-tree RSS cap (2026-07-11 measurement): a healthy
-# 2-poly worker tree sits at ~6GB steady-state (1 active ~6GB heap + 1 small
-# poly); the old 7GB default was only +0.8GB above that, so a legitimate
-# second concurrent proof poly (~+6GB) spiked the tree over cap and forced an
-# unnecessary rss_cap recycle -> restart churn + step-time long tails. Raise
-# to 12GB. Budget: 12 JVMs x 12GB = 144GB polys + ~106GB fixed = ~250GB, under
-# the ~285GB Ray-kill on the 300GB cgroup (~35GB margin). Do NOT set >=14 here:
-# 12 x 14 + 106 = 274GB leaves too little for transient JVM overlap.
-export ISABELLE_WORKER_RSS_CAP_GB=${ISABELLE_WORKER_RSS_CAP_GB:-12}
+# Isabelle per-worker poly-tree RSS cap is now a Hydra knob
+# (+algorithm.isabelle_worker_rss_cap_gb, default 12 in the training args
+# below), NOT an env var. 2026-07-11 measurement: a healthy 2-poly tree sits
+# ~6GB steady, and 12 JVMs x 12GB = 144GB polys + ~106GB fixed = ~250GB stays
+# under the ~285GB Ray-kill on the 300GB cgroup. Do NOT raise >=14 (transient
+# JVM overlap would overrun). Override per-run: ++algorithm.isabelle_worker_rss_cap_gb=N.
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
@@ -179,11 +176,9 @@ echo "Model: $MODEL_PATH | Training GPUs: $TRAIN_DEVICES ($N_GPUS)"
 # cap 12GB. This changes the reward for the dangerous/timeout tail vs v2, so
 # the whole run must be from scratch for one reward definition (v2's step-0..N
 # checkpoints are retained but must NOT be auto-resumed into v3 -- hence the
-# separate name AND RESUME_MODE below).
+# separate name; resume mode is the base-config default `auto`, overridable
+# on the CLI: pass trainer.resume_mode=disable for a fresh from-scratch run).
 EXP_NAME=${EXP_NAME:-${MODEL_TAG}_step_gdpo_isabelle_math_combined_v3}
-# disable = train from scratch even if checkpoints exist; auto = resume the
-# LATEST checkpoint under this EXP_NAME (use for crash restarts mid-run).
-RESUME_MODE=${RESUME_MODE:-auto}
 
 # --- Training ---
 # fol_task_type=math routes step rewards to Isabelle verification (not Z3).
@@ -206,7 +201,8 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     reward_model.reward_manager=step \
     reward.num_workers=4 \
     +algorithm.step_reward_max_workers=128 \
-    +algorithm.isabelle_pool_workers=${ISABELLE_POOL_WORKERS:-3} \
+    +algorithm.isabelle_pool_workers=3 \
+    +algorithm.isabelle_worker_rss_cap_gb=12 \
     "data.train_files=[data/gsm8k/train.parquet,data/math/train.parquet,data/bigmath/train.parquet]" \
     "data.val_files=[data/gsm8k/test.parquet,data/math500/test.parquet,data/aime24/test.parquet,data/aime25/test.parquet,data/amc23/test.parquet,data/minervamath/test.parquet,data/olympiadbench/test.parquet]" \
     data.train_batch_size=16 \
@@ -259,14 +255,17 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     trainer.test_freq=50 \
     trainer.max_actor_ckpt_to_keep=3 \
     trainer.val_before_train=true \
-    trainer.resume_mode=$RESUME_MODE \
     "$@"
-# Extra Hydra overrides pass straight through "$@", e.g.:
-#   bash math_step_gdpo_isabelle_combined.sh \
-#       +trainer.print_all_step_patterns=true \
-#       ++algorithm.isabelle_pool_workers=4
-# print_all_step_patterns is read via self.config.trainer.get(..., False), so
-# it defaults OFF when the flag is absent -- no need to declare it here.
+# resume_mode is left at the base-config default (auto); pass it and any other
+# Hydra override straight through "$@". Examples:
+#   from-scratch official run:
+#     bash math_step_gdpo_isabelle_combined.sh trainer.resume_mode=disable
+#   resume with 4 pool workers + full pattern logging:
+#     bash math_step_gdpo_isabelle_combined.sh \
+#         ++algorithm.isabelle_pool_workers=4 \
+#         ++algorithm.isabelle_worker_rss_cap_gb=12 \
+#         +trainer.print_all_step_patterns=true
+# print_all_step_patterns defaults OFF via self.config.trainer.get(..., False).
 
 TRAIN_EXIT=$?
 echo "Training finished with exit code $TRAIN_EXIT"

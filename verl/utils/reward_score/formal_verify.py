@@ -884,6 +884,8 @@ def _get_isabelle_engine(api_config: dict | None = None):
             check_deadline=float(timeout),
             # Judge HTTP deadline; wired (2026-07-11), operational value 240.
             api_timeout=float(cfg.get("api_timeout") or 240.0),
+            # Per-worker RSS cap (GB); Hydra knob, replaces the old env var.
+            rss_cap_gb=float(cfg.get("isabelle_worker_rss_cap_gb") or 12.0),
         )
         _isabelle_engine = IsabelleEngine(config)
         return _isabelle_engine
