@@ -1931,6 +1931,49 @@ class RayPPOTrainer:
                                 sr_sample.append({"steps": _pat[0]})
                             if len(sr_sample) > 1:
                                 print(f"[Step Rewards]: {sr_sample}")
+
+                            # Batch-wide per-response step patterns (2026-07-12
+                            # observability). Behind a flag (default off): only
+                            # the compact pattern/outcome/n_steps is printed (no
+                            # response text), so all rollouts fit in ~batch
+                            # short lines and reveal whether long-reasoning
+                            # responses exist, whether they earn reward (oooo)
+                            # or collapse (xxxx/uuuu), and whether the model
+                            # games the verifier by writing fewer steps. Enable
+                            # with +trainer.print_all_step_patterns=true.
+                            # pattern symbols: o=rewarded x=verified-failed
+                            # c=premise-inconsistent u=premise-undetermined
+                            # g=guard/neutral m=transcription-missing.
+                            if self.config.trainer.get("print_all_step_patterns", False):
+                                _pats = reward_extra_infos_dict.get("isabelle_pattern") or []
+                                _ns = reward_extra_infos_dict.get("isabelle_n_steps") or []
+                                _oc = reward_extra_infos_dict.get("isabelle_outcome_correct")
+                                _os = reward_extra_infos_dict.get("isabelle_o_steps") or []
+                                _n = len(prompts)
+                                print(f"\n[All Step Patterns] step={self.global_steps} batch={_n}")
+                                from collections import Counter
+                                _hist = Counter()
+                                # bucket -> [count, sum(outcome), sum(process o_rate)]
+                                _buk = {"1-2": [0, 0, 0.0], "3-5": [0, 0, 0.0],
+                                        "6-10": [0, 0, 0.0], "11+": [0, 0, 0.0]}
+                                for _i in range(_n):
+                                    _p = (_pats[_i] if _i < len(_pats) else "") or ""
+                                    _k = (int(_ns[_i]) if _i < len(_ns) and _ns[_i] is not None
+                                          else len(_p))
+                                    _o = (int(_oc[_i]) if _oc is not None and _i < len(_oc)
+                                          else int(round(float(outcome_rewards[_i]))))
+                                    _pr = ((_os[_i] / _k) if _i < len(_os) and _k > 0 else 0.0)
+                                    print(f"[Sample {_i}] pattern={_p or '-'} outcome={_o} n_steps={_k}")
+                                    _hist[_k] += 1
+                                    _b = ("1-2" if _k <= 2 else "3-5" if _k <= 5
+                                          else "6-10" if _k <= 10 else "11+")
+                                    _buk[_b][0] += 1
+                                    _buk[_b][1] += _o
+                                    _buk[_b][2] += _pr
+                                print("[Step Hist] " + " ".join(f"{k}:{_hist[k]}" for k in sorted(_hist)))
+                                print("[Step Buckets] " + " ".join(
+                                    f"{b}:n={c[0]},outcome={c[1]/c[0]:.2f},o_rate={c[2]/c[0]:.2f}"
+                                    for b, c in _buk.items() if c[0]))
                             tree_debug = {}
                             for k in (
                                 "treerl_tree_idx",

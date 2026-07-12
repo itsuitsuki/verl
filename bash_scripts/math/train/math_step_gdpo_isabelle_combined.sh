@@ -260,6 +260,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     trainer.max_actor_ckpt_to_keep=3 \
     trainer.val_before_train=true \
     trainer.resume_mode=$RESUME_MODE \
+    +trainer.print_all_step_patterns=${PRINT_ALL_PATTERNS:-false} \
     "$@"
 
 TRAIN_EXIT=$?
