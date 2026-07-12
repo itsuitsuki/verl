@@ -173,11 +173,14 @@ echo "Model: $MODEL_PATH | Training GPUs: $TRAIN_DEVICES ($N_GPUS)"
 
 # W&B run name, following the logic-side convention
 # (${MODEL_TAG}_step_gdpo_fol_combined_v1): model_algo_verifier_dataset_ver.
-# v2 (2026-07-11): official from-scratch run with the soundness-fixed reward
-# (pyexpr exponents/decimals/carriers, PIDE outcome typing, cache identity).
-# v1's checkpoints (step 150) are retained but must NOT be auto-resumed into
-# v2 -- hence the separate name AND the RESUME_MODE knob below.
-EXP_NAME=${EXP_NAME:-${MODEL_TAG}_step_gdpo_isabelle_math_combined_v2}
+# v3 (2026-07-11): official from-scratch run. Adds the giant-number guard
+# (dangerous claims -> eval, dangerous/timeout probes -> undetermined safe
+# mode instead of grinding simp/presburger), verify_timeout=60, worker RSS
+# cap 12GB. This changes the reward for the dangerous/timeout tail vs v2, so
+# the whole run must be from scratch for one reward definition (v2's step-0..N
+# checkpoints are retained but must NOT be auto-resumed into v3 -- hence the
+# separate name AND RESUME_MODE below).
+EXP_NAME=${EXP_NAME:-${MODEL_TAG}_step_gdpo_isabelle_math_combined_v3}
 # disable = train from scratch even if checkpoints exist; auto = resume the
 # LATEST checkpoint under this EXP_NAME (use for crash restarts mid-run).
 RESUME_MODE=${RESUME_MODE:-auto}
