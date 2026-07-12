@@ -1950,12 +1950,14 @@ class RayPPOTrainer:
                                 _oc = reward_extra_infos_dict.get("isabelle_outcome_correct")
                                 _os = reward_extra_infos_dict.get("isabelle_o_steps") or []
                                 _n = len(prompts)
-                                print(f"\n[All Step Patterns] step={self.global_steps} batch={_n}")
+                                print(f"\n[All Step Patterns] step={self.global_steps} batch={_n}"
+                                      " (idx:pattern=outcome)")
                                 from collections import Counter
                                 _hist = Counter()
                                 # bucket -> [count, sum(outcome), sum(process o_rate)]
                                 _buk = {"1-2": [0, 0, 0.0], "3-5": [0, 0, 0.0],
                                         "6-10": [0, 0, 0.0], "11+": [0, 0, 0.0]}
+                                _toks = []
                                 for _i in range(_n):
                                     _p = (_pats[_i] if _i < len(_pats) else "") or ""
                                     _k = (int(_ns[_i]) if _i < len(_ns) and _ns[_i] is not None
@@ -1963,13 +1965,16 @@ class RayPPOTrainer:
                                     _o = (int(_oc[_i]) if _oc is not None and _i < len(_oc)
                                           else int(round(float(outcome_rewards[_i]))))
                                     _pr = ((_os[_i] / _k) if _i < len(_os) and _k > 0 else 0.0)
-                                    print(f"[Sample {_i}] pattern={_p or '-'} outcome={_o} n_steps={_k}")
+                                    _toks.append(f"{_i}:{_p or '-'}={_o}")
                                     _hist[_k] += 1
                                     _b = ("1-2" if _k <= 2 else "3-5" if _k <= 5
                                           else "6-10" if _k <= 10 else "11+")
                                     _buk[_b][0] += 1
                                     _buk[_b][1] += _o
                                     _buk[_b][2] += _pr
+                                # compact: 16 responses per line (idx:pattern=outcome)
+                                for _j in range(0, len(_toks), 16):
+                                    print(" ".join(_toks[_j:_j + 16]))
                                 print("[Step Hist] " + " ".join(f"{k}:{_hist[k]}" for k in sorted(_hist)))
                                 print("[Step Buckets] " + " ".join(
                                     f"{b}:n={c[0]},outcome={c[1]/c[0]:.2f},o_rate={c[2]/c[0]:.2f}"
