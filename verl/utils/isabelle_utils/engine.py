@@ -798,8 +798,19 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         # refinements, which would re-introduce the grinding tactics.
         danger = is_dangerous_isabelle(*claims_t, *[t for _, t in prem])
         out = {"verified": None, "tolerance": False, "danger": danger}
+        # Safe mode (2026-07-11): the consistency of this step's premise chain
+        # is UNKNOWN (an earlier probe was undetermined), so ANY with-premises
+        # proof could be ex-falso. Prove the claim INDEPENDENTLY only -- a
+        # premise-free (canonical) proof is a tautology, true regardless of
+        # premise consistency, so it can still earn reward; a claim that needs
+        # the suspect premises earns nothing. This MUST gate the nz loop and
+        # the tolerance fallback too, not just the main _verify_single proof:
+        # both build make_theorem(..., prem, ...) and ALTERNATION's
+        # linarith/presburger/auto close any goal ex-falso from inconsistent
+        # premises (2026-07-11 review: HIGH ex-falso reward leak).
+        safe = bool(p.get("safe_mode"))
         nz_prem = []
-        if not danger:
+        if not danger and not safe:
             for d in p["nz_list"]:
                 rnz = _check(make_theorem(fixes_all, prem,
                                           f"{d} \\<noteq> 0", ALTERNATION))
@@ -807,13 +818,6 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                     nz_prem.append((f"nz{len(nz_prem)}", f"{d} \\<noteq> 0"))
         full_prem = prem + nz_prem
         tac = SAFE_DANGEROUS if danger else ALTERNATION
-        # Safe mode (2026-07-11): the consistency of this step's premise chain
-        # is UNKNOWN (an earlier probe was undetermined), so a with-premises
-        # proof could be ex-falso. Prove the claim INDEPENDENTLY only -- a
-        # premise-free (canonical) proof is a tautology, true regardless of
-        # premise consistency, so it can still earn reward; a claim that needs
-        # the suspect premises earns nothing.
-        safe = bool(p.get("safe_mode"))
 
         def _verify_single(g):
             if not safe:
@@ -836,7 +840,10 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             out["verified"] = all(_verify_single(g) for g in claims_t)
         else:
             out["verified"] = _verify_single(claims_t[0])
-        if not out["verified"] and not danger:
+        if not out["verified"] and not danger and not safe:
+            # NOT in safe mode: the tolerance fallback proves an approximate
+            # goal FROM the premises, so it must be forbidden when premise
+            # consistency is unknown (ex-falso leak, 2026-07-11 review).
             tol = tolerance_goal(p["claims_nodes"], vt_all, p["carrier"])
             if tol:
                 rt = _check(make_theorem(fixes_all, prem + nz_prem, tol,

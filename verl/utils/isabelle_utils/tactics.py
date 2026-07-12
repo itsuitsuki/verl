@@ -28,11 +28,26 @@ NZ_TACTIC = ("((simp) | (auto simp: add_eq_0_iff) | (auto) | (linarith) "
 # PROBES are treated as 'undetermined' (never 'consistent') without grinding.
 SAFE_DANGEROUS = "(eval)"
 
+# These match BOTH the raw source shape (e.g. "2^5000", "fact 50000") and the
+# transpiled Isabelle shape the guard actually sees at the call sites, where a
+# computed exponent is wrapped as `(nat (...))` and a factorial argument as
+# `(nat (N::int))` (2026-07-11 review: the old `\bfact\s*\(?\s*\d{3,}` and
+# `\^\s*\([^)]*\^` were DEAD / FALSE-POSITIVE against transpiler output).
 _DANGER_RE = re.compile(
-    r"\^\s*\(?\s*-?\d{4,}"        # power with a >=1000 literal exponent
-    r"|\^\s*\([^)]*\^"           # power tower: ^( ... ^ ... )
-    r"|\bfact\s*\(?\s*\d{3,}"    # factorial of a >=100 literal
-    r"|\d{40,}"                   # a >=40-digit integer literal
+    # power with a >=1000 LITERAL exponent (literal exponents are emitted
+    # bare, e.g. "2 ^ 5000"; computed ones get the nat wrapper handled below)
+    r"\^\s*\(?\s*-?\d{4,}"
+    # LITERAL power tower: an inner `<lit> ^ <lit>` inside a (possibly
+    # nat-wrapped) exponent -- 2^(3^11) -> "^ (nat (3 ^ 11))". A SYMBOLIC
+    # nested power (2^(n^2) -> "nat (n ^ 2)"; 2^(2^n) -> "nat (2 ^ (nat n))")
+    # has a non-literal base or exponent and must NOT match (it never
+    # materializes, so eval-only would only lose its reward).
+    r"|\^\s*\(\s*(?:nat\s*\(\s*)?\d+\s*\^\s*\(?\s*(?:nat\s*\(\s*)?\d"
+    # factorial of a >=100 literal, raw "fact 100" or transpiled
+    # "fact (nat (100::int))"
+    r"|\bfact\b[\s(]*(?:nat[\s(]*)?\d{3,}"
+    # a >=40-digit integer literal
+    r"|\d{40,}"
 )
 
 

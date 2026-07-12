@@ -27,6 +27,7 @@ class _MockPool:
 
     def __init__(self, probe_by_k=None):
         self.probe_by_k = probe_by_k or {}
+        self.claim_calls = []      # (has_assumes, code) for non-probe checks
 
     def submit(self, code):
         from concurrent.futures import Future
@@ -35,6 +36,8 @@ class _MockPool:
         return f
 
     def check(self, code):
+        if not re.search(r'shows\s+"False"', code):
+            self.claim_calls.append(("assumes" in code, code))
         ok, extra = self._decide(code)
         r = {"success": ok, "elapsed": 0.01,
              "errors": [] if ok else ["no"],
@@ -125,3 +128,25 @@ def test_inconsistent_dominates_later_undetermined(monkeypatch):
                monkeypatch)
     assert rec["premise_inconsistent_at"] == 1
     assert rec["pattern"] == "occc"
+
+
+def test_safe_mode_issues_no_with_premises_proof(monkeypatch):
+    # 2026-07-11 review HIGH: in safe mode the nz loop and tolerance fallback
+    # must NOT run with-premises proofs (ALTERNATION's linarith/presburger/auto
+    # close any goal ex-falso from inconsistent premises). Assert that once a
+    # step is in safe mode, EVERY claim-side prover call it makes is
+    # premise-free (no 'assumes' in the theorem).
+    props = {1: {"prop": "a == 55", "premises": []},   # k0 normal
+             2: {"prop": "b == 77", "premises": []},   # k1 safe, needs-premises
+             3: {"prop": "c == 77", "premises": []}}   # k2 safe, needs-premises
+    pool = _MockPool({1: "undetermined"})
+    rec = _run(pool, props, monkeypatch)
+    assert rec["premise_undetermined_at"] == 1
+    # k1,k2 need premises and are in safe mode -> blocked, no ex-falso reward
+    assert rec["pattern"] == "ouu"
+    # after safe mode begins (k1), a with-premises claim proof would only be
+    # issued for a NORMAL step. Here only k0 is normal; k0's claim (55) is
+    # bare-provable so its first with-premises attempt is allowed. The safe
+    # steps (k1,k2) must issue ZERO with-premises claim checks.
+    with_prem = [c for ha, c in pool.claim_calls if ha and '"77' in c.split("shows",1)[1]]
+    assert with_prem == []      # no ex-falso path for the 77 (needs-premises) claims
