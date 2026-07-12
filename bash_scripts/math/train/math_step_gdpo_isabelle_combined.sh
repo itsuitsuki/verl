@@ -260,8 +260,13 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     trainer.max_actor_ckpt_to_keep=3 \
     trainer.val_before_train=true \
     trainer.resume_mode=$RESUME_MODE \
-    +trainer.print_all_step_patterns=${PRINT_ALL_PATTERNS:-false} \
     "$@"
+# Extra Hydra overrides pass straight through "$@", e.g.:
+#   bash math_step_gdpo_isabelle_combined.sh \
+#       +trainer.print_all_step_patterns=true \
+#       ++algorithm.isabelle_pool_workers=4
+# print_all_step_patterns is read via self.config.trainer.get(..., False), so
+# it defaults OFF when the flag is absent -- no need to declare it here.
 
 TRAIN_EXIT=$?
 echo "Training finished with exit code $TRAIN_EXIT"
