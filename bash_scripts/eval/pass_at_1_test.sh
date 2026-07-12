@@ -30,6 +30,10 @@ if [ ! -d "$MODEL_PATH" ] && [ -d "/2022533109/zhouchuyan/models/Qwen2.5-1.5B-In
 fi
 
 VAL_FILE=${VAL_FILE:-${TEST_FILE:-"$DATA_DIR/test.parquet"}}
+# main_ppo only DATALOADS train_files (never trains: val-only run). Eval-only
+# benches (math500 / aime / amc / minerva / olympiadbench) ship test.parquet
+# only, so allow a dummy train file from another dataset (2026-07-11).
+TRAIN_FILE=${TRAIN_FILE:-"$DATA_DIR/train.parquet"}
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-${RESUME_FROM_PATH:-}}
 RUN_NAME=${RUN_NAME:-"$(basename "$MODEL_PATH")_${DATA_NAME}_pass_at_1"}
 
@@ -50,8 +54,8 @@ export no_proxy="127.0.0.1,localhost${no_proxy:+,$no_proxy}"
 unset ROCR_VISIBLE_DEVICES
 unset HIP_VISIBLE_DEVICES
 
-if [ ! -f "$DATA_DIR/train.parquet" ]; then
-    echo "ERROR: train parquet does not exist: $DATA_DIR/train.parquet" >&2
+if [ ! -f "$TRAIN_FILE" ]; then
+    echo "ERROR: train parquet does not exist: $TRAIN_FILE" >&2
     exit 1
 fi
 
@@ -96,7 +100,7 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
         +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
         +reward_model.reward_kwargs.max_resp_len="$MAX_RESPONSE_LENGTH" \
-        data.train_files="$DATA_DIR/train.parquet" \
+        data.train_files="$TRAIN_FILE" \
         data.val_files="$VAL_FILE" \
         data.train_batch_size=4 \
         data.val_batch_size="$VAL_BATCH_SIZE" \

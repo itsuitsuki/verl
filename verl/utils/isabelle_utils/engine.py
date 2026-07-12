@@ -15,9 +15,9 @@ from pathlib import Path
 
 from verl.utils.isabelle_utils.server_pool import IsabelleServerPool
 from verl.utils.isabelle_utils.tactics import (
-    ALTERNATION, EVAL_RESCUE, FALSE_TACTIC, NZ_TACTIC,
-    make_theorem, num_values, fixes_clause, identifiers,
-    anchor_ground_numerals, FREE_NUMS,
+    ALTERNATION, EVAL_RESCUE, FALSE_TACTIC, NZ_TACTIC, SAFE_DANGEROUS,
+    is_dangerous_isabelle, make_theorem, num_values, fixes_clause,
+    identifiers, anchor_ground_numerals, FREE_NUMS,
 )
 from verl.utils.isabelle_utils.judge import translate
 from verl.utils.isabelle_utils.xml_utils import (
@@ -780,35 +780,53 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", goal))
         return sorted((n, t) for (n, t) in fixes_all if n in toks)
 
-    def _probe_step(p):
-        """Premise-consistency probe only (goal False from the accumulated
-        axioms). Split from the claim cascade so the inconsistency point can
-        be resolved BEFORE cascades run: steps at/after that point are forced
-        to rewarded=False / pattern 'c' regardless of their proofs, so their
-        cascades (3-6 prover calls each) are dead work."""
-        rf = _check(make_theorem(fixes_all, p["prem"], "False",
-                                 ALTERNATION))
-        return bool(rf["success"])
+    def _probe_step_raw(p):
+        """Premise-consistency probe (goal False from the accumulated axioms).
+        Returns the RAW check result so the caller can classify it ternary
+        (inconsistent / consistent / undetermined). Used only by the mock /
+        legacy non-submit path; the submit path builds the theorem inline."""
+        return _check(make_theorem(fixes_all, p["prem"], "False",
+                                   ALTERNATION))
 
     def _cascade_step(p):
         prem, claims_t = p["prem"], p["claims_t"]
-        out = {"verified": None, "tolerance": False}
+        # Giant-number guard (2026-07-11): a claim or premise carrying a huge
+        # literal / >=1000 exponent / factorial / power tower makes the
+        # leading simp/presburger of ALTERNATION grind 60-75s past the 15s
+        # watchdog. Route the whole step to eval alone (watchdog-respecting,
+        # still proves legit moderate computations); skip the nz and tolerance
+        # refinements, which would re-introduce the grinding tactics.
+        danger = is_dangerous_isabelle(*claims_t, *[t for _, t in prem])
+        out = {"verified": None, "tolerance": False, "danger": danger}
         nz_prem = []
-        for d in p["nz_list"]:
-            rnz = _check(make_theorem(fixes_all, prem,
-                                      f"{d} \\<noteq> 0", ALTERNATION))
-            if rnz["success"]:
-                nz_prem.append((f"nz{len(nz_prem)}", f"{d} \\<noteq> 0"))
+        if not danger:
+            for d in p["nz_list"]:
+                rnz = _check(make_theorem(fixes_all, prem,
+                                          f"{d} \\<noteq> 0", ALTERNATION))
+                if rnz["success"]:
+                    nz_prem.append((f"nz{len(nz_prem)}", f"{d} \\<noteq> 0"))
         full_prem = prem + nz_prem
+        tac = SAFE_DANGEROUS if danger else ALTERNATION
+        # Safe mode (2026-07-11): the consistency of this step's premise chain
+        # is UNKNOWN (an earlier probe was undetermined), so a with-premises
+        # proof could be ex-falso. Prove the claim INDEPENDENTLY only -- a
+        # premise-free (canonical) proof is a tautology, true regardless of
+        # premise consistency, so it can still earn reward; a claim that needs
+        # the suspect premises earns nothing.
+        safe = bool(p.get("safe_mode"))
 
         def _verify_single(g):
-            r = _check(make_theorem(fixes_all, full_prem, g, ALTERNATION))
-            if r["success"]:
-                return True
-            r0 = _check(make_theorem(_canonical_fixes(g), [], g,
-                                     ALTERNATION))
+            if not safe:
+                r = _check(make_theorem(fixes_all, full_prem, g, tac))
+                if r["success"]:
+                    return True
+            r0 = _check(make_theorem(_canonical_fixes(g), [], g, tac))
             if r0["success"]:
                 return True
+            if danger:
+                # eval already tried; do NOT fall through to the grinding
+                # ALTERNATION/EVAL_RESCUE rescue on a giant goal.
+                return False
             # EVAL_RESCUE already imported at module level
             r_eval = _check(make_theorem(_canonical_fixes(g), [], g,
                                          EVAL_RESCUE))
@@ -818,7 +836,7 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             out["verified"] = all(_verify_single(g) for g in claims_t)
         else:
             out["verified"] = _verify_single(claims_t[0])
-        if not out["verified"]:
+        if not out["verified"] and not danger:
             tol = tolerance_goal(p["claims_nodes"], vt_all, p["carrier"])
             if tol:
                 rt = _check(make_theorem(fixes_all, prem + nz_prem, tol,
@@ -842,36 +860,87 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         with ThreadPoolExecutor(max_workers=min(par, len(items))) as ex:
             return list(ex.map(fn, items))
 
-    # Wave 1: consistency probes for every step; the inconsistency point is
-    # the FIRST step whose probe proves False (identical to the sequential
-    # first-hit rule -- each probe depends only on its own premise list).
-    # With a submitting pool the whole wave enters the FIFO at once -- no
-    # per-response executor threads; collection order == step order.
-    if _submit is not None:
-        _probe_futs = [_submit(make_theorem(fixes_all, p["prem"], "False",
-                                            ALTERNATION)) for p in prepped]
-        probe_hits = []
-        for _f in _probe_futs:
-            _r = _f.result()
-            _record(_r)
-            probe_hits.append(bool(_r["success"]))
-    else:
-        probe_hits = _pmap(_probe_step, prepped)
-    latch = None
-    for p, hit in zip(prepped, probe_hits):
-        if hit:
-            latch = p["k"]
-            break
-    rec["premise_inconsistent_at"] = latch
+    # Wave 1: consistency probes. TERNARY outcome per step (2026-07-11):
+    #   inconsistent  -- proved `|- False` from the accumulated premises;
+    #   consistent    -- the check COMPLETED and did not prove False;
+    #   undetermined  -- we could NOT decide (dangerous premise chain skipped;
+    #                    or timeout / worker_error / watchdog-incomplete).
+    # A timeout must NEVER be read as "consistent" (that would let ex-falso
+    # steps built on unverifiable premises earn reward). Dangerous premise
+    # chains skip the prover entirely (proving False from a giant term would
+    # grind). The first inconsistent OR undetermined step is the cutoff:
+    # every step at/after it gets NO positive reward.
+    def _classify_probe(r):
+        if r.get("success"):
+            return "inconsistent"
+        if (r.get("worker_error") or r.get("incomplete")
+                or r.get("undetermined")):
+            return "undetermined"
+        return "consistent"
 
-    # Wave 2: claim cascades ONLY for steps before the inconsistency point.
-    # Steps at/after it get rewarded=False and pattern 'c' regardless of any
-    # proof result (reward reads only `rewarded`), so their cascades are
-    # skipped entirely; their `verified` stays False. This changes ONLY the
-    # verified_steps diagnostic metric for post-inconsistency steps, never a
-    # reward.
-    to_cascade = [p for p in prepped
-                  if p["claims_t"] and (latch is None or p["k"] < latch)]
+    probe_oc = [None] * len(prepped)
+    _pending = []
+    for i, p in enumerate(prepped):
+        if is_dangerous_isabelle(*[t for _, t in p["prem"]]):
+            probe_oc[i] = "undetermined"
+        elif _submit is not None:
+            _pending.append((i, _submit(make_theorem(
+                fixes_all, p["prem"], "False", ALTERNATION))))
+        else:
+            probe_oc[i] = _classify_probe(_probe_step_raw(p))
+    for i, fut in _pending:
+        r = fut.result()
+        _record(r)
+        probe_oc[i] = _classify_probe(r)
+
+    # Two boundaries (2026-07-11), both latched at their FIRST occurrence:
+    #   hard_cut = first INCONSISTENT step. Premises are provably contradictory
+    #     from here, so this and every later step earn NO reward (symbol 'c').
+    #   safe_from = first UNDETERMINED step. Consistency is UNKNOWN from here,
+    #     so this and every later step enter SAFE MODE: the with-premises proof
+    #     is forbidden (could be ex-falso), but an INDEPENDENT premise-free
+    #     proof still earns reward; a claim that needs the suspect premises (or
+    #     times out) earns nothing (symbol 'u'). Inconsistent dominates unknown
+    #     (a proven contradiction is a harder cut than an undecidable one).
+    # Asymmetry rationale: an inconsistency is the MODEL's error (it asserted a
+    # contradiction) -> penalize the whole tail; an undetermined check is the
+    # VERIFIER's limitation -> stay lenient (rescue independently-true steps).
+    # FUTURE (needs an Isabelle unsat core + a step-dependency graph, neither
+    # available today): for an inconsistency, invalidate only the FIRST
+    # conflict-introducing conclusion and block only steps that DEPEND on it,
+    # letting conflict-independent later steps keep earning reward -- more
+    # precise than the current conservative tail cut, but unsafe to attempt
+    # without reliably identifying which conclusion to drop.
+    hard_cut = None
+    safe_from = None
+    for p, oc in zip(prepped, probe_oc):
+        if oc == "inconsistent" and hard_cut is None:
+            hard_cut = p["k"]
+        if oc == "undetermined" and safe_from is None:
+            safe_from = p["k"]
+    rec["premise_inconsistent_at"] = hard_cut
+    if safe_from is not None:
+        rec["premise_undetermined_at"] = safe_from
+
+    def _mode(k):
+        if hard_cut is not None and k >= hard_cut:
+            return "hard"
+        if safe_from is not None and k >= safe_from:
+            return "safe"
+        return "normal"
+
+    # Wave 2: claim cascades for every step NOT hard-cut. Safe-mode steps DO
+    # cascade (their independent proof can still earn reward); only the proven-
+    # inconsistent tail is skipped as dead work.
+    to_cascade = []
+    for p in prepped:
+        if not p["claims_t"]:
+            continue
+        m = _mode(p["k"])
+        if m == "hard":
+            continue
+        p["safe_mode"] = (m == "safe")
+        to_cascade.append(p)
     if _submit is not None and to_cascade:
         # Shared cascade executor (review #1): cascades are sequential
         # chains, so each needs a thread of control -- but a process-wide
@@ -886,8 +955,10 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
 
     for p in prepped:
         entry = p["entry"]
-        entry["premises_inconsistent"] = (latch is not None
-                                          and p["k"] >= latch)
+        m = _mode(p["k"])
+        entry["premises_inconsistent"] = (m == "hard")
+        if m == "safe":
+            entry["premises_undetermined"] = True
         if not p["claims_t"]:
             # definition-only step: nothing to prove (conservative), but
             # also nothing to reward - neutral, excluded from the metric
@@ -895,29 +966,32 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             entry["verified"] = True
             entry["rewarded"] = False
             continue
+        if m == "hard":
+            entry["verified"] = False   # hard cut: cascade skipped
+            entry["rewarded"] = False
+            continue
         res = cascade_out.get(p["k"])
         if res is None:
-            entry["verified"] = False   # cascade skipped past the latch
+            entry["verified"] = False
         else:
-            entry["verified"] = res["verified"]
+            entry["verified"] = res["verified"]   # safe mode: independent-only
             if res["tolerance"]:
                 entry["tolerance"] = True
+        # A safe-mode step that VERIFIED did so with a premise-free proof, so
+        # it earns reward; one that could not is 'u'. Reward is NOT gated on
+        # premises_undetermined (safe mode already restricted the proof path).
         entry["rewarded"] = (entry["verified"] and entry["guard_ok"]
-                             and not entry["premises_inconsistent"]
                              and not entry["transcription_missing"])
 
-    # Per-step symbol string (priority o>c>m>g>x): o=rewarded,
-    # c=premises-inconsistent, m=verified-but-transcription-missing,
-    # g=verified-but-guard-failed/neutral, x=unverified.
-    # NOTE: c is NOT a cascade from a failed step. It is the separate
-    # `premise_inconsistent_at` latch above (a real `|- False` proof against
-    # the accumulated axioms); an x leaves premises consistent, so x does not
-    # force following steps to c. Returned in rec so the reward manager can
-    # surface it (e.g. in the [Step Rewards] sample print).
+    # Per-step symbol string (priority o>c>u>m>g>x): o=rewarded,
+    # c=premises-inconsistent (hard cut), u=premises-undetermined AND could not
+    # be proven independently (safe-mode miss), m=verified-but-transcription-
+    # missing, g=verified-but-guard-failed/neutral, x=unverified.
     pat = "".join(("o" if e["rewarded"] else
                    ("c" if e["premises_inconsistent"] else
-                    ("m" if e["verified"] and e["transcription_missing"] else
-                     ("g" if e["verified"] else "x")))) for e in rec["steps"])
+                    ("u" if e.get("premises_undetermined") else
+                     ("m" if e["verified"] and e["transcription_missing"] else
+                      ("g" if e["verified"] else "x"))))) for e in rec["steps"])
     rec["pattern"] = pat
     # No per-response print: the pattern + outcome converge into the trainer's
     # single [Step Rewards] sample line (ray_trainer.py) once per step.

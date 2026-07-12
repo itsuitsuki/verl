@@ -899,6 +899,15 @@ class IsabelleServerPool:
     CACHE_FAIL_FAST_S = 10.0             # failure cacheable only below this
     MONITOR_INTERVAL_S = 60.0           # orphan-sweep cadence
     WORKER_RESTART_WARN = 20            # log every N restarts of one worker
+    # Two-strike shared timeout (2026-07-11): a pathological theorem (giant
+    # arithmetic that evades the watchdog) times out on the first worker, is
+    # retried once on a FRESH worker (MAX_CHECK_ATTEMPTS), and if it times out
+    # AGAIN it is "undetermined" -- returned immediately for the rest of the
+    # strike window WITHOUT another prover call, so 16 rollouts of the same
+    # theorem cannot each restart a worker. NOT written to the permanent cache;
+    # the window expires (TTL) so a later batch under lighter load can retry.
+    TIMEOUT_STRIKE_TTL = 900.0           # seconds a strike pair short-circuits
+    TIMEOUT_STRIKE_MAX = 8192            # bounded LRU of struck theorems
     # Per-check hard ceiling on ONE worker's poly-tree RSS (KB). Exceeding it
     # recycles the whole JVM (resets every poly). This is THE bound on host
     # memory (2026-07-08 OOM root cause: leaked zombie-proof polys accumulate,
@@ -951,6 +960,10 @@ class IsabelleServerPool:
         self._inflight: dict[str, threading.Event] = {}
         self.cache_hits = 0
         self.cache_misses = 0
+        # Two-strike shared-timeout table: theorem_code -> (strikes, last_ts).
+        # Guarded by _cache_lock. Bounded LRU (TIMEOUT_STRIKE_MAX).
+        self._timeout_strikes: OrderedDict[str, list] = OrderedDict()
+        self.undetermined_short_circuits = 0
         # Runaway-poly reaper state: {poly_pid: (cpu_jiffies, starttime, streak)}
         # of consecutive monitor ticks the poly spent ~100% on CPU.
         self._poly_cpu: dict[int, tuple] = {}
@@ -1106,9 +1119,56 @@ class IsabelleServerPool:
                 "sustained 100%% CPU in an oversized (>2) poly tree)",
                 len(runaways), runaways, self._runaway_streak * interval)
 
+    def _is_struck(self, theorem_code: str) -> bool:
+        """True if this theorem already timed out twice within the strike TTL
+        -- callers must short-circuit to 'undetermined' without a prover call.
+        Expired strikes are dropped."""
+        now = time.time()
+        with self._cache_lock:
+            rec = self._timeout_strikes.get(theorem_code)
+            if rec is None:
+                return False
+            if now - rec[1] > self.TIMEOUT_STRIKE_TTL:
+                self._timeout_strikes.pop(theorem_code, None)
+                return False
+            return rec[0] >= 2
+
+    def _record_timeout_strike(self, theorem_code: str):
+        now = time.time()
+        with self._cache_lock:
+            rec = self._timeout_strikes.get(theorem_code)
+            if rec is None or now - rec[1] > self.TIMEOUT_STRIKE_TTL:
+                self._timeout_strikes[theorem_code] = [1, now]
+            else:
+                rec[0] += 1
+                rec[1] = now
+                self._timeout_strikes.move_to_end(theorem_code)
+            while len(self._timeout_strikes) > self.TIMEOUT_STRIKE_MAX:
+                self._timeout_strikes.popitem(last=False)
+
+    @staticmethod
+    def _undetermined(reason: str) -> dict:
+        """Verdict for a check we could not complete (timeout twice / dangerous
+        skip). success is False AND worker_error marks it uncacheable AND
+        undetermined tells the engine to treat consistency as UNKNOWN (never
+        'consistent') and give no positive reward to dependent steps."""
+        return {"success": False, "elapsed": 0.0, "worker_error": True,
+                "undetermined": True, "errors": [reason],
+                "queue_wait": 0.0, "check_time": 0.0}
+
     def check(self, theorem_code: str) -> dict:
         # ---- theorem memo (single-flight) ----
         while True:
+            # Two-strike short-circuit (2026-07-11): a theorem that already
+            # timed out twice in this window is returned undetermined WITHOUT a
+            # prover call. Checked INSIDE the loop so a single-flight follower
+            # that re-becomes leader after two failed flights also short-
+            # circuits -- otherwise 16 rollouts of one pathological theorem
+            # would each restart a worker in turn.
+            if self._is_struck(theorem_code):
+                with self._cache_lock:
+                    self.undetermined_short_circuits += 1
+                return self._undetermined("undetermined: 2 prior timeouts")
             with self._cache_lock:
                 cached = self._cache.get(theorem_code)
                 if cached is not None:
@@ -1177,6 +1237,11 @@ class IsabelleServerPool:
                         out["check_time"] = 0.0
                         return out
             result = self._check_uncached(theorem_code)
+            # Record a strike when the (retried) check still ended in a
+            # timeout/worker_error, so a second such occurrence short-circuits
+            # to undetermined instead of restarting another worker.
+            if result.get("worker_error"):
+                self._record_timeout_strike(theorem_code)
             elapsed = float(result.get("elapsed", 0.0) or 0.0)
             cacheable = result.get("success") or (
                 not result.get("worker_error")
@@ -1365,6 +1430,20 @@ class IsabelleServerPool:
             if "e" in box:
                 e = box["e"]
                 self._book_restart(worker, type(e).__name__)
+                # 2026-07-11 TimeoutError attribution: idle-measured probes and
+                # even pathological arithmetic finish in <1s, so a 30s PIDE
+                # TimeoutError is NOT the common case -- it is a heavy tail of
+                # specific theorems (amplified by CPU contention among ~24 polys
+                # on a 64-core quota). Log the goal head AND the tail (which
+                # carries `by (<tactic>)`) so the offending tactic/goal is
+                # identifiable from the run log. Rate-limited to 1-in-20.
+                if isinstance(e, TimeoutError):
+                    self._timeout_seen = getattr(self, "_timeout_seen", 0) + 1
+                    if self._timeout_seen % 20 == 1:
+                        _POOL_LOG.warning(
+                            "verify TimeoutError #%d w%d goal=%r tac=%r",
+                            self._timeout_seen, worker.wid,
+                            theorem_code[:220], theorem_code[-90:])
                 try:
                     worker.stop(graceful=False)  # fast kill + killpg reap
                 except Exception:

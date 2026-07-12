@@ -924,14 +924,20 @@ def compute_solution_reward_isabelle(
         "translation_attempts_steps": 0,
         "guard_failed_steps": 0,
         "premise_inconsistent_at": None,
+        "premise_undetermined_at": None,
         "format_failed_closed": False,
         "pattern": "",
-        # Per-symbol counts from the pattern (o>c>m>g>x priority). g is ALSO
+        # Per-symbol counts from the pattern (o>c>u>m>g>x priority). g is ALSO
         # kept split as neutral_steps/guard_failed_steps above; these are the
         # combined pattern-symbol tallies for the [Step Rewards] print parity.
         "o_steps": 0,
         "x_steps": 0,
         "c_steps": 0,
+        # u = premises-undetermined: consistency could not be decided (giant
+        # premise skipped, or timeout/worker_error/incomplete). Fail-closed:
+        # this step and every step depending on the same premise chain earn
+        # no positive reward. A timeout is NEVER read as "consistent".
+        "u_steps": 0,
         "g_steps": 0,
         "m_steps": 0,
         # t = translation-failed: the XML step existed but never reached
@@ -941,7 +947,7 @@ def compute_solution_reward_isabelle(
         # counted here as n_steps - len(pattern). Reward is 0 (fail-closed),
         # same as x, but kept SEPARATE so x_rate stays "model reasoning
         # failed" and t_rate is "translator/format could not formalize".
-        # Invariant restored: o + x + c + g + m + t == n_steps.
+        # Invariant restored: o + x + c + u + g + m + t == n_steps.
         "t_steps": 0,
         # Per-response wall profile (2026-07-11 review #6). judge_http_wall_s
         # is pure HTTP wall and does not overlap prover time;
@@ -999,6 +1005,8 @@ def compute_solution_reward_isabelle(
         debug["pattern"] = str(result.get("pattern") or "")
         debug["premise_inconsistent_at"] = result.get(
             "premise_inconsistent_at")
+        debug["premise_undetermined_at"] = result.get(
+            "premise_undetermined_at")
         # translate_a: single dict OR list of dicts (judge attempts)
         ta = result.get("translate_a")
         if isinstance(ta, list):
@@ -1021,13 +1029,14 @@ def compute_solution_reward_isabelle(
             if not s.get("guard_ok", True):
                 debug["guard_failed_steps"] += 1
         # Per-symbol counts straight from the pattern string, so every symbol
-        # in the [Step Rewards] print (o/x/c/g/m) has a matching metric with
-        # the SAME priority resolution as the printed pattern (o>c>m>g>x).
+        # in the [Step Rewards] print (o/x/c/u/g/m) has a matching metric with
+        # the SAME priority resolution as the printed pattern (o>c>u>m>g>x).
         # rewarded_steps == o_steps by construction; kept for back-compat.
         pat = debug["pattern"]
         debug["o_steps"] = pat.count("o")   # rewarded (earned reward 1)
         debug["x_steps"] = pat.count("x")   # unverified (reached prover, no proof)
         debug["c_steps"] = pat.count("c")   # premises inconsistent (contaminated)
+        debug["u_steps"] = pat.count("u")   # premises undetermined (fail-closed)
         debug["g_steps"] = pat.count("g")   # verified-but-neutral/guard-failed
         debug["m_steps"] = pat.count("m")   # verified-but-transcription-missing
         # t = translation-failed: XML steps that never reached the prover.

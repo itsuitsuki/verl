@@ -2275,6 +2275,7 @@ class RayPPOTrainer:
                     "isabelle_o_steps": "isabelle/o_steps",
                     "isabelle_x_steps": "isabelle/x_steps",
                     "isabelle_c_steps": "isabelle/c_steps",
+                    "isabelle_u_steps": "isabelle/u_steps",
                     "isabelle_g_steps": "isabelle/g_steps",
                     "isabelle_m_steps": "isabelle/m_steps",
                     "isabelle_t_steps": "isabelle/t_steps",
@@ -2328,12 +2329,15 @@ class RayPPOTrainer:
                         "isabelle_neutral_steps": "isabelle/neutral_rate",
                         "isabelle_guard_failed_steps": "isabelle/guard_failed_rate",
                         # Per-symbol rates (count / n_steps). By construction
-                        # o+x+c+g+m+t == n_steps, so these six rates sum to 1
-                        # (t = translation-failed steps that never reached the
-                        # prover, hence carry no pattern symbol).
+                        # o+x+c+u+g+m+t == n_steps, so these seven rates sum to
+                        # 1 (t = translation-failed steps that never reached the
+                        # prover, hence carry no pattern symbol; u = premises
+                        # undetermined, could not be salvaged by an independent
+                        # proof).
                         "isabelle_o_steps": "isabelle/o_rate",
                         "isabelle_x_steps": "isabelle/x_rate",
                         "isabelle_c_steps": "isabelle/c_rate",
+                        "isabelle_u_steps": "isabelle/u_rate",
                         "isabelle_g_steps": "isabelle/g_rate",
                         "isabelle_m_steps": "isabelle/m_rate",
                         "isabelle_t_steps": "isabelle/t_rate",

@@ -16,6 +16,38 @@ FALSE_TACTIC = "((auto) | (linarith) | (presburger))"
 NZ_TACTIC = ("((simp) | (auto simp: add_eq_0_iff) | (auto) | (linarith) "
              "| (presburger))")
 
+# Giant-number guard (2026-07-11). Goals/premises carrying a huge literal,
+# a >=1000 literal exponent, a power tower, or a large factorial make the
+# leading simp/presburger of ALTERNATION grind 60-75s while EVADING the 15s
+# cooperative headless watchdog (the work is a single uninterruptible native
+# GMP op) -- the Isabelle analog of the math-verify bignum spin. Measured:
+# simp on 2^100000 = 75s, presburger on 2^5000 = 52s; eval alone honors the
+# 15s watchdog on factorials (aborts) AND still proves legit moderate
+# computations (2^100 = <value> in 0.7s), whereas linarith on a factorial
+# also grinds 75s. So dangerous CLAIMS get eval alone; dangerous consistency
+# PROBES are treated as 'undetermined' (never 'consistent') without grinding.
+SAFE_DANGEROUS = "(eval)"
+
+_DANGER_RE = re.compile(
+    r"\^\s*\(?\s*-?\d{4,}"        # power with a >=1000 literal exponent
+    r"|\^\s*\([^)]*\^"           # power tower: ^( ... ^ ... )
+    r"|\bfact\s*\(?\s*\d{3,}"    # factorial of a >=100 literal
+    r"|\d{40,}"                   # a >=40-digit integer literal
+)
+
+
+def is_dangerous_isabelle(*terms) -> bool:
+    """True if any Isabelle term string could drive a tactic to materialize a
+    giant integer (long literal, >=1000 literal exponent, power tower, or
+    factorial of >=100). Such a term makes the leading simp/presburger of
+    ALTERNATION grind 60-75s past the 15s watchdog. Callers route dangerous
+    claims to SAFE_DANGEROUS (eval) and dangerous consistency probes to an
+    'undetermined' verdict."""
+    for t in terms:
+        if t and _DANGER_RE.search(t):
+            return True
+    return False
+
 RESERVED = {
     "True", "False", "if", "then", "else", "case", "of", "let", "in",
     "lambda", "SOME", "THE", "ALL", "EX", "Not", "conj", "disj",

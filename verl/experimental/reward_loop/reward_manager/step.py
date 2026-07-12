@@ -330,6 +330,7 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_o_steps": 0,
                         "isabelle_x_steps": 0,
                         "isabelle_c_steps": 0,
+                        "isabelle_u_steps": 0,
                         "isabelle_g_steps": 0,
                         "isabelle_m_steps": 0,
                         "isabelle_t_steps": 0,
@@ -555,6 +556,7 @@ class StepRewardManager(RewardManagerBase):
                 reward_extra_info["isabelle_o_steps"] = int(d.get("o_steps") or 0)
                 reward_extra_info["isabelle_x_steps"] = int(d.get("x_steps") or 0)
                 reward_extra_info["isabelle_c_steps"] = int(d.get("c_steps") or 0)
+                reward_extra_info["isabelle_u_steps"] = int(d.get("u_steps") or 0)
                 reward_extra_info["isabelle_g_steps"] = int(d.get("g_steps") or 0)
                 reward_extra_info["isabelle_m_steps"] = int(d.get("m_steps") or 0)
                 reward_extra_info["isabelle_t_steps"] = int(d.get("t_steps") or 0)

@@ -76,6 +76,15 @@ fi
 
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
 export WANDB_MODE=${WANDB_MODE:-online}
+# Isabelle per-worker poly-tree RSS cap (2026-07-11 measurement): a healthy
+# 2-poly worker tree sits at ~6GB steady-state (1 active ~6GB heap + 1 small
+# poly); the old 7GB default was only +0.8GB above that, so a legitimate
+# second concurrent proof poly (~+6GB) spiked the tree over cap and forced an
+# unnecessary rss_cap recycle -> restart churn + step-time long tails. Raise
+# to 12GB. Budget: 12 JVMs x 12GB = 144GB polys + ~106GB fixed = ~250GB, under
+# the ~285GB Ray-kill on the 300GB cgroup (~35GB margin). Do NOT set >=14 here:
+# 12 x 14 + 106 = 274GB leaves too little for transient JVM overlap.
+export ISABELLE_WORKER_RSS_CAP_GB=${ISABELLE_WORKER_RSS_CAP_GB:-12}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
@@ -180,7 +189,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     +algorithm.step_reward_type=fol \
     +algorithm.fol_task_type=math \
     +algorithm.fol_max_tries=1 \
-    +algorithm.verify_timeout=30 \
+    +algorithm.verify_timeout=60 \
     +algorithm.api_timeout=200 \
     algorithm.use_xml_steps=true \
     +algorithm.step_reward_weights='[0.8, 0.2]' \

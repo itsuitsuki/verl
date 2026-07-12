@@ -219,6 +219,9 @@ if __name__ == "__main__":
             # rec["prof"] is a wall-time profile (2026-07-11 review #6):
             # nondeterministic by nature, absent from older baselines.
             v.get("rec", {}).pop("prof", None)
+            # premise_undetermined_at is only present when a probe was
+            # undetermined (dangerous/timeout) -- absent in the clean baseline.
+            v.get("rec", {}).pop("premise_undetermined_at", None)
             # DOCUMENTED EXCEPTION (2026-07-10): claim cascades are skipped
             # for steps at/after the premise-inconsistency point -- those
             # steps are forced to rewarded=False / pattern 'c' regardless, so
