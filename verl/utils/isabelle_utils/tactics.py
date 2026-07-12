@@ -7,7 +7,23 @@ from fractions import Fraction
 
 FREE_NUMS = {Fraction(0), Fraction(1), Fraction(2)}
 
-ALTERNATION = ("((simp) | (simp add: field_simps) | (simp add: algebra_simps) "
+# Exponent/log/exp-law branches are PREPENDED (2026-07-12). Isabelle's `|`
+# combinator keeps the FIRST branch that makes progress, so a leading `simp`
+# that rewrites-but-does-not-close a symbolic-exponent goal (e.g.
+# `2 powr (m-n) = 3/4` from `2 powr m = 3`, `2 powr n = 4`) blocks every later
+# branch and the whole `by` fails -- a FALSE NEGATIVE on a valid step (the
+# generic tactics never invoke powr_diff). `fastforce` is close-or-fail (it
+# fails cleanly instead of leaving subgoals), so these branches never block
+# the generic ones below and, being first, are never blocked themselves. Each
+# was verified to close its representative lemma-case and to fail fast (<0.6s)
+# otherwise. This is sound (fastforce proves only true goals) and strictly
+# widens coverage -- it recovers reward for valid exponent/log steps.
+ALTERNATION = ("((fastforce simp: powr_diff) | (fastforce simp: powr_add) "
+               "| (fastforce simp: powr_mult) | (fastforce simp: powr_powr) "
+               "| (fastforce simp: ln_mult) | (fastforce simp: ln_div) "
+               "| (fastforce simp: log_mult) | (fastforce simp: log_divide) "
+               "| (fastforce simp: exp_add) | (fastforce simp: exp_diff) "
+               "| (simp) | (simp add: field_simps) | (simp add: algebra_simps) "
                "| (eval) | (linarith) | (presburger) | (auto) "
                "| (auto simp: field_simps) "
                "| (simp add: floor_eq_iff ceiling_eq_iff))")
