@@ -67,6 +67,8 @@ def default_compute_score(
         res = {"score": _mv, "acc": _equiv, "acc_mathverify": _mv}
     elif data_source in [
         "open-r1/Big-Math-RL-Verified-Processed",
+        "open-r1/DAPO-Math-17k-Processed",
+        "zwhe99/DeepMath-103K",
         "math-ai/aime24",
         "math-ai/aime25",
         "math-ai/amc23",

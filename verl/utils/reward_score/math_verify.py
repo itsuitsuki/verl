@@ -92,14 +92,33 @@ def _parse_quantified(s: str):
     import re
 
     s = s.strip()
+    # Some Big-Math GTs are uniformly double-escaped (`\\exists x \\in
+    # \\mathbb{R}`) from a data pipeline; de-escape so a correct `\exists`
+    # answer still grades against them.
+    if "\\\\exists" in s or "\\\\forall" in s:
+        s = s.replace("\\\\", "\\")
+    # Surface normalization so more real "命题的否定" answers reach the
+    # structural comparison (2026-07-13 verification over Big-Math's quantified
+    # GTs): a `\neg p:` label prefix, the `\gt`/`\lt`/`\geqslant`/`\leqslant`
+    # relation variants, and a `\text{ such that }` domain/body separator.
+    s = re.sub(r"^\\neg\s*[a-zA-Z]\s*:\s*", "", s)
+    s = s.replace("\\gt", ">").replace("\\lt", "<")
+    s = s.replace("\\geqslant", "\\geq").replace("\\leqslant", "\\leq")
+    s = re.sub(r"\\text\s*\{[^}]*such that[^}]*\}", ",", s)
+    s = re.sub(r",\s*,", ",", s)
+    # A bound variable: a letter with an optional subscript, optionally braced
+    # (`{x_0}`), as ONE or a comma-separated LIST (`\exists x, y \in R, xy=0`;
+    # `\exists x_1, x_2 \in R, ...`). Without the list the parser captured only
+    # the first variable and grading fell back to string compare.
+    _v = r"\{?[a-zA-Z](?:_\{?\w+\}?)?\}?"
     m = re.match(
-        r"^\\(exists|forall)\s*(?P<var>[a-zA-Z](?:_\{?\w+\}?)?)\s*(?P<rest>.*)$",
+        rf"^\\(exists|forall)\s*(?P<var>{_v}(?:\s*,\s*{_v})*)\s*(?P<rest>.*)$",
         s,
     )
     if not m:
         return None
     quant = m.group(1)
-    var = m.group("var").strip()
+    var = re.sub(r"[{}\s]", "", m.group("var"))   # "{x_0}, x_1" -> "x_0,x_1"
     rest = m.group("rest").strip()
     if rest.startswith("\\in"):
         split = _split_domain_body(rest[len("\\in"):].strip())
@@ -239,8 +258,28 @@ def _grade_bodies(gold_body: str, pred_body: str) -> bool:
         return False
 
 
+# Degree/temperature unit markers: ^{\circ}[C], ^\circ[C], °[C], ℃, ℉. The
+# `\}` only inside the braced alternative, so a bare ^\circ does NOT eat the
+# enclosing \boxed{...} closing brace.
+_DEGREE_RE = _re.compile(
+    r"\^\s*(?:\{\s*\\circ\s*\}|\\circ)\s*[CF]?|°\s*[CF]?|℃|℉")
+
+
+def _normalize_units(s: str) -> str:
+    """Drop degree/temperature unit markers so 40^\\circ, 40° and 40 grade
+    equal, and 7^\\circ C / 7℃ / 7 grade equal: the unit is a LABEL, not part
+    of the numeric value, but math-verify treats the LaTeX \\circ and the
+    Unicode ° as different symbols and fails an otherwise-correct answer.
+    (Compound degree-minute-second answers like 51°55'3'' are not covered.)"""
+    if not s:
+        return s
+    return _DEGREE_RE.sub("", s).replace("\\,", "")
+
+
 def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0) -> float:
     ret_score = 0.0
+    model_output = _normalize_units(model_output)
+    ground_truth = _normalize_units(ground_truth)
 
     # Wrap the ground truth in \boxed{} format for verification
     ground_truth_boxed = "\\boxed{" + ground_truth + "}"

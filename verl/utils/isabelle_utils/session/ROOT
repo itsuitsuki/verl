@@ -1,0 +1,8 @@
+session Math_Verify = "HOL-Analysis" +
+  options [quick_and_dirty]
+  sessions
+    "HOL-Number_Theory"
+    "HOL-Real_Asymp"
+    "HOL-Probability"
+  theories
+    Math_Verify_Base

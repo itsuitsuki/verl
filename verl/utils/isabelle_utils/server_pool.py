@@ -208,7 +208,7 @@ def _poly_cpu_state(pid):
 # on the full theorem text (which embeds the tactic string, so tactic changes
 # change the key). Bump ISABELLE_THEOREM_CACHE_VERSION if SESSION/THEORY_IMPORTS
 # change (those alter verdicts without changing theorem text). ---
-_THM_CACHE_VERSION = os.environ.get("ISABELLE_THEOREM_CACHE_VERSION", "v1")
+_THM_CACHE_VERSION = os.environ.get("ISABELLE_THEOREM_CACHE_VERSION", "v3")
 _THM_ENV_FPRINT: str | None = None
 
 
@@ -417,7 +417,13 @@ def _sweep_stale_pools(base_dir):
         except OSError:
             pass
 
-SESSION = "HOL-Number_Theory"
+# Math_Verify: HOL-Analysis + Real_Asymp + Number_Theory + Sum_of_Squares +
+# Approximation merged into one image (built under isabelle/math_verify, heaps
+# shared across nodes). Measured: ~19-88s worker startup, ~1GB poly RSS (the
+# Analysis image is mmap'd, so idle memory barely grows). Gives every step
+# integrals/derivatives/limits without a second pool. Bump the theorem cache
+# version when changing SESSION/THEORY_IMPORTS (done: v2).
+SESSION = "Math_Verify"
 SESSION_OPTIONS = [
     "quick_and_dirty=true",
     # headless PIDE consolidation polls at 2.0s by default, which puts a
@@ -430,12 +436,14 @@ SESSION_OPTIONS = [
     # CHECK_DEADLINE and forces a restart)
     "headless_watchdog_timeout=15",
 ]
+# Import the session base theory (Math_Verify_Base) rather than the individual
+# HOL theories: it re-exports all of them (Analysis/Real_Asymp/Sum_of_Squares/
+# Code_Target_Numeral/Number_Theory/Approximation) AND carries the precompiled
+# quadrant-trig meta-theorems (sin_from_tan_cneg, cos_neg_q2, div_sqrt_eq, ...),
+# so the step-reward engine's trig recipe can `by (rule ...)` them without
+# re-proving the ~12 lemmas inline in every theorem.
 THEORY_IMPORTS = """  imports
-    Complex_Main
-    "HOL-Library.Sum_of_Squares"
-    "HOL-Library.Code_Target_Numeral"
-    "HOL-Number_Theory.Number_Theory"
-    "HOL-Decision_Procs.Approximation"
+    "Math_Verify.Math_Verify_Base"
 """
 PURGE_EVERY = 10          # checks per worker between purge_theories all=true
 CHECK_DEADLINE = 60.0     # seconds per use_theories call before worker restart

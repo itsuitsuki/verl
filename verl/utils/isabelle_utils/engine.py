@@ -15,8 +15,14 @@ from pathlib import Path
 
 from verl.utils.isabelle_utils.server_pool import IsabelleServerPool
 from verl.utils.isabelle_utils.tactics import (
-    ALTERNATION, EVAL_RESCUE, FALSE_TACTIC, NZ_TACTIC, SAFE_DANGEROUS,
-    is_dangerous_isabelle, make_theorem, num_values, fixes_clause,
+    ALTERNATION, EVAL_RESCUE, FALSE_TACTIC, LINEAR_FALSE, LINEAR_CLAIM,
+    NZ_TACTIC, SAFE_DANGEROUS,
+    SOS_RESCUE, SMT_RESCUE, FIELD_RESCUE, ALGEBRA_RESCUE, TRIG_RESCUE,
+    has_division, has_trig, has_poly, has_powr, EXP_RESCUE,
+    DERIV_TACTIC, LIMIT_TACTIC, has_log, has_deriv,
+    has_limit, has_integral_goal, integral_recipe, is_dangerous_isabelle,
+    make_theorem, make_theorem_with_logs, make_theorem_unfold, num_values,
+    range_ints, fixes_clause,
     identifiers, anchor_ground_numerals, FREE_NUMS,
 )
 from verl.utils.isabelle_utils.judge import translate
@@ -24,12 +30,73 @@ from verl.utils.isabelle_utils.xml_utils import (
     block_stats, boxed_answer, corrupt_steps, parse_xml_steps,
 )
 from verl.utils.isabelle_utils.pyexpr import (
-    FUNCS, PyExprError, analyze, parse_expr, py_to_isabelle, transpile,
+    FUNCS, PyExprError, analyze, func_arities, is_nonlinear, is_linear_arith,
+    parse_expr, py_to_isabelle, transpile, _pv,
 )
 
 _PKG_DIR = Path(__file__).parent.resolve()
 FREE_NUMS = {Fraction(0), Fraction(1), Fraction(2)}
 UNIT_CLOSURE = (Fraction(60), Fraction(100), Fraction(1000))
+
+
+def _eval_values(node, vals):
+    """Values of every numeric sub-expression of a TRANSLATED proposition under
+    the pinned variable values `vals` -- side1 - side2 = 3, price * qty = 10,
+    (a + b) / 2 = ... -- for ANY operator, bounded to what the proposition
+    actually writes (not a blind allow-list). The faithfulness check on a
+    conclusion's numbers uses this so a number the proposition COMPUTES (in
+    variable form) counts as transcribed, whatever the operation."""
+    out = set()
+
+    def ev(n):
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            v = Fraction(n.value)
+            out.add(v)
+            return v
+        if isinstance(n, ast.Name):
+            return vals.get(n.id)
+        if isinstance(n, ast.BinOp):
+            a, b = ev(n.left), ev(n.right)
+            if a is None or b is None:
+                return None
+            op = type(n.op)
+            try:
+                if op is ast.Add:
+                    r = a + b
+                elif op is ast.Sub:
+                    r = a - b
+                elif op is ast.Mult:
+                    r = a * b
+                elif op is ast.Div:
+                    r = a / b if b else None
+                elif op is ast.FloorDiv:
+                    r = a // b if b else None
+                elif op is ast.Mod:
+                    r = a % b if b else None
+                elif op is ast.Pow:
+                    r = (a ** b if b.denominator == 1 and abs(b) <= 20
+                         else None)
+                else:
+                    r = None
+            except (ZeroDivisionError, ValueError, OverflowError):
+                r = None
+            if r is not None:
+                out.add(r)
+            return r
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+            v = ev(n.operand)
+            if v is not None:
+                out.add(-v)
+                return -v
+            return None
+        # Compare / BoolOp / Call: recurse so their operand sub-expressions are
+        # still evaluated (the comparison/boolean value itself is not numeric).
+        for ch in ast.iter_child_nodes(n):
+            ev(ch)
+        return None
+
+    ev(node)
+    return out
 
 PROMPTS_DIR = _PKG_DIR / "prompts"
 PROMPT_GIVENS_PY = (PROMPTS_DIR / "translate_givens.txt").read_text(
@@ -222,12 +289,18 @@ def pin_from(src: str, vals: dict):
                 vals[c.left.id] = v
 
 
-def transcription_missing_py(src, con_text, var_vals, premise_text,
-                             context_srcs):
-    """AST version of the anti-repair check (v4.3 semantics)."""
+def transcription_missing_py(judge_prop, model_conclusion, var_vals,
+                             premise_text, context_srcs):
+    """Anti-repair check: every number the MODEL's conclusion states must be
+    PRESENT in the JUDGE's translated proposition, so the judge cannot silently
+    fix a wrong number (write == 41 for a stated 40) into a passing check. A
+    number counts as present if the proposition CONTAINS it literally OR
+    COMPUTES it -- side1 - side2 = 3, price * qty = 10 (see _eval_values) -- so
+    the variable form is accepted for any operator. Returns the model's numbers
+    that the proposition neither writes nor computes."""
     from verl.utils.isabelle_utils.pyexpr import _const_eval, analyze as _an
     try:
-        node = parse_expr(src)
+        node = parse_expr(judge_prop)
     except PyExprError:
         return []
     ctx_dumps = set()
@@ -236,7 +309,7 @@ def transcription_missing_py(src, con_text, var_vals, premise_text,
             ctx_dumps.add(ast.dump(parse_expr(c_src)))
         except PyExprError:
             pass
-    pn, idents = set(), set()
+    present_nums, idents = set(), set()
     for c in (node.values if isinstance(node, ast.BoolOp) else [node]):
         if is_vacuous_node(c) or ast.dump(c) in ctx_dumps:
             continue
@@ -245,10 +318,20 @@ def transcription_missing_py(src, con_text, var_vals, premise_text,
         except PyExprError:
             continue
         idents |= ids
-        pn |= cs
-    pn |= {var_vals[i] for i in idents if i in var_vals}
+        present_nums |= cs
+    present_nums |= {var_vals[i] for i in idents if i in var_vals}
+    # A variable's subscript index counts as present: the conclusion says "the
+    # third / sixth term" (3, 6) and the proposition names them a3 / a_6 -- the
+    # digit lives in the variable name, which num_values does not see.
+    for i in idents:
+        present_nums |= {Fraction(m) for m in re.findall(r"\d+", i)}
+    # Evaluate what the proposition actually COMPUTES (side1 - side2 = 3,
+    # price * qty = 10): a conclusion result written in variable form still
+    # counts as transcribed, for any operator -- general, and bounded to what
+    # the proposition writes.
+    present_nums |= _eval_values(node, var_vals)
     prem_nums = num_values(premise_text, words=True)
-    con_text = re.sub(r"_\{?\d+\}?", "", con_text)
+    con_text = re.sub(r"_\{?\d+\}?", "", model_conclusion)
     out = []
     for v in num_values(con_text, words=True):
         if v in FREE_NUMS or v in prem_nums:
@@ -257,8 +340,14 @@ def transcription_missing_py(src, con_text, var_vals, premise_text,
         for c in UNIT_CLOSURE:
             forms.add(v * c)
             forms.add(v / c)
-        if not (forms & pn):
-            out.append(str(v))
+        if forms & present_nums:
+            continue
+        # An ordinal ("the third / sixth term") is read by num_values as the
+        # fraction 1/3, 1/6 -- a position, not a value: if its reciprocal (the
+        # position) is present as a subscript (a3, a6), it is transcribed.
+        if v.numerator == 1 and Fraction(v.denominator) in present_nums:
+            continue
+        out.append(str(v))
     return out
 
 
@@ -334,6 +423,201 @@ def nz_divisors(src: str, var_types: dict, carrier: str):
                 except PyExprError:
                     pass
     return out
+
+
+# ---------- quadrant-trig recipe (2026-07-14) ----------
+# "angle a in a quadrant, tan a = T, find sin a / cos a". The value-independent
+# meta-theorems (sin_from_tan_c{pos,neg}, cos_from_tan_c{pos,neg}, the sign
+# lemmas cos_{pos,neg}_q*, and div_sqrt_eq) are PRECOMPILED into the Math_Verify
+# session (Math_Verify_Base.thy). This recipe detects the pattern and emits a
+# short self-contained theorem that instantiates them, so the answer -- rational
+# (3/5) or irrational (2/sqrt 5) -- closes by simp evaluation. None if no match.
+_TRIG_DISCH = ("(rule div_sqrt_eq; simp add: power2_eq_square real_sqrt_pow2 "
+               "field_simps)")
+# inclusive-quadrant table over multiples of pi: (lo, hi) -> (cos-sign, lemma)
+_TRIG_QUAD = [((0.0, 0.5), ("pos", "cos_pos_q1")),
+             ((0.5, 1.0), ("neg", "cos_neg_q2")),
+             ((1.0, 1.5), ("neg", "cos_neg_q3")),
+             ((1.5, 2.0), ("pos", "cos_pos_q4"))]
+
+
+def _pi_mult(node):
+    """A quadrant bound as a multiple of pi (pi->1, so pi/2->0.5); None if the
+    expression is not a clean rational multiple of pi (or a bare 0)."""
+    def ev(n):
+        if isinstance(n, ast.Constant):
+            return float(n.value) if isinstance(n.value, (int, float)) else None
+        if isinstance(n, ast.Name):
+            return 1.0 if n.id == "pi" else None
+        if isinstance(n, ast.BinOp):
+            a, b = ev(n.left), ev(n.right)
+            if a is None or b is None:
+                return None
+            if isinstance(n.op, ast.Mult):
+                return a * b
+            if isinstance(n.op, ast.Div):
+                return a / b if b else None
+            if isinstance(n.op, ast.Add):
+                return a + b
+            if isinstance(n.op, ast.Sub):
+                return a - b
+            return None
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+            v = ev(n.operand)
+            return None if v is None else -v
+        return None
+    return ev(node)
+
+
+def _trig_vfloat(node):
+    """Numeric value of the claimed trig answer (pi->pi, sqrt/abs supported);
+    None if not a closed numeric expression. Used only to pick the sign branch."""
+    import math as _m
+    def ev(n):
+        if isinstance(n, ast.Constant):
+            return float(n.value) if isinstance(n.value, (int, float)) else None
+        if isinstance(n, ast.Name):
+            return _m.pi if n.id == "pi" else None
+        if isinstance(n, ast.BinOp):
+            a, b = ev(n.left), ev(n.right)
+            if a is None or b is None:
+                return None
+            op = type(n.op)
+            if op is ast.Mult:
+                return a * b
+            if op is ast.Div:
+                return a / b if b else None
+            if op is ast.Add:
+                return a + b
+            if op is ast.Sub:
+                return a - b
+            if op is ast.Pow:
+                return a ** b
+            return None
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+            v = ev(n.operand)
+            return None if v is None else -v
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            args = [ev(a) for a in n.args]
+            if any(x is None for x in args):
+                return None
+            f = {"sqrt": _m.sqrt, "abs": abs}.get(n.func.id)
+            return f(*args) if f else None
+        return None
+    try:
+        return ev(node)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def trig_quadrant_theorem(claim_src, prem_srcs, vt):
+    """A self-contained Isabelle theorem for `sin(a)==V` / `cos(a)==V` given a
+    `tan(a)==T` premise and quadrant bounds on `a`, via the precompiled trig
+    meta-theorems; None if the pattern does not apply."""
+    try:
+        node = parse_expr(claim_src)
+    except PyExprError:
+        return None
+    if not (isinstance(node, ast.Compare) and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Eq)):
+        return None
+    lhs, rhs = node.left, node.comparators[0]
+    if not (isinstance(lhs, ast.Call) and isinstance(lhs.func, ast.Name)
+            and lhs.func.id in ("sin", "cos") and len(lhs.args) == 1
+            and isinstance(lhs.args[0], ast.Name)):
+        return None
+    fn, ang = lhs.func.id, lhs.args[0].id
+    vf = _trig_vfloat(rhs)
+    if vf is None:
+        return None
+    tan_src = None
+    lo = hi = None
+    assm_srcs = []
+    for ps in prem_srcs:
+        try:
+            pn = parse_expr(ps)
+        except PyExprError:
+            continue
+        used = False
+        if (isinstance(pn, ast.Compare) and len(pn.ops) == 1
+                and isinstance(pn.ops[0], ast.Eq)):
+            l, r = pn.left, pn.comparators[0]
+            if (isinstance(l, ast.Call) and isinstance(l.func, ast.Name)
+                    and l.func.id == "tan" and len(l.args) == 1
+                    and isinstance(l.args[0], ast.Name) and l.args[0].id == ang):
+                tan_src = r
+                assm_srcs.append(ps)
+                used = True
+        if (isinstance(pn, ast.Compare)
+                and all(isinstance(o, (ast.Lt, ast.LtE)) for o in pn.ops)):
+            terms = [pn.left] + list(pn.comparators)
+            for i in range(len(pn.ops)):
+                left, right = terms[i], terms[i + 1]
+                if isinstance(right, ast.Name) and right.id == ang:
+                    m = _pi_mult(left)
+                    if m is not None:
+                        lo = m if lo is None else max(lo, m)
+                        used = True
+                if isinstance(left, ast.Name) and left.id == ang:
+                    m = _pi_mult(right)
+                    if m is not None:
+                        hi = m if hi is None else min(hi, m)
+                        used = True
+            if used and ps not in assm_srcs:
+                assm_srcs.append(ps)
+    if tan_src is None or lo is None or hi is None:
+        return None
+    quad = None
+    for (a, b), info in _TRIG_QUAD:
+        if a - 1e-6 <= lo and hi <= b + 1e-6:
+            quad = info
+            break
+    if quad is None:
+        return None
+    csign, signlem = quad
+    try:
+        tt = transpile(tan_src, vt, "real")
+        goal_t = transpile(node, vt, "real")
+    except PyExprError:
+        return None
+    dd = f"(({tt})^2 + 1)"
+    if fn == "sin":
+        meta = "sin_from_tan_cneg" if csign == "neg" else "sin_from_tan_cpos"
+        num = f"- ({tt})" if csign == "neg" else f"({tt})"
+    else:
+        meta = "cos_from_tan_cneg" if csign == "neg" else "cos_from_tan_cpos"
+        num = "- 1" if csign == "neg" else "1"
+    pang = _pv(ang)
+    cs_op = "<" if csign == "neg" else ">"
+    ids = set(identifiers(goal_t))
+    assm_terms = []
+    for i, ps in enumerate(assm_srcs):
+        try:
+            t = transpile(parse_expr(ps), vt, "real")
+        except PyExprError:
+            return None
+        assm_terms.append((f"h{i}", t))
+        ids |= identifiers(t)
+    tan_ref = next((n for n, t in assm_terms if "tan" in t), None)
+    if tan_ref is None:
+        return None
+    fixhead = (f"  fixes {' '.join(f'{i}::real' for i in sorted(ids))}\n"
+               if ids else "")
+    ass = ("  assumes "
+           + "\n      and ".join(f'{n}: "{t}"' for n, t in assm_terms) + "\n")
+    vt_rhs = transpile(rhs, vt, "real")
+    if vf >= 0:
+        match = (f'  have "{num} / sqrt {dd} = ({vt_rhs})" by {_TRIG_DISCH}\n'
+                 f'  thus ?thesis using m by simp\n')
+    else:
+        match = (f'  have "- ({num}) / sqrt {dd} = - ({vt_rhs})" by {_TRIG_DISCH}\n'
+                 f'  thus ?thesis using m by simp\n')
+    return (f'theorem chk:\n{fixhead}{ass}  shows "{goal_t}"\nproof -\n'
+            f'  have cs: "cos {pang} {cs_op} 0" using assms'
+            f' by (auto intro: {signlem})\n'
+            f'  have m: "{fn} {pang} = {num} / sqrt {dd}"'
+            f' by (rule {meta}[OF cs {tan_ref}])\n'
+            f'{match}qed')
 
 
 # ---------- per-response pipeline ----------
@@ -414,17 +698,28 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
     rec["n_steps"] = len(steps_xml)
 
     base_nums = num_values(problem, words=True)
-    problem_nums = set(base_nums) | FREE_NUMS
-    givens_window = set(problem_nums)
-    givens_window |= {Fraction(c) for c in
-                      (3, 5, 7, 10, 12, 24, 25, 50, 60, 90, 100, 180, 360,
-                       1000)}
-    givens_window |= {Fraction(10) ** k for k in range(4, 10)}
+    # Subscript indices in a_n notation (a_1, a_4, a_{12}) are problem numbers:
+    # num_values skips them (the leading `_` is a word char), yet an arithmetic/
+    # geometric sequence's defining relation a_k == a_1 + (k-1)*d has coefficients
+    # k-1 drawn straight from those indices, so they must be admitted.
+    base_nums |= {Fraction(m) for m in re.findall(r"_\{?(\d+)", problem)}
+    # `allowed_given_nums` (was givens_window): the numbers a GIVEN may use --
+    # the faithfulness allow-list that catches the JUDGE inventing numbers not
+    # in the problem. A range phrase ("integers 1 through 9") only yields its
+    # endpoints via num_values, so range_ints adds the interior integers (4/6/8)
+    # -- else they read as invented. Flows into given_nums (hence the step-level
+    # allow-lists too), so range problems translate in givens AND steps.
+    problem_nums = set(base_nums) | FREE_NUMS | range_ints(problem)
+    allowed_given_nums = set(problem_nums)
+    allowed_given_nums |= {Fraction(c) for c in
+                           (3, 5, 7, 10, 12, 24, 25, 50, 60, 90, 100, 180, 360,
+                            1000)}
+    allowed_given_nums |= {Fraction(10) ** k for k in range(4, 10)}
     for v in base_nums:
         for c in (Fraction(60), Fraction(100), Fraction(1000)):
-            givens_window.add(v * c)
+            allowed_given_nums.add(v * c)
             if v != 0:
-                givens_window.add(v / c)
+                allowed_given_nums.add(v / c)
 
     def validate_givens(parsed):
         fixes, givens = parsed
@@ -437,7 +732,7 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             except PyExprError as e:
                 errs.append(f"GIVEN '{g[:60]}': {e}")
                 continue
-            bad = [str(v) for v in consts if v not in givens_window]
+            bad = [str(v) for v in consts if v not in allowed_given_nums]
             if bad:
                 errs.append(f"GIVEN uses numbers not in the problem "
                             f"statement: {sorted(set(bad))}. Only "
@@ -628,14 +923,39 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                  for k in range(len(steps_xml))]
 
     vt_all = dict(vt)
+    # A step may introduce a FRESH intermediate name not declared in the givens
+    # VARS (current_tiles, subtotal). Its default type must not clash with the
+    # declared ones: in a purely INTEGER problem (counting -- tiles, apples),
+    # defaulting a new var to real makes `red::int == current_tiles::real -
+    # blue::int` a TYPE ERROR (Isabelle has no int<->real coercion) and the step
+    # fails to typecheck (2026-07-15: pool tiles `ox`). Default new names to int
+    # when EVERY declared var is int, else real (real safely holds a stray
+    # integer literal, and a genuinely fractional intermediate is normally
+    # declared real by the judge so it is not defaulted here).
+    _new_default = "int" if (vt and all(t == "int" for t in vt.values())) \
+        else "real"
     for p in props_src + [q for ps in prem_srcs for q in ps]:
         try:
             _, ids, _, _ = py_to_isabelle(p, vt_all)
             for i in ids:
-                vt_all.setdefault(i, "real")
+                vt_all.setdefault(i, _new_default)
         except PyExprError:
             pass
-    fixes_all = list(vt_all.items())
+    # Uninterpreted functions (f/g/h applied) are declared as function-typed
+    # fixes `f :: "real => ... => real"`, NOT scalars -- collected from every
+    # given/prop/premise. _canonical_fixes() then picks them up by name like
+    # any other fix. (analyze() already keeps these names out of vt_all.)
+    func_ar = {}
+    for p in givens_src + props_src + [q for ps in prem_srcs for q in ps]:
+        try:
+            func_ar.update(func_arities(parse_expr(p)))
+        except PyExprError:
+            pass
+    # Fix names carry the same pv_ prefix as the transpiled terms (see
+    # pyexpr._pv) so free variables never collide with an Isabelle constant.
+    func_fixes = [(_pv(name), '"' + " => ".join(["real"] * (ar + 1)) + '"')
+                  for name, ar in sorted(func_ar.items())]
+    fixes_all = [(_pv(k), v) for k, v in vt_all.items()] + func_fixes
     terms, consts_per = [], []
     for p in props_src:
         term, ids, consts, carrier = _transpile_conjunctive(p, vt_all)
@@ -652,6 +972,19 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         except PyExprError:
             pass
     g_prem = [(f"g{i}", t) for i, t in enumerate(given_terms)]
+    # A claim that exactly restates a GIVEN is trivially satisfied: the given is
+    # an always-true assumption, so the claim holds independent of the step's
+    # premise-chain consistency (safe mode too, where g_prem is withheld from
+    # the proof). Without this, a step that merely carries a given forward --
+    # "the LCM of 1 through 9 is the answer", when the givens define
+    # answer == lcm(1,...,9) -- is an unprovable free-variable claim, mislabeled
+    # x and denied reward for a valid restatement.
+    given_dumps = set()
+    for _g in givens_src:
+        try:
+            given_dumps.add(ast.dump(parse_expr(_g)))
+        except PyExprError:
+            pass
 
     if outdir is not None:
         (outdir / f"{rid:03d}_v5.json").write_text(json.dumps(
@@ -680,6 +1013,32 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
     for g in givens_src:
         pin_from(g, var_vals)
     concl_nums = set()
+    # sos rescue is gated on nonlinearity; a nonlinear GIVEN (e.g. a geometric
+    # relation a_3 = a_1*r**2) is admitted to every step, so compute it once
+    # here and OR it into each step's flag below.
+    givens_nonlin = False
+    for _g in givens_src:
+        try:
+            if is_nonlinear(parse_expr(_g)):
+                givens_nonlin = True
+                break
+        except PyExprError:
+            pass
+    # Linear-probe gate (2026-07-14): the consistency probe may use the fast,
+    # complete `(linarith|presburger)` (LINEAR_FALSE) instead of the heavy
+    # ALTERNATION only when EVERY accumulated premise is affine with constant
+    # coefficients. Precompute per-source linearity here; the givens are
+    # admitted to every step, and each step also carries all EARLIER steps'
+    # conclusions, so a step's premise chain is linear iff the givens, all
+    # prior props, and this step's own admitted premises/definitions are each
+    # linear (a parse failure -> treated as non-linear, i.e. keep ALTERNATION).
+    def _src_linear(src):
+        try:
+            return is_linear_arith(parse_expr(src))
+        except PyExprError:
+            return False
+    givens_linear = all(_src_linear(g) for g in givens_src)
+    props_linear = [_src_linear(p) for p in props_src]
     prepped = []
     for k, (s, (term, carrier)) in enumerate(zip(steps_xml, terms)):
         entry = {"step": k, "neutral": False}
@@ -687,13 +1046,19 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             props_src[k], s["conclusion"], var_vals,
             " ".join(s["premises"]), list(givens_src) + props_src[:k])
         pin_from(props_src[k], var_vals)
-        win = (num_values(s["block_text"], words=True) | given_nums)
-        for v in set(num_values(s["block_text"], words=True)):
-            win.add(v * 100)
+        # `allowed_step_nums` (was win): the numbers this step's translated
+        # proposition may use -- the problem's given_nums PLUS the numbers the
+        # MODEL itself wrote in this step's text (so a number the model states,
+        # e.g. cos(pi/4), is the model's, not a judge invention). Anything else
+        # is the JUDGE inventing a number -> guard_invented.
+        step_text_nums = num_values(s["block_text"], words=True)
+        allowed_step_nums = step_text_nums | given_nums
+        for v in set(step_text_nums):
+            allowed_step_nums.add(v * 100)
             if v != 0:
-                win.add(v / 100)
+                allowed_step_nums.add(v / 100)
         entry["guard_invented"] = [str(v) for v in consts_per[k]
-                                   if v not in win]
+                                   if v not in allowed_step_nums]
         entry["guard_ok"] = not entry["guard_invented"]
 
         # (c) definition vs claim split over the prop's top-level conjuncts:
@@ -701,7 +1066,8 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         # `answer`, never a bare constant) is a conservative extension - it
         # becomes an assumption instead of a proof obligation
         prop_conj = conjuncts(props_src[k])
-        defs_t, claims_t, claims_nodes = [], [], []
+        defs_t, claims_t, claims_nodes, claims_given = [], [], [], []
+        defs_linear = True   # all definition-conjuncts affine (linear probe gate)
 
 
         for c in prop_conj:
@@ -720,17 +1086,27 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             ccar = _node_carrier(c, vt_all, "real")
             if is_def:
                 defs_t.append(transpile(c, vt_all, ccar))
+                if not is_linear_arith(c):
+                    defs_linear = False
             else:
                 claims_t.append(transpile(c, vt_all, ccar))
                 claims_nodes.append(c)
+                claims_given.append(ast.dump(c) in given_dumps)
         entry["n_definitions"] = len(defs_t)
 
         # (b) the step's own premises, admitted only with provenance: their
-        # numbers must come from the problem/givens or earlier conclusions,
-        # and copying this step's conclusion is rejected (Z3-path parity)
+        # numbers must trace to the problem/givens, earlier conclusions, OR the
+        # MODEL's own text for this step -- a number the model wrote (cos(pi/4)
+        # = sqrt2/2, "an odd integer between 3 and 7") is the model's citation,
+        # not a judge invention, so admit it; a false cited premise is caught by
+        # the consistency probe, not this number check. Copying this step's own
+        # conclusion is still rejected (below).
         admitted = []
+        prem_nonlin = False
+        admitted_linear = True   # all admitted premises affine (linear probe gate)
         prop_dumps = {ast.dump(c) for c in prop_conj}
-        prem_window = given_nums | concl_nums | FREE_NUMS
+        allowed_prem_nums = (given_nums | concl_nums | FREE_NUMS
+                             | step_text_nums)
         for psrc in prem_srcs[k]:
             try:
                 from verl.utils.isabelle_utils.pyexpr import analyze as _an
@@ -740,12 +1116,16 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                 continue
             if any(ast.dump(c) in prop_dumps for c in conjuncts(psrc)):
                 continue
-            if not all(v in prem_window for v in pcs):
+            if not all(v in allowed_prem_nums for v in pcs):
                 continue
             try:
                 admitted.append(py_to_isabelle(psrc, vt_all)[0])
             except PyExprError:
                 continue
+            if is_nonlinear(node):
+                prem_nonlin = True
+            if not is_linear_arith(node):
+                admitted_linear = False
         entry["n_admitted_premises"] = len(admitted)
 
         prem = g_prem + [(f"s{j}", terms[j][0]) for j in range(k)]
@@ -761,10 +1141,52 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
                     claim_src = props_src[k]
                 nz_list.extend(nz_divisors(
                     claim_src, vt_all, claim_carrier))
+        # Rational equations put the UNKNOWN in a premise denominator (work-rate:
+        # "1/comb = 1/pipe - 1/leak", solve pipe), not the claim. Collect premise
+        # divisors too so pipe != 0 gets proved and admitted for FIELD_RESCUE.
+        for psrc in prem_srcs[k]:
+            try:
+                pcar = _node_carrier(parse_expr(psrc), vt_all, "real")
+                nz_list.extend(nz_divisors(psrc, vt_all, pcar))
+            except PyExprError:
+                pass
+        nz_list = list(dict.fromkeys(nz_list))
+        step_nonlin = (givens_nonlin or prem_nonlin
+                       or any(is_nonlinear(c) for c in claims_nodes))
+        # Linear-probe gate: this step's premise chain (givens + ALL earlier
+        # conclusions + this step's admitted premises + definitions) is affine,
+        # so the consistency probe can use the fast complete `(linarith|
+        # presburger)` instead of grinding ALTERNATION to the watchdog.
+        linear_prem = (givens_linear and all(props_linear[:k])
+                       and admitted_linear and defs_linear)
+        # linear_step also requires every CLAIM to be affine: then
+        # (linarith|presburger) is a COMPLETE decision procedure for the
+        # with-premise proof too (proves it fast or the goal is genuinely not
+        # entailed), so the claim cascade skips the ALTERNATION grind. Measured:
+        # a 10-relation sequence goal a_3+a_6+a_9=32 took ALTERNATION 17.6s ->
+        # watchdog -> x, but linarith 0.96s -> proved.
+        linear_step = (linear_prem and bool(claims_nodes)
+                       and all(is_linear_arith(c) for c in claims_nodes))
+        # Quadrant-trig: a single-claim `sin(a)/cos(a) == V` step with a
+        # `tan(a) == T` premise and quadrant bounds gets a self-contained
+        # theorem built from the precompiled meta-theorems (bounds live in the
+        # givens, so feed those in too). None unless the pattern matches.
+        trig_thm = None
+        if len(claims_nodes) == 1:
+            try:
+                _csrc = ast.unparse(claims_nodes[0])
+            except AttributeError:
+                _csrc = None
+            if _csrc and ("sin" in _csrc or "cos" in _csrc):
+                trig_thm = trig_quadrant_theorem(
+                    _csrc, list(prem_srcs[k]) + list(givens_src), vt_all)
         rec["steps"].append(entry)
         prepped.append({"k": k, "entry": entry, "prem": prem,
                         "claims_t": claims_t, "claims_nodes": claims_nodes,
-                        "nz_list": nz_list, "carrier": carrier})
+                        "claims_given": claims_given, "trig_thm": trig_thm,
+                        "nz_list": nz_list, "carrier": carrier,
+                        "nonlinear": step_nonlin, "linear_prem": linear_prem,
+                        "linear_step": linear_step})
         # cross-step state advances on TRANSLATIONS, exactly as before
         try:
             known |= py_to_isabelle(props_src[k], vt_all)[1]
@@ -783,13 +1205,13 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         toks = set(re.findall(r"[A-Za-z_][A-Za-z0-9_']*", goal))
         return sorted((n, t) for (n, t) in fixes_all if n in toks)
 
-    def _probe_step_raw(p):
+    def _probe_step_raw(p, tac=ALTERNATION):
         """Premise-consistency probe (goal False from the accumulated axioms).
         Returns the RAW check result so the caller can classify it ternary
         (inconsistent / consistent / undetermined). Used only by the mock /
-        legacy non-submit path; the submit path builds the theorem inline."""
-        return _check(make_theorem(fixes_all, p["prem"], "False",
-                                   ALTERNATION))
+        legacy non-submit path; the submit path builds the theorem inline. `tac`
+        is LINEAR_FALSE for an affine premise chain, else ALTERNATION."""
+        return _check(make_theorem(fixes_all, p["prem"], "False", tac))
 
     def _cascade_step(p):
         prem, claims_t = p["prem"], p["claims_t"]
@@ -812,20 +1234,76 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
         # linarith/presburger/auto close any goal ex-falso from inconsistent
         # premises (2026-07-11 review: HIGH ex-falso reward leak).
         safe = bool(p.get("safe_mode"))
+        # sos rescue is gated on nonlinearity, computed at prep time over the
+        # claims AND the admitted premises AND the givens -- the nonlinear
+        # fact usually lives in a premise (e.g. a_3 = a_1*r**2), not the
+        # (linear) conclusion a_2 = 6. sos grinds ~15s on goals it cannot
+        # close and proves any goal ex-falso from inconsistent premises, so
+        # it is also gated on non-danger (here) and non-safe (below).
+        nonlin = (not danger) and bool(p.get("nonlinear"))
         nz_prem = []
         if not danger and not safe:
             for d in p["nz_list"]:
-                rnz = _check(make_theorem(fixes_all, prem,
-                                          f"{d} \\<noteq> 0", ALTERNATION))
-                if rnz["success"]:
-                    nz_prem.append((f"nz{len(nz_prem)}", f"{d} \\<noteq> 0"))
+                # ALTERNATION proves most d != 0; a denominator that is itself
+                # only pinned through a rational premise (pipe, from
+                # 1/comb = 1/pipe - 1/leak) needs field_simps, so fall back to
+                # FIELD_RESCUE.
+                for nztac in (ALTERNATION, FIELD_RESCUE):
+                    if _check(make_theorem(fixes_all, prem,
+                                           f"{d} \\<noteq> 0", nztac))["success"]:
+                        nz_prem.append((f"nz{len(nz_prem)}",
+                                        f"{d} \\<noteq> 0"))
+                        break
         full_prem = prem + nz_prem
         tac = SAFE_DANGEROUS if danger else ALTERNATION
 
         def _verify_single(g):
+            # Quadrant-trig recipe: a self-contained theorem (sin/cos from
+            # tan + quadrant, via the precompiled meta-theorems). Sound in safe
+            # mode too -- it derives the true value from the stated premises via
+            # real theorems, never ex-falso.
+            tthm = p.get("trig_thm")
+            if tthm is not None and _check(tthm)["success"]:
+                return True
             if not safe:
-                r = _check(make_theorem(fixes_all, full_prem, g, tac))
-                if r["success"]:
+                if p.get("linear_step"):
+                    # Affine premises + affine goal: prove with (argo|smt)
+                    # (LINEAR_CLAIM). This REPLACES the with-premise ALTERNATION,
+                    # whose leading fastforce/powr branches grind a many-relation
+                    # linear goal to the 15s watchdog. On the ACTUAL engine
+                    # premise set (givens attached to every step -> ~19 premises)
+                    # linarith/force/auto all hit the watchdog (Fourier-Motzkin /
+                    # search blow-up); argo (built-in, simplex) closes both the
+                    # difference step and the 11-variable value step in ~0.4s and
+                    # fails fast on an unentailed goal (2026-07-14). The premise-
+                    # free canonical / eval rescues below still run (a ground
+                    # tautology can close without the premises).
+                    if _check(make_theorem(fixes_all, full_prem, g,
+                                           LINEAR_CLAIM))["success"]:
+                        return True
+                else:
+                    r = _check(make_theorem(fixes_all, full_prem, g, tac))
+                    if r["success"]:
+                        return True
+            else:
+                # SAFE MODE (2026-07-15 rework). Consistency is UNKNOWN because
+                # the `|- False` probe was UNDETERMINED -- and it is undetermined
+                # in exactly the cases where the SAME tactic (ALTERNATION, sos/
+                # smt are gated OFF in safe mode) could not derive `False` within
+                # the watchdog. Measured invariant: an inconsistency ALTERNATION
+                # CAN exploit is found FAST for the `False` goal too -> the probe
+                # SUCCEEDS -> the step is hard-cut `c`, never safe mode (verified:
+                # a1=9,k=40,a1=k/b1^2 -> probe proves False in 0.4s -> hard cut).
+                # So a with-premise proof reaching safe mode cannot route through
+                # ex-falso: ex-falso needs `False`, which this tactic provably
+                # cannot reach here (else no safe mode). A completing success is
+                # therefore a DIRECT derivation (any contradiction found within
+                # the watchdog would have made the probe succeed) -> sound to
+                # reward. Recovers inverse/direct variation (a = k/b^2: a2 = 4)
+                # that the old premise-free-only safe mode zeroed to `u`, without
+                # the perturbed/negation probe (which itself grinds 15s on the
+                # nonlinear premises whatever the goal).
+                if _check(make_theorem(fixes_all, full_prem, g, tac))["success"]:
                     return True
             r0 = _check(make_theorem(_canonical_fixes(g), [], g, tac))
             if r0["success"]:
@@ -837,12 +1315,95 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
             # EVAL_RESCUE already imported at module level
             r_eval = _check(make_theorem(_canonical_fixes(g), [], g,
                                          EVAL_RESCUE))
-            return r_eval["success"]
+            if r_eval["success"]:
+                return True
+            # Rational-equation rescue: an unknown in a denominator (work-rate /
+            # mixture: 1/comb = 1/pipe - 1/leak => pipe = 12). The denominators
+            # were proved nonzero into nz_prem above; field_simps then solves.
+            # ALTERNATION cannot (its field_simps sits behind `eval`, which
+            # aborts on the free-variable goal). Uses the premises, so non-safe.
+            if not safe and has_division(g, *[t for _, t in full_prem]):
+                if _check(make_theorem(fixes_all, full_prem, g,
+                                       FIELD_RESCUE))["success"]:
+                    return True
+            # Trig-identity rescue: tan(pi - a) = -tan(a), sin(pi/2 - a) = cos a,
+            # angle-sum/-difference -- expand tan to sin/cos and apply the laws.
+            if not safe and has_trig(g):
+                if _check(make_theorem(fixes_all, full_prem, g,
+                                       TRIG_RESCUE))["success"]:
+                    return True
+            # Polynomial-identity rescue: a factoring / expansion identity
+            # (58*x^5 - 203*x^11 = 29*x^5*(2 - 7*x^6)) that algebra_simps
+            # expands but ALTERNATION cannot reach (its fastforce/powr branches
+            # grind on the polynomial first).
+            if not safe and has_poly(g):
+                if _check(make_theorem(fixes_all, full_prem, g,
+                                       ALGEBRA_RESCUE))["success"]:
+                    return True
+            # Definitional-eval rescue: unfold the definitional givens
+            # (answer = gcd 32 48) INTO the goal, then eval the now-ground
+            # result (answer = 16). ALTERNATION's eval sits on the
+            # un-substituted goal, where the free `answer` blocks evaluation.
+            if not safe:
+                uthm = make_theorem_unfold(fixes_all, full_prem, g)
+                if uthm is not None and _check(uthm)["success"]:
+                    return True
+            # Integer rescue: presburger/arith decide a linear integer goal
+            # (side3 = 5 from side3 mod 2 = 1 and 3 < side3 < 7). ALTERNATION
+            # contains presburger but its earlier `eval` aborts on the
+            # free-variable goal before reaching it; run it standalone with the
+            # premises. Gated on integer flavour (mod/dvd or an int/nat carrier).
+            if not safe:
+                _gt = " ".join([g] + [t for _, t in full_prem])
+                if ("mod" in _gt or "dvd" in _gt
+                        or p.get("carrier") in ("int", "nat")):
+                    if _check(make_theorem(fixes_all, full_prem, g,
+                                           "(presburger | arith)"))["success"]:
+                        return True
+            # Nonlinear real rescue: sos WITH the premises (the nonlinear fact
+            # -- r^2 = 9, a squared distance -- lives in them). Forbidden in
+            # safe mode: sos would close the goal ex-falso from premises whose
+            # consistency is unknown.
+            if nonlin and not safe:
+                if _check(make_theorem(fixes_all, full_prem, g,
+                                       SOS_RESCUE))["success"]:
+                    return True
+            # Uninterpreted-function rescue: smt (verit) discharges functional
+            # equations (forall x. f(x+1)=f(x)+2 => f 2=9) and functional
+            # existentials that nothing else closes; make_theorem_with_logs
+            # first supplies any log-numeral facts (so f(log b x)=x => f N=V
+            # composes). Gated to a function in the step (else smt only wastes
+            # ~15s grinding); non-safe (ex-falso) and non-danger (above).
+            if func_ar and not safe:
+                if _check(make_theorem_with_logs(fixes_all, full_prem, g,
+                                                 SMT_RESCUE))["success"]:
+                    return True
+            # Log-numeral rescue: a bare `log B V = N` (V = B^N) that no single
+            # tactic closes (numeral<->powr gap). The log toolbox proves it via
+            # the powr recipe and hands it to the normal tactic. General over
+            # every log computation, composed here with the premises.
+            if not safe and has_log(g, *[t for _, t in full_prem]):
+                if _check(make_theorem_with_logs(fixes_all, full_prem, g,
+                                                 ALTERNATION))["success"]:
+                    return True
+            # Exponential-equation rescue: `b powr f = c => f-value` by the
+            # injectivity of a base>1 power (4 powr (2y) = 4 => 2y = 1). smt with
+            # powr_inj + powr_one closes it in 0.6s where auto/sos/plain-smt
+            # fail/grind. Gated to a variable-exponent power in the step.
+            if not safe and has_powr(g, *[t for _, t in full_prem]):
+                if _check(make_theorem(fixes_all, full_prem, g,
+                                       EXP_RESCUE))["success"]:
+                    return True
+            return False
 
+        # A claim identical to a GIVEN is auto-satisfied (see given_dumps): the
+        # given holds by assumption, so this is sound even in safe mode.
+        gflags = p.get("claims_given") or [False] * len(claims_t)
         if len(claims_t) > 1:
-            out["verified"] = all(_verify_single(g) for g in claims_t)
+            out["verified"] = all(gf or _verify_single(g)
+                                  for gf, g in zip(gflags, claims_t))
         else:
-            out["verified"] = _verify_single(claims_t[0])
+            out["verified"] = gflags[0] or _verify_single(claims_t[0])
         if not out["verified"] and not danger and not safe:
             # NOT in safe mode: the tolerance fallback proves an approximate
             # goal FROM the premises, so it must be forbidden when premise
@@ -891,13 +1452,17 @@ def process_one(rid, item, pool, config, outdir=None, corrupt=False,
     probe_oc = [None] * len(prepped)
     _pending = []
     for i, p in enumerate(prepped):
+        # A purely linear premise chain is decided completely and fast by
+        # (linarith|presburger); ALTERNATION grinds its powr/ln/exp branches to
+        # the watchdog on a many-equation linear goal (2026-07-14 regression).
+        probe_tac = LINEAR_FALSE if p.get("linear_prem") else ALTERNATION
         if is_dangerous_isabelle(*[t for _, t in p["prem"]]):
             probe_oc[i] = "undetermined"
         elif _submit is not None:
             _pending.append((i, _submit(make_theorem(
-                fixes_all, p["prem"], "False", ALTERNATION))))
+                fixes_all, p["prem"], "False", probe_tac))))
         else:
-            probe_oc[i] = _classify_probe(_probe_step_raw(p))
+            probe_oc[i] = _classify_probe(_probe_step_raw(p, probe_tac))
     for i, fut in _pending:
         r = fut.result()
         _record(r)
