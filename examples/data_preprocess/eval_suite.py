@@ -11,7 +11,7 @@ exists and stays the canonical copy):
   - math-ai/olympiadbench            (674,  'test', text-only maths subset)
 
 Each becomes data/<name>/test.parquet with the SAME extra_info struct as
-data/gsm8k (byte-identical field set -- pyarrow refuses to concat parquets
+data/gsm8k (identical field set -- pyarrow refuses to concat parquets
 whose extra_info structs differ, and validation runs on a list of these
 files together with gsm8k's).
 

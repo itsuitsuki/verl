@@ -1,20 +1,19 @@
 """
 Unified formal-verification step reward (dispatch layer).
 
-This module is the single entry point for all formal-verification step
-rewards. It dispatches on ``fol_task_type`` to one of three backends
-(the ``fol_*`` config prefix is historical: "fol" here means
-"formal-verification step reward", NOT specifically First-Order Logic):
+This module is the single entry point for all formal-verification step rewards.
+It dispatches on ``fol_task_type`` to one of three backends
+(the ``fol_*`` config prefix is historical and @deprecated: "fol" here does NOT mean specifically First-Order Logic):
 
   - ``logic``    -> Z3/SMT  via FOLEngine       (verl.utils.fol_utils)
-  - ``math_z3``  -> Z3/SMT  via FOLEngine       (deprecated Z3 math path)
   - ``math``     -> Isabelle via IsabelleEngine (verl.utils.isabelle_utils)
+  - ``math_z3``  -> Z3/SMT  via FOLEngine       (deprecated Z3 math path)
 
 The Z3 path verifies by entailment (premises & NOT(conclusion) UNSAT -> 1.0);
 the Isabelle path verifies a whole solution per-step (see isabelle_utils).
 
-Configurable via api_config keys (``fol_*`` prefix kept for backward
-compatibility with existing training scripts and past W&B runs):
+# TODO: change the fol_ prefixes
+Configurable via api_config keys (``fol_*`` prefix kept for backward compatibility with existing training scripts and past W&B runs):
   - fol_preprocess: "direct" (default) | "structured"   [Z3 only]
   - fol_translation: "implication" (default) | "assertion"  [Z3 only]
   - fol_task_type: "logic" (default) | "math" (Isabelle) | "math_z3" (Z3, deprecated)
@@ -37,41 +36,37 @@ import fcntl
 import json
 import logging
 import os
-import re
 import threading
 from collections import OrderedDict
 from hashlib import sha1
+
+from verl.utils.fol_utils.common import extract_fol_problem
+from verl.utils.fol_utils.engine import (FOLConfig, FOLEngine,
+                                         PreprocessPipeline, TaskType,
+                                         TranslationMode)
+from verl.utils.step_splitter import (check_step_format,
+                                      parse_step_tag_contents, parse_step_tags)
+
 # import threading
 # import time
 
-from verl.utils.fol_utils.common import check_step_format_fol, extract_fol_problem, parse_step_tags
-from verl.utils.fol_utils.engine import (
-    FOLConfig,
-    FOLEngine,
-    PreprocessPipeline,
-    TaskType,
-    TranslationMode,
-)
 
 logger = logging.getLogger(__name__)
 
-_PREMISE_PATTERN = re.compile(r"<premise>(.*?)</premise>", re.DOTALL)
-_CONCLUSION_PATTERN = re.compile(r"<conclusion>(.*?)</conclusion>", re.DOTALL)
-
-_FOL_SHARED_STATE_CACHE_MAX_SIZE = max(1, int(os.environ.get("FOL_SHARED_PREPROCESS_CACHE_SIZE", "512")))
-_FOL_SHARED_STATE_DISK_CACHE_VERSION = os.environ.get("FOL_SHARED_PREPROCESS_DISK_CACHE_VERSION", "v2")
-_fol_shared_state_cache: OrderedDict[tuple, dict] = OrderedDict()
-_fol_shared_state_cache_lock = threading.Lock()
-_fol_shared_state_inflight: dict[tuple, dict] = {}
-_FOL_VERIFY_CACHE_MAX_SIZE = max(1, int(os.environ.get("FOL_VERIFY_CACHE_SIZE", "4096")))
-_FOL_VERIFY_DISK_CACHE_VERSION = os.environ.get("FOL_VERIFY_DISK_CACHE_VERSION", "v2")
-_fol_verify_cache: OrderedDict[tuple, float] = OrderedDict()
-_fol_verify_cache_lock = threading.Lock()
-_fol_verify_inflight: dict[tuple, dict] = {}
-_fol_verify_cache_stats = {"hits": 0, "misses": 0}
-_fol_verify_cache_stats_lock = threading.Lock()
-_fol_verify_cache_step_stats: OrderedDict[int, dict[str, int]] = OrderedDict()
-_fol_verify_cache_summary_registered = False
+_SHARED_STATE_CACHE_MAX_SIZE = max(1, int(os.environ.get("SHARED_PREPROCESS_CACHE_SIZE", "512")))
+_SHARED_STATE_DISK_CACHE_VERSION = os.environ.get("SHARED_PREPROCESS_DISK_CACHE_VERSION", "v1")
+_shared_state_cache: OrderedDict[tuple, dict] = OrderedDict()
+_shared_state_cache_lock = threading.Lock()
+_shared_state_pending: dict[tuple, dict] = {}
+_VERIFY_CACHE_MAX_SIZE = max(1, int(os.environ.get("VERIFY_CACHE_SIZE", "4096")))
+_VERIFY_DISK_CACHE_VERSION = os.environ.get("VERIFY_DISK_CACHE_VERSION", "v2")
+_verify_cache: OrderedDict[tuple, float] = OrderedDict()
+_verify_cache_lock = threading.Lock()
+_verify_pending: dict[tuple, dict] = {}
+_verify_cache_stats = {"hits": 0, "misses": 0}
+_verify_cache_stats_lock = threading.Lock()
+_verify_cache_step_stats: OrderedDict[int, dict[str, int]] = OrderedDict()
+_verify_cache_summary_registered = False
 
 
 def _normalize_cumulative_mode(mode: str | None) -> str:
@@ -152,7 +147,7 @@ def _shared_state_disk_cache_dir(api_config: dict | None) -> str:
 def _shared_state_disk_cache_paths(cache_key: tuple, api_config: dict | None) -> tuple[str, str]:
     """Return data and lock paths for one shared-state cache key."""
     key_text = json.dumps(
-        [_FOL_SHARED_STATE_DISK_CACHE_VERSION, cache_key],
+        [_SHARED_STATE_DISK_CACHE_VERSION, cache_key],
         ensure_ascii=False,
         separators=(",", ":"),
         default=str,
@@ -201,7 +196,7 @@ def _store_shared_state_to_disk(
     data_path, _ = _shared_state_disk_cache_paths(cache_key, api_config)
     tmp_path = f"{data_path}.{os.getpid()}.{threading.get_ident()}.tmp"
     payload = {
-        "version": _FOL_SHARED_STATE_DISK_CACHE_VERSION,
+        "version": _SHARED_STATE_DISK_CACHE_VERSION,
         "processed_context": shared_state["processed_context"],
         "declarations": shared_state["declarations"],
     }
@@ -219,7 +214,7 @@ def _store_shared_state_to_disk(
 
 
 class _SharedStateDiskLock:
-    """Per-key file lock used to prevent cross-process declaration stampedes."""
+    """Per-key file lock that deduplicates declaration work across processes."""
 
     def __init__(self, cache_key: tuple, api_config: dict | None):
         self.enabled = _shared_state_disk_cache_enabled(api_config)
@@ -260,14 +255,21 @@ def _normalize_step_text(text: str) -> str:
 
 
 def _has_student_premise_conclusion_duplicate(step_text: str) -> bool:
-    """Whether actor copied the current conclusion verbatim into a premise."""
-    premises = [_normalize_step_text(item) for item in _PREMISE_PATTERN.findall(step_text or "")]
-    conclusions = [_normalize_step_text(item) for item in _CONCLUSION_PATTERN.findall(step_text or "")]
-    conclusions = [item for item in conclusions if item]
-    if not premises or not conclusions:
-        return False
+    """Whether actor copied any current conclusion verbatim into a premise."""
+    premise_items, conclusion_items = parse_step_tag_contents(step_text or "")
+    premises = [
+        _normalize_step_text(item)
+        for item in premise_items
+    ]
+    conclusions = [
+        _normalize_step_text(item)
+        for item in conclusion_items
+    ]
     premise_set = {item for item in premises if item}
-    return any(conclusion in premise_set for conclusion in conclusions)
+    return any(
+        conclusion and conclusion in premise_set
+        for conclusion in conclusions
+    )
 
 
 def _deduplicate_text_items(items: list[str]) -> list[str]:
@@ -407,28 +409,28 @@ def prepare_fol_shared_state(
         fol_config.old_max_tries,
     )
 
-    with _fol_shared_state_cache_lock:
-        cached = _fol_shared_state_cache.get(cache_key)
+    with _shared_state_cache_lock:
+        cached = _shared_state_cache.get(cache_key)
         if cached is not None:
-            _fol_shared_state_cache.move_to_end(cache_key)
+            _shared_state_cache.move_to_end(cache_key)
             return cached
-        inflight_state = _fol_shared_state_inflight.get(cache_key)
-        owner = inflight_state is None
+        pending_state = _shared_state_pending.get(cache_key)
+        owner = pending_state is None
         if owner:
-            inflight_state = {"event": threading.Event(), "result": None, "exc": None}
-            _fol_shared_state_inflight[cache_key] = inflight_state
+            pending_state = {"event": threading.Event(), "result": None, "exc": None}
+            _shared_state_pending[cache_key] = pending_state
 
     if not owner:
-        inflight_state["event"].wait()
-        with _fol_shared_state_cache_lock:
-            cached = _fol_shared_state_cache.get(cache_key)
+        pending_state["event"].wait()
+        with _shared_state_cache_lock:
+            cached = _shared_state_cache.get(cache_key)
             if cached is not None:
-                _fol_shared_state_cache.move_to_end(cache_key)
+                _shared_state_cache.move_to_end(cache_key)
                 return cached
-        inflight_exc = inflight_state.get("exc")
-        if inflight_exc is not None:
-            raise inflight_exc
-        return inflight_state.get("result")
+        pending_exception = pending_state.get("exc")
+        if pending_exception is not None:
+            raise pending_exception
+        return pending_state.get("result")
 
     try:
         shared_state = _load_shared_state_from_disk(cache_key, fol_config, fol_config.api_config)
@@ -448,27 +450,27 @@ def prepare_fol_shared_state(
                         }
                         _store_shared_state_to_disk(cache_key, shared_state, fol_config.api_config)
     except BaseException as exc:
-        with _fol_shared_state_cache_lock:
-            inflight_state["exc"] = exc
-            inflight_state["event"].set()
-            _fol_shared_state_inflight.pop(cache_key, None)
+        with _shared_state_cache_lock:
+            pending_state["exc"] = exc
+            pending_state["event"].set()
+            _shared_state_pending.pop(cache_key, None)
         raise
 
-    with _fol_shared_state_cache_lock:
-        existing = _fol_shared_state_cache.get(cache_key)
+    with _shared_state_cache_lock:
+        existing = _shared_state_cache.get(cache_key)
         if existing is not None:
-            _fol_shared_state_cache.move_to_end(cache_key)
-            inflight_state["result"] = existing
-            inflight_state["event"].set()
-            _fol_shared_state_inflight.pop(cache_key, None)
+            _shared_state_cache.move_to_end(cache_key)
+            pending_state["result"] = existing
+            pending_state["event"].set()
+            _shared_state_pending.pop(cache_key, None)
             return existing
         if shared_state is not None:
-            _fol_shared_state_cache[cache_key] = shared_state
-            if len(_fol_shared_state_cache) > _FOL_SHARED_STATE_CACHE_MAX_SIZE:
-                _fol_shared_state_cache.popitem(last=False)
-        inflight_state["result"] = shared_state
-        inflight_state["event"].set()
-        _fol_shared_state_inflight.pop(cache_key, None)
+            _shared_state_cache[cache_key] = shared_state
+            if len(_shared_state_cache) > _SHARED_STATE_CACHE_MAX_SIZE:
+                _shared_state_cache.popitem(last=False)
+        pending_state["result"] = shared_state
+        pending_state["event"].set()
+        _shared_state_pending.pop(cache_key, None)
     return shared_state
 
 
@@ -529,7 +531,7 @@ def _verify_disk_cache_dir(api_config: dict | None) -> str:
 def _verify_disk_cache_paths(cache_key: tuple, api_config: dict | None) -> tuple[str, str]:
     """Return data and lock paths for one exact verify cache key."""
     key_text = json.dumps(
-        [_FOL_VERIFY_DISK_CACHE_VERSION, cache_key],
+        [_VERIFY_DISK_CACHE_VERSION, cache_key],
         ensure_ascii=False,
         separators=(",", ":"),
         default=str,
@@ -561,7 +563,7 @@ def _store_verify_reward_to_disk(cache_key: tuple, reward: float, api_config: di
         return
     data_path, _ = _verify_disk_cache_paths(cache_key, api_config)
     tmp_path = f"{data_path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    payload = {"version": _FOL_VERIFY_DISK_CACHE_VERSION, "reward": float(reward)}
+    payload = {"version": _VERIFY_DISK_CACHE_VERSION, "reward": float(reward)}
     try:
         os.makedirs(os.path.dirname(data_path), exist_ok=True)
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -576,7 +578,7 @@ def _store_verify_reward_to_disk(cache_key: tuple, reward: float, api_config: di
 
 
 class _VerifyDiskLock:
-    """Per-key file lock used to prevent cross-process exact verify stampedes."""
+    """Per-key file lock that deduplicates exact verification across processes."""
 
     def __init__(self, cache_key: tuple, api_config: dict | None):
         self.enabled = _verify_disk_cache_enabled(api_config)
@@ -621,10 +623,10 @@ def _print_verify_cache_summary() -> None:
     if not _verify_cache_log_enabled():
         return
 
-    with _fol_verify_cache_stats_lock:
-        hits = _fol_verify_cache_stats["hits"]
-        misses = _fol_verify_cache_stats["misses"]
-        step_items = list(_fol_verify_cache_step_stats.items())
+    with _verify_cache_stats_lock:
+        hits = _verify_cache_stats["hits"]
+        misses = _verify_cache_stats["misses"]
+        step_items = list(_verify_cache_step_stats.items())
     total = hits + misses
     if total <= 0:
         return
@@ -646,12 +648,12 @@ def _print_verify_cache_summary() -> None:
 
 def _register_verify_cache_summary() -> None:
     """Register the summary printer exactly once."""
-    global _fol_verify_cache_summary_registered
-    with _fol_verify_cache_stats_lock:
-        if _fol_verify_cache_summary_registered:
+    global _verify_cache_summary_registered
+    with _verify_cache_stats_lock:
+        if _verify_cache_summary_registered:
             return
         atexit.register(_print_verify_cache_summary)
-        _fol_verify_cache_summary_registered = True
+        _verify_cache_summary_registered = True
 
 
 def _log_verify_cache_event(hit: bool, step_index: int) -> None:
@@ -660,10 +662,10 @@ def _log_verify_cache_event(hit: bool, step_index: int) -> None:
         return
 
     _register_verify_cache_summary()
-    with _fol_verify_cache_stats_lock:
+    with _verify_cache_stats_lock:
         stat_key = "hits" if hit else "misses"
-        _fol_verify_cache_stats[stat_key] += 1
-        step_stats = _fol_verify_cache_step_stats.setdefault(step_index, {"hits": 0, "misses": 0})
+        _verify_cache_stats[stat_key] += 1
+        step_stats = _verify_cache_step_stats.setdefault(step_index, {"hits": 0, "misses": 0})
         step_stats[stat_key] += 1
 
 
@@ -671,7 +673,7 @@ def compute_step_reward_format_fol(
     step_text: str, prompt_text: str, step_history: list[str], **kwargs,
 ) -> float:
     """Format-check process reward ensuring strict step/premise/conclusion tags."""
-    return 1.0 if check_step_format_fol(step_text) else 0.0
+    return 1.0 if check_step_format(step_text) else 0.0
 
 
 def compute_step_reward_fol(
@@ -689,7 +691,7 @@ def compute_step_reward_fol(
     Configurable via api_config:
       fol_preprocess: "direct" | "structured"
       fol_translation: "implication" | "assertion"
-      max_tries, timeout, cumulative, fol_format_failed_score
+      max_tries, timeout, cumulative
     """
     # _t0 = time.time()
     # _tid = threading.current_thread().name
@@ -704,15 +706,12 @@ def compute_step_reward_fol(
             "z3_error": None,
             "judge_usage": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
-        fol_format_failed_score = float((api_config or {}).get("fol_format_failed_score", 0.0))
-
-        # Format precheck: if the step contains <step> but has bad format
-        # (missing <premise>/<conclusion>, mismatched tags, etc.), skip the
-        # expensive FOL judge call and return the configured FOL format score.
-        if "<step>" in step_text and not check_step_format_fol(step_text):
+        # Defensive backend check only: the reward managers penalize badly formatted steps
+        # through penalty_score BEFORE this call (reward_manager/format_penalty.py), so a
+        # malformed step reaching here comes from a direct caller and scores plain 0.0.
+        if "<step>" in step_text and not check_step_format(step_text):
             debug_info["format_failed_closed"] = True
-            debug_info["format_failed_score"] = fol_format_failed_score
-            return {"score": fol_format_failed_score, "debug": debug_info} if return_debug else fol_format_failed_score
+            return {"score": 0.0, "debug": debug_info} if return_debug else 0.0
         if _has_student_premise_conclusion_duplicate(step_text):
             debug_info["student_premise_conclusion_duplicate"] = True
             return {"score": 0.0, "debug": debug_info} if return_debug else 0.0
@@ -751,38 +750,38 @@ def compute_step_reward_fol(
             step_to_translate=step_to_translate,
         )
         owner = False
-        inflight_state = None
-        with _fol_verify_cache_lock:
-            cached_reward = _fol_verify_cache.get(verify_cache_key)
+        pending_state = None
+        with _verify_cache_lock:
+            cached_reward = _verify_cache.get(verify_cache_key)
             if cached_reward is not None:
-                _fol_verify_cache.move_to_end(verify_cache_key)
+                _verify_cache.move_to_end(verify_cache_key)
                 debug_info["cache_hit"] = True
                 _log_verify_cache_event(True, step_index)
                 return {"score": cached_reward, "debug": debug_info} if return_debug else cached_reward
-            inflight_state = _fol_verify_inflight.get(verify_cache_key)
-            if inflight_state is None:
-                inflight_state = {"event": threading.Event(), "reward": None, "exc": None}
-                _fol_verify_inflight[verify_cache_key] = inflight_state
+            pending_state = _verify_pending.get(verify_cache_key)
+            if pending_state is None:
+                pending_state = {"event": threading.Event(), "reward": None, "exc": None}
+                _verify_pending[verify_cache_key] = pending_state
                 owner = True
 
         if not owner:
-            inflight_state["event"].wait()
-            with _fol_verify_cache_lock:
-                cached_reward = _fol_verify_cache.get(verify_cache_key)
+            pending_state["event"].wait()
+            with _verify_cache_lock:
+                cached_reward = _verify_cache.get(verify_cache_key)
                 if cached_reward is not None:
-                    _fol_verify_cache.move_to_end(verify_cache_key)
+                    _verify_cache.move_to_end(verify_cache_key)
                     debug_info["cache_hit"] = True
                     _log_verify_cache_event(True, step_index)
                     return {"score": cached_reward, "debug": debug_info} if return_debug else cached_reward
-            inflight_exc = inflight_state.get("exc")
-            if inflight_exc is not None:
-                raise inflight_exc
-            inflight_reward = inflight_state.get("reward")
-            if inflight_reward is not None:
+            pending_exception = pending_state.get("exc")
+            if pending_exception is not None:
+                raise pending_exception
+            pending_reward = pending_state.get("reward")
+            if pending_reward is not None:
                 debug_info["cache_hit"] = True
                 _log_verify_cache_event(True, step_index)
-                return {"score": inflight_reward, "debug": debug_info} if return_debug else inflight_reward
-            raise RuntimeError("FOL verify cache in-flight request completed without a result")
+                return {"score": pending_reward, "debug": debug_info} if return_debug else pending_reward
+            raise RuntimeError("FOL verify cache pending request completed without a result")
 
         # print(f"[FOL][{_tid}] → verify_step({fol_config.translation.value})...", flush=True)
         # _t2 = time.time()
@@ -810,18 +809,18 @@ def compute_step_reward_fol(
                         reward = float(reward)
                         _store_verify_reward_to_disk(verify_cache_key, reward, fol_config.api_config)
         except BaseException as exc:
-            with _fol_verify_cache_lock:
-                inflight_state["exc"] = exc
-                inflight_state["event"].set()
-                _fol_verify_inflight.pop(verify_cache_key, None)
+            with _verify_cache_lock:
+                pending_state["exc"] = exc
+                pending_state["event"].set()
+                _verify_pending.pop(verify_cache_key, None)
             raise
-        with _fol_verify_cache_lock:
-            _fol_verify_cache[verify_cache_key] = reward
-            if len(_fol_verify_cache) > _FOL_VERIFY_CACHE_MAX_SIZE:
-                _fol_verify_cache.popitem(last=False)
-            inflight_state["reward"] = reward
-            inflight_state["event"].set()
-            _fol_verify_inflight.pop(verify_cache_key, None)
+        with _verify_cache_lock:
+            _verify_cache[verify_cache_key] = reward
+            if len(_verify_cache) > _VERIFY_CACHE_MAX_SIZE:
+                _verify_cache.popitem(last=False)
+            pending_state["reward"] = reward
+            pending_state["event"].set()
+            _verify_pending.pop(verify_cache_key, None)
         # print(f"[FOL][{_tid}] ◀ done  reward={reward}  verify={time.time()-_t2:.2f}s  total={time.time()-_t0:.2f}s", flush=True)
         return {"score": reward, "debug": debug_info} if return_debug else reward
     except Exception as e:
@@ -850,43 +849,50 @@ _isabelle_engine = None
 _isabelle_engine_lock = threading.Lock()
 
 
+def _isabelle_config_from(api_config: dict | None):
+    """The effective IsabelleConfig a reward api_config maps to. Pure translation, no side effects: used both to build the engine and to check that a later caller agrees with the engine already built."""
+    from verl.utils.isabelle_utils.engine import IsabelleConfig
+    cfg = api_config or {}
+    # fol_timeout aligns with the Z3 path: per-verification deadline in seconds. Default 60 matches the pool's VERIFY_TIMEOUT.
+    timeout = cfg.get("fol_timeout") or cfg.get("timeout") or 60.0
+    return IsabelleConfig(
+        translator_url=cfg.get("base_url", "http://127.0.0.1:4873/v1"),
+        translator_model=cfg.get("model", "Qwen3.6-35B-A3B"),
+        pool_workers=int(cfg.get("isabelle_pool_workers", 32)),
+        verify_timeout=float(timeout),
+        api_timeout=float(cfg.get("api_timeout") or 240.0),
+        each_worker_proc_tree_mem_max_gb=float(cfg.get("isabelle_worker_rss_cap_gb") or 12.0),
+        translate_chunk_steps=int(cfg.get("isabelle_translate_chunk_steps") or 20),
+        step_check_parallelism=int(cfg.get("isabelle_step_check_parallelism") or 4),
+        runaway_cpu_s=float(cfg.get("isabelle_runaway_cpu_s") or 90.0),
+    )
+
+
+def _require_matching_engine_config(config):
+    """Raise if the existing engine was built from a DIFFERENT effective config. One engine per process is deliberate (each engine owns a multi-worker Isabelle pool, so config-keyed engines would multiply JVM/poly memory); what is NOT acceptable is silently running a caller under someone else's config, which this check turns into a loud error naming the differing fields."""
+    from dataclasses import fields
+    existing = _isabelle_engine.config
+    if existing == config:
+        return
+    diffs = ["%s: engine=%r caller=%r" % (f.name, getattr(existing, f.name), getattr(config, f.name))
+             for f in fields(existing) if getattr(existing, f.name) != getattr(config, f.name)]
+    raise RuntimeError(
+        "IsabelleEngine already exists with a different config (one engine per process; refusing to silently reuse it): "
+        + "; ".join(diffs))
+
+
 def _get_isabelle_engine(api_config: dict | None = None):
-    """Lazy singleton: one IsabelleEngine per process.
-
-    KNOWN LIMITATION (2026-06-14): the singleton is built from whatever
-    api_config the first caller passes. Subsequent callers' api_config is
-    SILENTLY IGNORED, even if they pass different judge_url / pool_workers
-    / session / fol_timeout. This is fine today because:
-      * a single training run has exactly one fol_task_type=math reward
-        type using Isabelle
-      * the Z3 path uses its own FOLEngine, not IsabelleEngine
-
-    It would break if a future training mixed two reward types both
-    wanting Isabelle with different configs (e.g. one with HOL-Number_Theory
-    and another with HOL-Analysis). In that case, replace this singleton
-    with a config-keyed dict of engines.
-    """
+    """Process-level singleton with an explicit config contract (2026-07-16, replaces the old first-config-wins behavior whose docstring admitted later api_configs were SILENTLY IGNORED): the engine is built from the first caller's api_config; a later caller whose effective config matches reuses it, and one whose config differs gets a RuntimeError instead of the wrong engine. A run that genuinely needs two Isabelle configs needs two processes."""
     global _isabelle_engine
+    config = _isabelle_config_from(api_config)
     if _isabelle_engine is not None:
+        _require_matching_engine_config(config)
         return _isabelle_engine
     with _isabelle_engine_lock:
         if _isabelle_engine is not None:
+            _require_matching_engine_config(config)
             return _isabelle_engine
-        from verl.utils.isabelle_utils.engine import IsabelleEngine, IsabelleConfig
-        cfg = api_config or {}
-        # fol_timeout aligns with Z3 path: per-verification deadline in
-        # seconds. Default 60 matches the pool's pre-existing CHECK_DEADLINE.
-        timeout = cfg.get("fol_timeout") or cfg.get("timeout") or 60.0
-        config = IsabelleConfig(
-            judge_url=cfg.get("base_url", "http://127.0.0.1:4873/v1"),
-            judge_model=cfg.get("model", "Qwen3.6-35B-A3B"),
-            pool_workers=int(cfg.get("isabelle_pool_workers", 32)),
-            check_deadline=float(timeout),
-            # Judge HTTP deadline; wired (2026-07-11), operational value 240.
-            api_timeout=float(cfg.get("api_timeout") or 240.0),
-            # Per-worker RSS cap (GB); Hydra knob, replaces the old env var.
-            rss_cap_gb=float(cfg.get("isabelle_worker_rss_cap_gb") or 12.0),
-        )
+        from verl.utils.isabelle_utils.engine import IsabelleEngine
         _isabelle_engine = IsabelleEngine(config)
         return _isabelle_engine
 
@@ -910,8 +916,9 @@ def compute_solution_reward_isabelle(
         (rewards, debug_dict) where debug_dict carries judge/verifier
         statistics for metric aggregation (mirrors Z3 path's debug_info).
 
-    Fast-fail mirrors the Z3 path: if XML is malformed or there is no
-    \\boxed{} answer, skip the expensive judge + Isabelle call entirely.
+    Fast-fail mirrors the Z3 path: if the XML yields no valid step, skip the
+    expensive judge + Isabelle call entirely. The \\boxed outcome contract is
+    the reward manager's business (format_penalty), not this backend's.
     """
     debug = {
         "format_ok": False,
@@ -925,8 +932,8 @@ def compute_solution_reward_isabelle(
         "translation_attempts_givens": 0,
         "translation_attempts_steps": 0,
         "guard_failed_steps": 0,
-        "premise_inconsistent_at": None,
-        "premise_undetermined_at": None,
+        "premise_consistency_inconsistent_at": None,
+        "premise_consistency_unknown_at": None,
         "format_failed_closed": False,
         "pattern": "",
         # Per-symbol counts from the pattern (o>c>u>m>g>x priority). g is ALSO
@@ -935,10 +942,7 @@ def compute_solution_reward_isabelle(
         "o_steps": 0,
         "x_steps": 0,
         "c_steps": 0,
-        # u = premises-undetermined: consistency could not be decided (giant
-        # premise skipped, or timeout/worker_error/incomplete). Fail-closed:
-        # this step and every step depending on the same premise chain earn
-        # no positive reward. A timeout is NEVER read as "consistent".
+        # u = premise consistency unknown and the permitted claim checks failed.
         "u_steps": 0,
         "g_steps": 0,
         "m_steps": 0,
@@ -951,41 +955,39 @@ def compute_solution_reward_isabelle(
         # failed" and t_rate is "translator/format could not formalize".
         # Invariant restored: o + x + c + u + g + m + t == n_steps.
         "t_steps": 0,
-        # Per-response wall profile (2026-07-11 review #6). judge_http_wall_s
+        # Per-response wall profile (2026-07-11 review #6). judge_http_wall_time
         # is pure HTTP wall and does not overlap prover time;
-        # translate_validate_wall_s is end-to-end translation/validation wall
+        # translate_validate_wall_time is end-to-end translation/validation wall
         # and may include prover-backed validation. Cache/restart gauges are
         # process-cumulative snapshots; batch max is the meaningful endpoint.
-        "judge_http_wall_s": 0.0,
-        "translate_validate_wall_s": 0.0,
+        "judge_http_wall_time": 0.0,
+        "translate_validate_wall_time": 0.0,
         "prove_calls": 0,
-        "prove_queue_s": 0.0,
-        "prove_run_s": 0.0,
+        "prove_queue_time": 0.0,
+        "prove_run_time": 0.0,
         "prove_cache_hits": 0,
-        "reward_wall_s": 0.0,
+        "reward_wall_time": 0.0,
         "pool_restarts": 0,
         "thm_cache_hit_rate": 0.0,
         "tr_cache_hit_rate": 0.0,
-        # Real judge load vs cache reuse (2026-07-11 review): the legacy
-        # judge_calls_* counted cache MARKERS as judge calls. http calls
-        # count actual requests.post attempts; the *_hits split says which
-        # cache layer answered instead.
+        # Count actual judge HTTP requests separately from cache reuse. The old
+        # judge_calls_* calculation counted cache metadata as judge calls.
         "judge_http_calls": 0,
         "judge_retry_calls": 0,
         "translation_mem_hits": 0,
         "translation_disk_hits": 0,
-        "translation_flight_hits": 0,
+        "translation_shared_hits": 0,
         "translation_xproc_hits": 0,
         "translation_failures": 0,
         "error": None,
     }
-    # Fast-fail: malformed XML or missing boxed answer (matches Z3 path).
+    # Fast-fail: malformed XML only. A missing \boxed no longer blocks process verification:
+    # the boxed contract is an OUTCOME matter (the reward manager replaces the outcome score;
+    # see reward_manager/format_penalty.py), and valid steps keep their process rewards.
     try:
-        from verl.utils.isabelle_utils.xml_utils import (
-            parse_xml_steps, boxed_answer,
-        )
+        from verl.utils.step_splitter import parse_xml_steps
         steps_xml = parse_xml_steps(response)
-        if steps_xml is None or boxed_answer(response) is None:
+        if steps_xml is None:
             debug["format_failed_closed"] = True
             return ([0.0], debug) if return_debug else [0.0]
     except Exception:
@@ -1005,18 +1007,18 @@ def compute_solution_reward_isabelle(
         debug["outcome_correct"] = bool(result.get("outcome_correct"))
         debug["n_steps"] = int(result.get("n_steps", 0) or 0)
         debug["pattern"] = str(result.get("pattern") or "")
-        debug["premise_inconsistent_at"] = result.get(
-            "premise_inconsistent_at")
-        debug["premise_undetermined_at"] = result.get(
-            "premise_undetermined_at")
-        # translate_a: single dict OR list of dicts (judge attempts)
-        ta = result.get("translate_a")
+        debug["premise_consistency_inconsistent_at"] = result.get(
+            "premise_consistency_inconsistent_at")
+        debug["premise_consistency_unknown_at"] = result.get(
+            "premise_consistency_unknown_at")
+        # translation_record_from_problem: single dict OR list of dicts (judge attempts)
+        ta = result.get("translation_record_from_problem")
         if isinstance(ta, list):
             debug["translation_attempts_givens"] = len(ta)
         elif isinstance(ta, dict):
             debug["translation_attempts_givens"] = 1
-        # translate_b: list (one entry per chunk) of {"attempts": ...}
-        tb = result.get("translate_b") or []
+        # translation_record_from_steps: list (one entry per chunk) of {"attempts": ...}
+        tb = result.get("translation_record_from_steps") or []
         if isinstance(tb, list):
             debug["translation_attempts_steps"] = sum(
                 len(x) if isinstance(x, list) else 1 for x in tb)
@@ -1037,8 +1039,8 @@ def compute_solution_reward_isabelle(
         pat = debug["pattern"]
         debug["o_steps"] = pat.count("o")   # rewarded (earned reward 1)
         debug["x_steps"] = pat.count("x")   # unverified (reached prover, no proof)
-        debug["c_steps"] = pat.count("c")   # premises inconsistent (contaminated)
-        debug["u_steps"] = pat.count("u")   # premises undetermined (fail-closed)
+        debug["c_steps"] = pat.count("c")   # premise consistency is inconsistent
+        debug["u_steps"] = pat.count("u")   # premise consistency is unknown
         debug["g_steps"] = pat.count("g")   # verified-but-neutral/guard-failed
         debug["m_steps"] = pat.count("m")   # verified-but-transcription-missing
         # t = translation-failed: XML steps that never reached the prover.
@@ -1049,15 +1051,15 @@ def compute_solution_reward_isabelle(
         # Wall profile from the engine (review #6). Guarded: an old cached
         # rec or an early-return path may lack keys; defaults stay 0.
         prof = result.get("prof") or {}
-        debug["judge_http_wall_s"] = float(
-            prof.get("judge_http_s") or 0.0)
-        debug["translate_validate_wall_s"] = float(
-            prof.get("translate_validate_s") or 0.0)
+        debug["judge_http_wall_time"] = float(
+            prof.get("translator_http_time") or 0.0)
+        debug["translate_validate_wall_time"] = float(
+            prof.get("translate_validate_time") or 0.0)
         debug["prove_calls"] = int(prof.get("prove_calls") or 0)
-        debug["prove_queue_s"] = float(prof.get("prove_queue_s") or 0.0)
-        debug["prove_run_s"] = float(prof.get("prove_run_s") or 0.0)
+        debug["prove_queue_time"] = float(prof.get("prove_queue_time") or 0.0)
+        debug["prove_run_time"] = float(prof.get("prove_run_time") or 0.0)
         debug["prove_cache_hits"] = int(prof.get("prove_cache_hits") or 0)
-        debug["reward_wall_s"] = float(prof.get("reward_wall_s") or 0.0)
+        debug["reward_wall_time"] = float(prof.get("reward_wall_time") or 0.0)
         try:
             debug["pool_restarts"] = int(engine.pool.restart_count)
             _ch = int(engine.pool.cache_hits)
@@ -1066,7 +1068,8 @@ def compute_solution_reward_isabelle(
         except Exception:  # noqa: BLE001 -- gauges must never fail scoring
             pass
         try:
-            from verl.utils.isabelle_utils.judge import translate_cache_stats
+            from verl.utils.isabelle_utils.translator import \
+                translate_cache_stats
             _ts = translate_cache_stats()
             debug["tr_cache_hit_rate"] = _ts["hits"] / max(
                 1, _ts["hits"] + _ts["misses"])
@@ -1075,8 +1078,8 @@ def compute_solution_reward_isabelle(
 
         # Split real judge HTTP load from cache reuse (review round 2).
         def _tr_attempt_entries(x):
-            # translate_a is a list (or single dict); translate_b is one
-            # chunk's list or a list of per-chunk lists.
+            # the problem record is a list (or single dict); the steps record
+            # is one chunk's list or a list of per-chunk lists.
             if isinstance(x, dict):
                 return [x]
             out = []
@@ -1087,15 +1090,15 @@ def compute_solution_reward_isabelle(
                     out.append(e)
             return out
 
-        for a in (_tr_attempt_entries(result.get("translate_a"))
-                  + _tr_attempt_entries(result.get("translate_b"))):
+        for a in (_tr_attempt_entries(result.get("translation_record_from_problem"))
+                  + _tr_attempt_entries(result.get("translation_record_from_steps"))):
             marker = a.get("cache")
             if marker == "mem":
                 debug["translation_mem_hits"] += 1
             elif marker == "disk":
                 debug["translation_disk_hits"] += 1
-            elif marker == "flight":
-                debug["translation_flight_hits"] += 1
+            elif marker == "shared":
+                debug["translation_shared_hits"] += 1
             elif marker == "xproc":
                 debug["translation_xproc_hits"] += 1
             posts = int(a.get("http_posts") or 0)

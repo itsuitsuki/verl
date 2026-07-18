@@ -1,7 +1,7 @@
 """CPU-only tests for the 2026-07-12 symbolic-exponent coverage fix.
 
 Root cause: a valid step like `2 powr (m-n) = 3/4` (from `2 powr m = 3`,
-`2 powr n = 4`) is a FALSE NEGATIVE under the old ALTERNATION -- a leading
+`2 powr n = 4`) is a FALSE NEGATIVE under the old ALTERNATION; a leading
 `simp` rewrites-but-does-not-close the goal, and Isabelle's `|` keeps that
 first progress-making branch, blocking every later branch (there was no
 powr_diff branch anyway). Fix: prepend close-or-fail `fastforce simp: <law>`
@@ -24,7 +24,7 @@ def test_symbolic_real_exponent_emits_powr():
 
     tgt, _, _, _ = py_to_isabelle("2 ** (m - n) == 3/4",
                                   {"m": "real", "n": "real"})
-    assert "powr" in tgt and "(m - n)" in tgt
+    assert "powr" in tgt and "(pv_m - pv_n)" in tgt
 
 
 def test_alternation_has_exponent_law_branches():
@@ -36,10 +36,9 @@ def test_alternation_has_exponent_law_branches():
 
 
 def test_exponent_branches_are_prepended_before_simp():
-    # they MUST come before the generic `(simp)` branch, or the leading simp
-    # would block them (the whole point of the fix).
+    # They come before the generic simp branch. Since 2026-07-18 every open-capable branch is close-or-fail (`simp; fail`), so a partial rewrite no longer blocks later branches; keeping the law branches first remains the cheap order (the law usually closes the goal in one step).
     alt = tactics.ALTERNATION
-    assert alt.index("fastforce simp: powr_diff") < alt.index("(simp)")
+    assert alt.index("fastforce simp: powr_diff") < alt.index("(simp;")
 
 
 def test_exponent_branches_use_close_or_fail_fastforce():

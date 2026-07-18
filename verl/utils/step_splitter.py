@@ -1,13 +1,245 @@
-"""
-Shared step-splitting utilities for TreeRL and StepRewardManager.
+"""Split reasoning responses into text steps and token boundaries.
 
-Provides common functions for splitting LLM response text into reasoning steps,
-both by plain-text delimiters (e.g., \\n\\n) and by XML tags (<step>...</step>).
-Also provides token-position mapping for step boundaries.
+XML responses share one scanner and one premise/conclusion parser. Callers may
+then choose either permissive splitting for truncated generation or strict
+validation for formal-verification rewards.
 """
 
 import re
+from dataclasses import dataclass
 from typing import Callable, Optional
+
+
+@dataclass(frozen=True)
+class _XmlStepBlock:
+    full_text: str
+    inner_text: str
+    start: int
+    end: int
+    closed: bool
+
+
+_XML_STEP_PATTERN = re.compile(r"<step>.*?(?:</step>|$)", re.DOTALL)
+_PREMISE_PATTERN = re.compile(r"<premise>(.*?)</premise>", re.DOTALL)
+_CONCLUSION_PATTERN = re.compile(r"<conclusion>(.*?)</conclusion>", re.DOTALL)
+_TAG_PATTERN = re.compile(r"<(/?\w+)>")
+
+
+def _scan_xml_step_blocks(
+    response_text: str,
+    *,
+    include_unclosed: bool,
+) -> list[_XmlStepBlock]:
+    """Return XML step blocks and their character ranges."""
+    blocks = []
+    for match in _XML_STEP_PATTERN.finditer(response_text):
+        full_text = match.group(0)
+        closed = full_text.endswith("</step>")
+        if not closed and not include_unclosed:
+            continue
+        inner_end = -len("</step>") if closed else None
+        blocks.append(
+            _XmlStepBlock(
+                full_text=full_text,
+                inner_text=full_text[len("<step>") : inner_end],
+                start=match.start(),
+                end=match.end(),
+                closed=closed,
+            )
+        )
+    return blocks
+
+
+def parse_step_tag_contents(step_text: str) -> tuple[list[str], list[str]]:
+    """Return all premise and conclusion tag contents from one step."""
+    premises = [item.strip() for item in _PREMISE_PATTERN.findall(step_text)]
+    conclusions = [item.strip() for item in _CONCLUSION_PATTERN.findall(step_text)]
+    return premises, conclusions
+
+
+def parse_step_tags(step_text: str) -> dict:
+    """Parse premise tags and the last conclusion tag from one step."""
+    premises, conclusions = parse_step_tag_contents(step_text)
+    conclusion = conclusions[-1] if conclusions else None
+    return {"premises": premises, "conclusion": conclusion}
+
+
+def parse_xml_steps(response_text: str):
+    """Parse all closed XML steps in a response for formal verification.
+
+    Each result contains the stripped premises, the first conclusion, and the
+    text inside the outer ``<step>`` tags. A response with no closed steps is
+    invalid, and so is one with a closed step that has no premise, no
+    conclusion, or an empty premise or conclusion: the same interior
+    requirement check_step_format enforces per step on the FOL path (aligned
+    2026-07-17; a premise-free step was also the cheapest way to farm process
+    reward with trivially true statements).
+    """
+    steps = []
+    for block in _scan_xml_step_blocks(response_text, include_unclosed=False):
+        premises, conclusions = parse_step_tag_contents(block.inner_text)
+        if not premises or not all(premises) or not conclusions or not all(conclusions):
+            return None
+        steps.append(
+            {
+                "premises": premises,
+                "conclusion": conclusions[0],
+                "block_text": block.inner_text,
+            }
+        )
+    return steps or None
+
+
+def get_step_list(response_text: str) -> list[str]:
+    """Return the stripped contents of all closed XML steps."""
+    return [
+        block.inner_text.strip()
+        for block in _scan_xml_step_blocks(response_text, include_unclosed=False)
+    ]
+
+
+@dataclass(frozen=True)
+class XmlStepReport:
+    """Format facts about one identified ``<step>`` block: where it is, whether it closed, and its first defect (None = valid). Reward policy (what score a defective step receives) deliberately lives with the reward manager (reward_manager.format_penalty), never here."""
+
+    text: str          # full block text, tags included
+    start: int         # character start in the response
+    end: int           # character end in the response
+    closed: bool
+    error: Optional[str]   # None, or one of: unclosed, bad_tag_structure, bad_tag_order, no_premise, empty_premise, no_conclusion, empty_conclusion
+
+    @property
+    def valid(self) -> bool:
+        return self.error is None
+
+
+def _classify_step_block(block: _XmlStepBlock) -> Optional[str]:
+    """First applicable defect of one step block, mirroring the per-step rules check_step_format enforces on the FOL path."""
+    if not block.closed:
+        return "unclosed"
+    stack = []
+    for match in _TAG_PATTERN.finditer(block.full_text):
+        tag = match.group(1)
+        if tag.startswith("/"):
+            if not stack or stack[-1] != tag[1:]:
+                return "bad_tag_structure"
+            stack.pop()
+        else:
+            stack.append(tag)
+    if stack:
+        return "bad_tag_structure"
+    premises, conclusions = parse_step_tag_contents(block.inner_text)
+    if not premises:
+        return "no_premise"
+    if not all(premises):
+        return "empty_premise"
+    if not conclusions:
+        return "no_conclusion"
+    if not all(conclusions):
+        return "empty_conclusion"
+    if block.full_text.find("<premise>") > block.full_text.find("<conclusion>"):
+        return "bad_tag_order"
+    return None
+
+
+_BOXED_START_RE = re.compile(r"\\boxed\{")
+
+
+def boxed_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of every ``\\boxed{...}``: (start of the ``\\boxed``, index just past its matching brace). The brace scan tolerates nesting (``\\boxed{\\frac{1}{2}}``); a span whose braces never close runs to len(text)."""
+    text = text or ""
+    spans = []
+    for match in _BOXED_START_RE.finditer(text):
+        depth = 1
+        i = match.end()
+        while i < len(text) and depth:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        spans.append((match.start(), i))
+    return spans
+
+
+def first_boxed_end(text: str) -> Optional[int]:
+    """Character index just past the matching brace of the FIRST ``\\boxed{...}``, or None when the text has no ``\\boxed`` (see :func:`boxed_spans`)."""
+    spans = boxed_spans(text)
+    return spans[0][1] if spans else None
+
+
+_REASONING_TAG_NAMES = {"step", "/step", "premise", "/premise", "conclusion", "/conclusion"}
+
+
+def find_stray_xml_tags(response_text: str) -> list[tuple[int, int, str]]:
+    """Reasoning tags that sit OUTSIDE every identified ``<step>`` block: a stray ``</step>`` with no opener, a ``<conclusion>`` dangling after the blocks, premise or conclusion tags that belong to no step. Facts only ((start, end, tag) per stray tag); the reward managers' format policy decides what they cost. Text without reasoning tags outside blocks is legal and reported as nothing."""
+    spans = [(block.start, block.end)
+             for block in _scan_xml_step_blocks(response_text, include_unclosed=True)]
+    stray = []
+    for match in _TAG_PATTERN.finditer(response_text):
+        tag = match.group(1)
+        if tag not in _REASONING_TAG_NAMES:
+            continue
+        if any(start <= match.start() < end for start, end in spans):
+            continue
+        stray.append((match.start(), match.end(), tag))
+    return stray
+
+
+def analyze_xml_steps(response_text: str) -> list[XmlStepReport]:
+    """Per-step format report for the reward managers: every identified ``<step>`` block in order, a final unclosed block included, each with its first defect. The list is index-aligned with split_by_xml_step_tags (same scanner, unclosed included)."""
+    return [
+        XmlStepReport(
+            text=block.full_text,
+            start=block.start,
+            end=block.end,
+            closed=block.closed,
+            error=_classify_step_block(block),
+        )
+        for block in _scan_xml_step_blocks(response_text, include_unclosed=True)
+    ]
+
+
+def check_step_format(step_text: str) -> bool:
+    """Return whether one step has complete, nonempty XML reasoning tags."""
+    step_text = step_text.strip()
+    blocks = _scan_xml_step_blocks(step_text, include_unclosed=False)
+    if len(blocks) != 1 or blocks[0].full_text != step_text:
+        return False
+
+    if step_text.count("<step>") != 1 or step_text.count("</step>") != 1:
+        return False
+
+    premise_open = step_text.count("<premise>")
+    premise_close = step_text.count("</premise>")
+    conclusion_open = step_text.count("<conclusion>")
+    conclusion_close = step_text.count("</conclusion>")
+    if premise_open <= 0 or premise_open != premise_close:
+        return False
+    if conclusion_open <= 0 or conclusion_open != conclusion_close:
+        return False
+    if step_text.find("<premise>") > step_text.find("<conclusion>"):
+        return False
+
+    stack = []
+    for match in _TAG_PATTERN.finditer(step_text):
+        tag = match.group(1)
+        if tag.startswith("/"):
+            closing_tag = tag[1:]
+            if not stack or stack[-1] != closing_tag:
+                return False
+            stack.pop()
+        else:
+            stack.append(tag)
+    if stack:
+        return False
+
+    premises, conclusions = parse_step_tag_contents(step_text)
+    return all(premises) and all(conclusions)
+
+
+# Compatibility name retained for existing reward configuration and imports.
+check_step_format_fol = check_step_format
 
 
 def default_split_fn(response_text: str) -> list[str]:
@@ -47,20 +279,24 @@ def split_response_into_steps(
 
 
 def split_by_xml_step_tags(response_text: str) -> list[tuple[str, int, int]]:
-    """Split response text into steps using ``<step>...</step>`` XML tags.
+    """Return XML steps with character ranges.
 
-    If no ``<step>`` tags are found the returned list is empty, allowing
-    callers to fall back to a delimiter-based splitter.
-
-    Args:
-        response_text: The full decoded response text.
-
-    Returns:
-        List of (step_text, char_start, char_end) tuples.
+    A final unclosed ``<step>`` is included because generation may stop at the
+    response token limit. Callers that validate complete responses should use
+    :func:`parse_xml_steps` instead.
     """
-    pattern = r"<step>.*?(?:</step>|$)"
-    matches = list(re.finditer(pattern, response_text, flags=re.DOTALL))
-    return [(m.group(0), m.start(), m.end()) for m in matches]
+    return [
+        (block.full_text, block.start, block.end)
+        for block in _scan_xml_step_blocks(
+            response_text,
+            include_unclosed=True,
+        )
+    ]
+
+
+def char_end_to_token_pos(response_ids, tokenizer, char_end: int, valid_response_length: int) -> int:
+    """Public name for the character-to-token boundary mapping (the reward managers place stray-tag penalties with it)."""
+    return _char_end_to_token_pos(response_ids, tokenizer, char_end, valid_response_length)
 
 
 def _char_end_to_token_pos(response_ids, tokenizer, char_end: int, valid_response_length: int) -> int:
@@ -156,12 +392,10 @@ def split_tokens_by_delimiter(
 ) -> list[tuple[int, int, str]]:
     """Split a token sequence at delimiter boundaries directly in token space.
 
-    This avoids the decode |→| split |→| re-encode round-trip that causes BPE
-    drift (``len(encode(decode(tokens[:k]))) != k``).
+    This avoids the decode |→| split |→| re-encode round-trip that causes BPE drift (``len(encode(decode(tokens[:k]))) != k``).
 
     The delimiter tokens are included at the **start** of the following step,
-    matching the behaviour of the character-level
-    ``split_response_into_steps()`` helper.
+    matching the behaviour of the character-level ``split_response_into_steps()`` helper.
 
     Args:
         token_ids: Flat list/sequence of token IDs (e.g. from ``.tolist()``).

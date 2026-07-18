@@ -788,7 +788,6 @@ LLM 调用次数：每道题 1 次（declarations），每步 1 次（implicatio
 | `fol_translation` | `"implication"` | `"implication"` / `"assertion"` | 翻译模式。`implication` = 源分离的前提/结论翻译（推荐）；`assertion` = premise_fol/conclusion_fol 直接翻译 |
 | `fol_cumulative_mode` | `"current_only"` | `"current_only"` / `"step"` / `"dependency_graph"` | 累积推理模式。`current_only` = 只用当前步骤；`step` = 包含所有前序结论；`dependency_graph` = 按前提-结论依赖图选择祖先步骤 |
 | `fol_judge_use_outlines` | `false` | `true` / `false` | 是否请求结构化 JSON 输出（structured generation）。需要 judge 模型支持 json_schema response_format |
-| `fol_format_failed_score` | `0.0` | 任意 float | 步骤格式不合法时（缺少 premise/conclusion 标签）的替代分值 |
 | `max_tries` | `1` | int ≥ 0 | 声明/表达式修复的最大重试次数 |
 | `old_max_tries` | `0` | int ≥ 0 | 整段 Z3 代码纠错循环的最大重试次数（旧版纠错路径） |
 | `timeout` | `30.0` | float (秒) | Z3 求解器单步超时时间 |
@@ -1040,17 +1039,17 @@ if "self_eval" in self.step_reward_types:
 
 **权重调整**：fol/self_eval 脚本已从 `[0.5, 0.5]` 改为 `[0.8, 0.2]`，让 outcome advantage 主导优化方向。
 
-**Penalty 机制**（`verl/experimental/reward_loop/reward_manager/step.py`）：当 response 出现 reward hacking 行为时，将该 response 的所有 process reward 置为 penalty_score（默认 0.0），切断 exploit 信号。
+**Penalty 机制**（`verl/experimental/reward_loop/reward_manager/format_penalty.py`，StepRewardManager 与 TreeRewardManager 共用同一实现）：训练层的格式处罚全部使用 `penalty_score` 一个分值。除截断外处罚是局部的：坏 step 只罚该 step，其余 step 正常验证。这些规则只作用于训练；validation 返回原始 benchmark 分数（`validate_with_step_reward=false` 时在规则之前返回）。
 
 ### 配置参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `algorithm.penalty_max_steps` | `0`（禁用） | step 数超过此阈值时触发 penalty（推荐 12） |
-| `algorithm.penalty_on_truncated` | `False` | response 被 max_response_length 截断时触发 |
-| `algorithm.penalty_on_multi_boxed` | `False` | response 中出现多个 `\boxed{}` 时触发 |
-| `algorithm.penalty_on_bad_format` | `False` | `<step>`/`</step>` 数量不匹配或 `<conclusion>` 在 `<step>` 外时触发 |
-| `algorithm.penalty_score` | `0.0` | penalty 时所有 step reward 的替代分值（可设负值） |
+| `algorithm.penalty_max_steps` | `0`（禁用） | 超过阈值的后缀 step 各自得到 penalty_score，前缀不受影响（推荐 12） |
+| `algorithm.penalty_on_truncated` | `False` | response 被 max_response_length 截断时，全部 step 置 penalty_score 且不再验证 |
+| `algorithm.penalty_on_multi_boxed` | `False` | boxed 契约的总开关（名称沿用旧配置，0 个的规则也由它控制）：0 个 `\boxed{}` 时 outcome 置为 penalty_score、process 正常；多个时以第一个为准在其前缀上重评 outcome，之后的每个 `\boxed{}` 在自身位置得到一个 penalty_score |
+| `algorithm.penalty_on_bad_format` | `False` | 坏 step（未闭合、缺 premise/conclusion 等）单独置 penalty_score，其余 step 正常验证；`<step>` 块外散落的 reasoning tag 在其位置得到一个 penalty_score；response 没有任何 `<step>` 时在末 token 置一个 penalty_score |
+| `algorithm.penalty_score` | `0.0` | 上述全部处罚共用的分值（生产训练用 -1.0） |
 
 ### 使用示例
 

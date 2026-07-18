@@ -10,7 +10,7 @@ step reward manager, the same math_reasoning.txt XML-step system prompt, and
 fol_task_type=math (Isabelle) work unchanged. The only differences vs gsm8k.py:
   - source dataset + fields (problem / solution instead of question / answer)
   - final-answer extraction pulls the last \\boxed{...} from the solution
-The extra_info struct is kept BYTE-IDENTICAL to data/gsm8k (no extra fields):
+The extra_info struct is kept identical to data/gsm8k (no extra fields):
 pyarrow refuses to concat parquets whose extra_info structs differ, which
 breaks multi-parquet data.train_files lists. Filter by MATH level/subject at
 preprocess time here if ever needed (fields available in the raw dataset).
@@ -35,7 +35,8 @@ import datasets
 from tqdm.auto import tqdm
 
 from verl.utils.hdfs_io import copy, makedirs
-from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
+from verl.utils.reward_score.math_reward import (last_boxed_only_string,
+                                                 remove_boxed)
 
 PROMPT_DIR = Path(__file__).resolve().parents[2] / "verl" / "prompts"
 
@@ -94,7 +95,7 @@ def make_map_fn(split, format="flat", system_prompt=None, user_prompt_suffix=Non
                 "math_solution": solution_raw,
                 "math_final_answer": final_answer,
                 # NOTE: no math_level / math_subject here — the extra_info
-                # struct must be byte-identical to data/gsm8k so pyarrow can
+                # struct must be identical to data/gsm8k so pyarrow can
                 # concat them in a multi-parquet data.train_files list.
                 # Filter by level/subject at preprocess time if ever needed.
                 # Keep these structured fields compatible with the FOL extractor.

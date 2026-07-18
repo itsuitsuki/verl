@@ -1659,13 +1659,6 @@ class RayPPOTrainer:
                                 )
                                 if fol_cumulative_mode is not None:
                                     api_config["fol_cumulative_mode"] = str(fol_cumulative_mode)
-                                fol_format_failed_score = reward_cfg.get(
-                                    "fol_format_failed_score",
-                                    algo_cfg.get("fol_format_failed_score", None),
-                                )
-                                if fol_format_failed_score is not None:
-                                    api_config["fol_format_failed_score"] = float(fol_format_failed_score)
-
                                 for rt in step_reward_types:
                                     if rt == "format":
                                         from verl.utils.reward_score.formal_verify import compute_step_reward_format_fol
@@ -1925,7 +1918,7 @@ class RayPPOTrainer:
                             for k, v in reward_extra_infos_dict.items():
                                 if k.endswith("_step_reward") and len(v) > 0:
                                     sr_sample.append({k: v[0]})
-                            # Isabelle per-step verdict symbols (o/x/c/g/m), if present.
+                            # Isabelle per-step result symbols (o/x/c/u/g/m), if present.
                             _pat = reward_extra_infos_dict.get("isabelle_pattern")
                             if _pat is not None and len(_pat) > 0 and _pat[0]:
                                 sr_sample.append({"steps": _pat[0]})
@@ -1942,7 +1935,7 @@ class RayPPOTrainer:
                             # games the verifier by writing fewer steps. Enable
                             # with +trainer.print_all_step_patterns=true.
                             # pattern symbols: o=rewarded x=verified-failed
-                            # c=premise-inconsistent u=premise-undetermined
+                            # c=premise-inconsistent u=premise-consistency-unknown
                             # g=guard/neutral m=transcription-missing.
                             if self.config.trainer.get("print_all_step_patterns", False):
                                 _pats = reward_extra_infos_dict.get("isabelle_pattern") or []
@@ -2348,7 +2341,7 @@ class RayPPOTrainer:
                     "isabelle_judge_retry_calls": "isabelle/judge_retry_calls",
                     "isabelle_translation_mem_hits": "isabelle/translation_mem_hits",
                     "isabelle_translation_disk_hits": "isabelle/translation_disk_hits",
-                    "isabelle_translation_flight_hits": "isabelle/translation_flight_hits",
+                    "isabelle_translation_shared_hits": "isabelle/translation_shared_hits",
                     "isabelle_translation_xproc_hits": "isabelle/translation_xproc_hits",
                     "isabelle_translation_failures": "isabelle/translation_failures",
                 }
@@ -2379,9 +2372,9 @@ class RayPPOTrainer:
                         # Per-symbol rates (count / n_steps). By construction
                         # o+x+c+u+g+m+t == n_steps, so these seven rates sum to
                         # 1 (t = translation-failed steps that never reached the
-                        # prover, hence carry no pattern symbol; u = premises
-                        # undetermined, could not be salvaged by an independent
-                        # proof).
+                        # prover, hence carry no pattern symbol; u = premise
+                        # consistency unknown and not proved by the permitted
+                        # claim checks).
                         "isabelle_o_steps": "isabelle/o_rate",
                         "isabelle_x_steps": "isabelle/x_rate",
                         "isabelle_c_steps": "isabelle/c_rate",

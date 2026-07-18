@@ -14,11 +14,11 @@ if not hasattr(os, "sysconf"):
     pytest.skip("server_pool is Linux-only (os.sysconf at module level)",
                 allow_module_level=True)
 
-from verl.utils.isabelle_utils import server_pool as sp
+from verl.utils.isabelle_utils._server_pool.worker import IsabelleWorker
 
 
 def _worker(tmp_path):
-    return sp.IsabelleWorker(0, tmp_path)
+    return IsabelleWorker(0, tmp_path)
 
 
 def test_single_purge_thread_processes_batches(tmp_path):

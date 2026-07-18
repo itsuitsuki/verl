@@ -144,3 +144,5 @@ outputs
 CLAUDE.md
 .playwright-mcp/
 tests/test_siliconflow_concurrency.py
+
+.vscode/

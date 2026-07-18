@@ -1,124 +1,77 @@
 # New file for the verl-fol fork; follows examples/data_preprocess/math_lighteval.py.
-"""
-Preprocess open-r1/Big-Math-RL-Verified-Processed into the verl-fol
-step-reward parquet format (train split only -- Big-Math is training data;
-validation runs on the 6-benchmark eval suite instead).
-
-Upstream already did (SynthLabsAI paper + open-r1 processing):
-  - dedup, MATH-500/Omni-MATH decontamination, non-English/multi-part/
-    proof/yes-no removal (SynthLabsAI)
-  - drop rows whose answer math-verify cannot parse; drop null solve rates
-    (open-r1)
-
-This script adds only what upstream does not know about our setup:
-  F1  source dedup: drop source in {gsm8k, math} -- both datasets are
-      already in our train list as data/gsm8k + data/math; keeping them
-      here would double-sample those problems.
-  F2  solve-rate band [0.1, 0.7]: outside the band GDPO group advantage
-      collapses (all-fail or all-pass groups carry no signal). Band is
-      Llama-3.1-8B based -- recalibrate against critic/score/mean if the
-      4B/8B policy disagrees.
-
-Schema matches data/gsm8k byte-identically (pyarrow multi-parquet concat).
-data_source is fixed to "open-r1/Big-Math-RL-Verified-Processed", which
-routes to math-verify boxed-gated scoring in reward_score/__init__.py.
-
-Usage (dt2):
-  HF_ENDPOINT=https://hf-mirror.com python examples/data_preprocess/bigmath.py \
-      --raw_dir /2022533109/zhouchuyan/verl/data/raw_bigmath_processed \
-      --local_save_dir ./data/bigmath \
-      --system_prompt_file math_reasoning.txt
-"""
-
+"""Build a conservative, auditable Big-Math training dataset."""
 import argparse
-import os
 from pathlib import Path
 
-import datasets
 import pandas as pd
 
-PROMPT_DIR = Path(__file__).resolve().parents[2] / "verl" / "prompts"
+from math_rl_data import load_prompt_file, process_records, write_dataset
 
+PROMPT_DIR = Path(__file__).resolve().parents[2] / "verl" / "prompts"
 DATA_SOURCE = "open-r1/Big-Math-RL-Verified-Processed"
 INSTRUCTION = r"Let's think step by step and output the final answer in \boxed{}."
 
 
-def _load_prompt_file(path_or_name: str) -> str:
-    p = Path(path_or_name)
-    if not p.is_absolute():
-        p = PROMPT_DIR / p
-    return p.read_text(encoding="utf-8").strip()
-
-
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw_dir", required=True, help="local snapshot of the processed dataset")
-    parser.add_argument("--local_save_dir", default="./data/bigmath")
-    parser.add_argument("--system_prompt_file", default=None)
-    # Band [0, 0.9] (2026-07-05 decision). min=0: unlike outcome-only GRPO
-    # (all-fail group -> zero advantage -> dead signal), Step-GDPO's process
-    # reward ranks rollouts by verified steps even when every rollout misses
-    # the final answer -- hard problems are exactly where dense step credit
-    # pays off. Big-Math already removed problems unsolvable by Llama-405B
-    # x8 and 8B x64, so sub-0.1 rows still have reproduced answer labels.
-    # max=0.9: solve rates are Llama-3.1-8B based and our Qwen policies run
-    # higher; all-correct groups only waste compute (advantage collapses to
-    # 0). Watch bigmath o_rate vs outcome divergence for process-reward
-    # hacking on unsolved problems. Shipped train.parquet = 161,037 rows.
+    parser.add_argument("--raw_dir", required=True)
+    parser.add_argument("--local_save_dir", default="./data/bigmath_clean")
+    parser.add_argument("--system_prompt_file", default="math_reasoning.txt")
     parser.add_argument("--solve_rate_min", type=float, default=0.0)
     parser.add_argument("--solve_rate_max", type=float, default=0.9)
     args = parser.parse_args()
 
-    system_prompt = _load_prompt_file(args.system_prompt_file) if args.system_prompt_file else None
+    src = Path(args.raw_dir) / "all" / "train-00000-of-00001.parquet"
+    raw = pd.read_parquet(src)
 
-    src = os.path.join(args.raw_dir, "all", "train-00000-of-00001.parquet")
-    df = pd.read_parquet(src)
-    n0 = len(df)
+    # F1: these sources are already loaded as separate GSM8K/MATH parquets.
+    f1_mask = raw["source"].isin(["gsm8k", "math"])
+    f1_excluded = raw[f1_mask].copy()
+    f1_excluded["source_index"] = f1_excluded.index
+    f1_excluded["reason"] = "source_already_in_gsm8k_or_math"
+    after_f1 = raw[~f1_mask]
 
-    # F1: source dedup against our existing train parquets
-    df = df[~df["source"].isin(["gsm8k", "math"])]
-    n1 = len(df)
+    # F2: retain the configured RL difficulty band. This is not quality scoring.
+    f2_keep = after_f1["llama8b_solve_rate"].between(
+        args.solve_rate_min, args.solve_rate_max)
+    f2_excluded = after_f1[~f2_keep].copy()
+    f2_excluded["source_index"] = f2_excluded.index
+    f2_excluded["reason"] = "solve_rate_outside_requested_range"
+    selected = after_f1[f2_keep]
 
-    # F2: solve-rate band
-    df = df[(df["llama8b_solve_rate"] >= args.solve_rate_min) & (df["llama8b_solve_rate"] <= args.solve_rate_max)]
-    n2 = len(df)
-    print(f"rows: {n0} -> drop gsm8k/math sources -> {n1} -> solve_rate band -> {n2}")
+    records = []
+    for source_index, row in selected.iterrows():
+        records.append({
+            "source_index": int(source_index),
+            "prompt": str(row["prompt"] or ""),
+            "answer": str(row["solution"] or ""),
+            "source": str(row["source"] or ""),
+            "domain": str(row["domain"]),
+            "difficulty": float(row["llama8b_solve_rate"]),
+            "topic": str(row["domain"]),
+        })
 
-    rows = []
-    for idx, ex in enumerate(df.itertuples(index=False)):
-        question = str(ex.prompt).strip()
-        answer = str(ex.solution).strip()
-        if not question or not answer:
-            continue
-        prompt_content = f"<Question>\n{question}\n</Question>\n\n{INSTRUCTION}"
-        prompt_messages = []
-        if system_prompt:
-            prompt_messages.append({"role": "system", "content": system_prompt})
-        prompt_messages.append({"role": "user", "content": prompt_content})
-        rows.append(
-            {
-                "data_source": DATA_SOURCE,
-                "prompt": prompt_messages,
-                "ability": "math",
-                "reward_model": {"style": "rule", "ground_truth": answer},
-                "extra_info": {
-                    "split": "train",
-                    "index": idx,
-                    "answer": answer,
-                    "question": question,
-                    "math_question": question,
-                    "math_solution": "",
-                    "math_final_answer": answer,
-                    "fol_context": "",
-                    "fol_question": question,
-                    "fol_options": "",
-                },
-            }
-        )
+    save_dir = Path(args.local_save_dir).expanduser()
+    process_records(
+        records=records,
+        save_dir=save_dir,
+        data_source=DATA_SOURCE,
+        source_description=str(src),
+        system_prompt=load_prompt_file(args.system_prompt_file, PROMPT_DIR),
+        instruction=INSTRUCTION,
+        stage_counts={
+            "raw": len(raw),
+            "f1_excluded": len(f1_excluded),
+            "after_f1": len(after_f1),
+            "f2_excluded": len(f2_excluded),
+            "after_f2": len(selected),
+        },
+    )
+    write_dataset(f1_excluded.to_dict("records"),
+                  save_dir / "f1_excluded.parquet")
+    write_dataset(f2_excluded.to_dict("records"),
+                  save_dir / "f2_excluded.parquet")
 
-    out = datasets.Dataset.from_list(rows)
-    save_dir = os.path.expanduser(args.local_save_dir)
-    os.makedirs(save_dir, exist_ok=True)
-    out.to_parquet(os.path.join(save_dir, "train.parquet"))
-    print(f"saved {len(out)} rows -> {save_dir}/train.parquet")
-    print(f"data_source: {DATA_SOURCE}")
+
+if __name__ == "__main__":
+    main()

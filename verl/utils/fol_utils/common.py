@@ -32,6 +32,12 @@ from typing import Any, Optional, Union
 
 from openai import OpenAI
 
+from verl.utils.step_splitter import (
+    check_step_format_fol,
+    get_step_list,
+    parse_step_tags,
+)
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Linux training path uses fcntl
@@ -129,7 +135,7 @@ _OPENAI_TRANSIENT_MARKERS = ("429", "rate limit", "502", "503", "504", "connecti
 def _is_transient_openai_error(exc: BaseException) -> bool:
     """Check if an OpenAI-compatible API error is transient and retryable."""
     try:
-        from openai import RateLimitError, APIStatusError
+        from openai import APIStatusError, RateLimitError
         if isinstance(exc, RateLimitError):
             return True
         if isinstance(exc, APIStatusError) and exc.status_code in (429, 500, 502, 503, 504):
@@ -771,27 +777,8 @@ def extract_python_block(text: str, strategy: str = "last") -> str:
     return matches[-1]
 
 
-def parse_step_tags(step_text: str) -> dict:
-    """Parse <premise> and <conclusion> tags from a step block.
-
-    Returns:
-        dict with keys 'premises' (list[str]) and 'conclusion' (str | None).
-    """
-    premise_pattern = re.compile(r"<premise>(.*?)</premise>", re.DOTALL)
-    premises = [p.strip() for p in premise_pattern.findall(step_text)]
-
-    conclusion_pattern = re.compile(r"<conclusion>(.*?)</conclusion>", re.DOTALL)
-    conclusion_matches = conclusion_pattern.findall(step_text)
-    conclusion = conclusion_matches[-1].strip() if conclusion_matches else None
-
-    return {"premises": premises, "conclusion": conclusion}
-
-
-def get_step_list(text_content: str) -> list[str]:
-    """Extract step contents from ``<step>...</step>`` tags."""
-    pattern = r"<step.*?>(.*?)</step>"
-    matches = re.findall(pattern, text_content, flags=re.DOTALL)
-    return [content.strip() for content in matches]
+# XML step parsing and format validation live in ``verl.utils.step_splitter``.
+# The imports near the top of this module preserve the established FOL API.
 
 
 def parse_python_logic_steps(code_str: str) -> list[dict]:
@@ -1250,60 +1237,5 @@ def generate_z3_functions(predicates: dict) -> str:
     return "\n".join(code_lines)
 
 
-# ---------------------------------------------------------------------------
-# Format checking (kept from original fol.py)
-# ---------------------------------------------------------------------------
-
-def check_step_format_fol(step_text: str) -> bool:
-    """Check if a reasoning step strictly follows the format with <step>, <premise>, <conclusion>."""
-    step_text = step_text.strip()
-
-    if not step_text.startswith("<step>") or not step_text.endswith("</step>"):
-        return False
-
-    step_open = step_text.count("<step>")
-    step_close = step_text.count("</step>")
-    premise_open = step_text.count("<premise>")
-    premise_close = step_text.count("</premise>")
-    conclusion_open = step_text.count("<conclusion>")
-    conclusion_close = step_text.count("</conclusion>")
-
-    if step_open != 1 or step_close != 1:
-        return False
-    if premise_open <= 0 or premise_open != premise_close:
-        return False
-    if conclusion_open <= 0 or conclusion_open != conclusion_close:
-        return False
-
-    first_premise_pos = step_text.find("<premise>")
-    first_conclusion_pos = step_text.find("<conclusion>")
-    if first_premise_pos > first_conclusion_pos:
-        return False
-
-    # Check tag nesting
-    tag_pattern = r"<(/?\w+)>"
-    matches = list(re.finditer(tag_pattern, step_text))
-    stack = []
-    for match in matches:
-        tag = match.group(1)
-        if tag.startswith("/"):
-            closing_tag = tag[1:]
-            if not stack or stack[-1] != closing_tag:
-                return False
-            stack.pop()
-        else:
-            if tag == "conclusion" and "premise" in stack:
-                pass
-            stack.append(tag)
-
-    if len(stack) != 0:
-        return False
-
-    # Check tags have content
-    for tag_name in ["premise", "conclusion"]:
-        matches_content = re.findall(f"<{tag_name}>(.*?)</{tag_name}>", step_text, re.DOTALL)
-        for content in matches_content:
-            if not content.strip():
-                return False
-
-    return True
+# ``check_step_format_fol`` is imported from ``verl.utils.step_splitter`` so
+# existing FOL imports continue to use the shared XML step grammar.

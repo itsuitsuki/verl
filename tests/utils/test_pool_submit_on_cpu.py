@@ -1,7 +1,7 @@
-"""CPU-only tests for the unified check scheduler (server_pool.py, 2026-07-11
-review #1): pool.submit() feeds one process-wide FIFO served by num_workers
-dispatcher threads. No Isabelle needed: _check_uncached is mocked. Verifies
-result delivery, memo fast path, queue_wait injection, exception delivery."""
+"""CPU-only tests for the unified Isabelle check scheduler.
+
+pool.submit() places requests in one process-wide FIFO served by dispatcher threads. `_check_uncached` is mocked, so no Isabelle process is needed. The tests cover result delivery, memory-cache hits, queue-wait measurement, exception delivery, and concurrent identical-request deduplication.
+"""
 import os
 import threading
 
@@ -34,16 +34,13 @@ def test_submit_resolves_all_and_injects_queue_wait(tmp_path, monkeypatch):
     monkeypatch.setattr(p, "_check_uncached", fake_uncached)
     futs = [p.submit(THM.replace("4", str(4 + i))) for i in range(6)]
     outs = [f.result(timeout=10.0) for f in futs]
-    assert all(o["success"] for o in outs)
+    assert all(o.proved for o in outs)
     assert len(calls) == 6                     # each distinct theorem proved
-    assert all(float(o.get("queue_wait", -1)) >= 0.0 for o in outs)
+    assert all(o.queue_wait >= 0.0 for o in outs)
 
 
 def test_fifo_delay_lands_in_queue_wait(tmp_path, monkeypatch):
-    # Review round 2: the previous >= 0.0 assertion was vacuous -- deleting
-    # the dispatcher's injection line still passed. Serialize on ONE
-    # dispatcher lane with a slow check: the later submissions MUST show
-    # their time in the request FIFO.
+    # This assertion must detect whether FIFO delay is added to queue_wait. Use one dispatcher with a slow check so later submissions remain in the request queue long enough to measure.
     import time as _time
 
     p = _pool(tmp_path, monkeypatch, num_workers=1)
@@ -60,7 +57,7 @@ def test_fifo_delay_lands_in_queue_wait(tmp_path, monkeypatch):
     t.start()
     outs = [f.result(timeout=15.0) for f in futs]
     # 3rd request sat behind two 0.2s checks in the FIFO
-    assert float(outs[2]["queue_wait"]) >= 0.3
+    assert outs[2].queue_wait >= 0.3
 
 
 def test_submit_memo_fast_path(tmp_path, monkeypatch):
@@ -72,10 +69,10 @@ def test_submit_memo_fast_path(tmp_path, monkeypatch):
         return {"success": True, "elapsed": 0.01, "errors": []}
 
     monkeypatch.setattr(p, "_check_uncached", fake_uncached)
-    assert p.submit(THM).result(timeout=10.0)["success"]
+    assert p.submit(THM).result(timeout=10.0).proved
     r2 = p.submit(THM).result(timeout=10.0)
-    assert r2["success"] and r2.get("cache_hit") and n["c"] == 1
-    assert r2["queue_wait"] == 0.0             # memo hit bypasses the FIFO
+    assert r2.proved and r2.cache_hit and n["c"] == 1
+    assert r2.queue_wait == 0.0                # memo hit bypasses the FIFO
 
 
 def test_submit_delivers_exceptions(tmp_path, monkeypatch):
@@ -90,10 +87,7 @@ def test_submit_delivers_exceptions(tmp_path, monkeypatch):
 
 
 def test_queue_wait_and_check_time_disjoint(tmp_path, monkeypatch):
-    # 2026-07-11 review round 2 (checklist #3): prove_queue_s + prove_run_s
-    # must not double count. queue_wait covers idle.get(); check_time is
-    # stamped AFTER the worker was obtained. Inject a 0.25s idle delay and a
-    # 0.1s run: check_time must exclude the idle delay.
+    # queue_wait must cover only idle-worker and FIFO delay, while check_time covers execution after a worker is obtained. A delayed worker and a separate execution delay verify that these intervals do not overlap.
     import time as _time
 
     p = _pool(tmp_path, monkeypatch)
@@ -113,13 +107,12 @@ def test_queue_wait_and_check_time_disjoint(tmp_path, monkeypatch):
 
     threading.Thread(target=_feed).start()
     r = p._check_uncached(THM)
-    assert r["queue_wait"] >= 0.2                 # saw the idle delay
-    assert 0.05 <= r["check_time"] <= 0.2         # run only, no idle time
+    assert r.queue_wait >= 0.2                    # saw the idle delay
+    assert 0.05 <= r.check_time <= 0.2            # run only, no idle time
 
 
-def test_submit_concurrent_single_flight(tmp_path, monkeypatch):
-    # 16 concurrent submits of ONE theorem: dispatchers + the pool's
-    # single-flight memo must still collapse to one real proof.
+def test_submit_deduplicates_concurrent_identical_checks(tmp_path, monkeypatch):
+    # Sixteen concurrent submissions of one theorem still perform one proof.
     p = _pool(tmp_path, monkeypatch, num_workers=3)
     n = {"c": 0}
     lock = threading.Lock()
@@ -132,5 +125,5 @@ def test_submit_concurrent_single_flight(tmp_path, monkeypatch):
     monkeypatch.setattr(p, "_check_uncached", fake_uncached)
     futs = [p.submit(THM) for _ in range(16)]
     outs = [f.result(timeout=15.0) for f in futs]
-    assert all(o["success"] for o in outs)
+    assert all(o.proved for o in outs)
     assert n["c"] == 1

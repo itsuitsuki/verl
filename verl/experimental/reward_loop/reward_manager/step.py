@@ -20,13 +20,11 @@ from typing import Callable, Optional
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
+from verl.experimental.reward_loop.reward_manager.format_penalty import (
+    assess_response, place_extra_penalty, verifier_response)
 from verl.utils.reward_score import default_compute_score
-from verl.utils.step_splitter import (
-    default_split_fn,
-    get_step_token_positions,
-    split_by_xml_step_tags,
-    split_response_into_steps,
-)
+from verl.utils.step_splitter import (char_end_to_token_pos, default_split_fn,
+                                      get_step_token_positions)
 
 
 def _compute_step_reward_random(step_text: str, prompt_text: str, step_history: list[str], **kwargs) -> float:
@@ -109,7 +107,7 @@ class StepRewardManager(RewardManagerBase):
         if old_max_tries is not None:
             self.api_config["old_max_tries"] = int(old_max_tries)
         # Per-verification deadline in seconds (Z3 subprocess timeout / Isabelle
-        # check_deadline). New alias `verify_timeout` preferred; `fol_timeout`
+        # verify_timeout). New alias `verify_timeout` preferred; `fol_timeout`
         # kept for backward compatibility with existing scripts.
         z3_timeout = reward_cfg.get("verify_timeout", algo_cfg.get("verify_timeout",
                      reward_cfg.get("fol_timeout", algo_cfg.get("fol_timeout", None))))
@@ -151,12 +149,6 @@ class StepRewardManager(RewardManagerBase):
             algo_cfg.get("fol_judge_use_outlines", False),
         )
         self.api_config["fol_judge_use_outlines"] = bool(fol_judge_use_outlines)
-        fol_format_failed_score = reward_cfg.get(
-            "fol_format_failed_score",
-            algo_cfg.get("fol_format_failed_score", None),
-        )
-        if fol_format_failed_score is not None:
-            self.api_config["fol_format_failed_score"] = float(fol_format_failed_score)
         self.validate_with_step_reward = _as_bool(
             reward_cfg.get("validate_with_step_reward", algo_cfg.get("validate_with_step_reward", True))
         )
@@ -190,7 +182,8 @@ class StepRewardManager(RewardManagerBase):
         # Built-in extra reward types if requested (Lazy loading)
         if any(rt in ["fol", "fol_old", "format"] for rt in self.step_reward_types):
             try:
-                from verl.utils.reward_score.formal_verify import compute_step_reward_format_fol, compute_step_reward_fol
+                from verl.utils.reward_score.formal_verify import (
+                    compute_step_reward_fol, compute_step_reward_format_fol)
                 if "format" not in self.step_reward_fns:
                     self.step_reward_fns["format"] = compute_step_reward_format_fol
                 if "fol" not in self.step_reward_fns:
@@ -198,14 +191,16 @@ class StepRewardManager(RewardManagerBase):
             except ImportError as e:
                 logging.getLogger(__name__).warning("Failed to lazily load built-in FOL reward functions: %s", e)
             try:
-                from verl.utils.reward_score.fol_old import compute_step_reward_fol as compute_step_reward_fol_old
+                from verl.utils.reward_score.fol_old import \
+                    compute_step_reward_fol as compute_step_reward_fol_old
                 if "fol_old" not in self.step_reward_fns:
                     self.step_reward_fns["fol_old"] = compute_step_reward_fol_old
             except ImportError:
                 pass
 
         if "self_eval" in self.step_reward_types:
-            from verl.utils.reward_score.self_eval import compute_step_reward_self_eval
+            from verl.utils.reward_score.self_eval import \
+                compute_step_reward_self_eval
             if "self_eval" not in self.step_reward_fns:
                 self.step_reward_fns["self_eval"] = compute_step_reward_self_eval
 
@@ -236,7 +231,7 @@ class StepRewardManager(RewardManagerBase):
         )  # penalize responses with multiple \boxed{}
         self.penalty_on_bad_format = bool(
             reward_cfg.get("penalty_on_bad_format", algo_cfg.get("penalty_on_bad_format", False))
-        )  # penalize mismatched <step>/<conclusion> tags
+        )  # penalize each badly formatted <step> (per step; see format_penalty.py)
         self.penalty_score = float(
             reward_cfg.get("penalty_score", algo_cfg.get("penalty_score", 0.0))
         )  # score to assign when penalized (default 0.0, can be negative)
@@ -338,13 +333,13 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_g_steps": 0,
                         "isabelle_m_steps": 0,
                         "isabelle_t_steps": 0,
-                        "isabelle_judge_http_wall_s": 0.0,
-                        "isabelle_translate_validate_wall_s": 0.0,
+                        "isabelle_judge_http_wall_time": 0.0,
+                        "isabelle_translate_validate_wall_time": 0.0,
                         "isabelle_prove_calls": 0,
-                        "isabelle_prove_queue_s": 0.0,
-                        "isabelle_prove_run_s": 0.0,
+                        "isabelle_prove_queue_time": 0.0,
+                        "isabelle_prove_run_time": 0.0,
                         "isabelle_prove_cache_hits": 0,
-                        "isabelle_reward_wall_s": 0.0,
+                        "isabelle_reward_wall_time": 0.0,
                         "isabelle_pool_restarts": 0,
                         "isabelle_thm_cache_hit_rate": 0.0,
                         "isabelle_tr_cache_hit_rate": 0.0,
@@ -352,7 +347,7 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_judge_retry_calls": 0,
                         "isabelle_translation_mem_hits": 0,
                         "isabelle_translation_disk_hits": 0,
-                        "isabelle_translation_flight_hits": 0,
+                        "isabelle_translation_shared_hits": 0,
                         "isabelle_translation_xproc_hits": 0,
                         "isabelle_translation_failures": 0,
                         "isabelle_pattern": "",
@@ -391,26 +386,28 @@ class StepRewardManager(RewardManagerBase):
             if self.reward_router_address is not None
             else {}
         )
-        if self.is_async_reward_score:
-            result = await self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                **extra_reward_kwargs,
-            )
-        else:
-            result = await self.loop.run_in_executor(
+        async def _grade_outcome(solution_str):
+            """One outcome-grader call; also used to regrade on the first-boxed prefix when the response contains several \\boxed answers."""
+            if self.is_async_reward_score:
+                return await self.compute_score(
+                    data_source=data_source,
+                    solution_str=solution_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                    **extra_reward_kwargs,
+                )
+            return await self.loop.run_in_executor(
                 None,
                 lambda: self.compute_score(
                     data_source=data_source,
-                    solution_str=response_str,
+                    solution_str=solution_str,
                     ground_truth=ground_truth,
                     extra_info=extra_info,
                     **extra_reward_kwargs,
                 ),
             )
 
+        result = await _grade_outcome(response_str)
         if isinstance(result, dict):
             score = result["score"]
         else:
@@ -420,6 +417,9 @@ class StepRewardManager(RewardManagerBase):
         if isinstance(result, dict):
             reward_extra_info.update(result)
 
+        # Validation reports plain benchmark accuracy: the format rules below (including the
+        # boxed contract) shape TRAINING rewards only, so returning here keeps validation
+        # curves comparable with baselines and published numbers.
         if _as_bool(data_item.non_tensor_batch.get("__validate__", False)) and not self.validate_with_step_reward:
             reward_extra_info["validation_skipped_step_reward"] = True
             return {"reward_score": score, "reward_extra_info": reward_extra_info}
@@ -430,71 +430,64 @@ class StepRewardManager(RewardManagerBase):
         reward_extra_info["num_steps"] = len(step_positions)
 
         # --- Anti-reward-hacking precheck ---
-        # Hard path penalties skip all expensive process-reward calls. Max-step
-        # overflow is finer grained: keep the prefix and penalize only the suffix.
-        hard_penalize = False
-        hard_penalty_reason = []
-        penalty_step_indices = set()
-        penalty_reason = []
-
-        num_steps = len(step_positions)
-
-        # 1. Too many steps
-        if self.penalty_max_steps > 0 and num_steps > self.penalty_max_steps:
-            penalty_step_indices.update(range(self.penalty_max_steps, num_steps))
-            penalty_reason.append(f"num_steps={num_steps}>{self.penalty_max_steps}")
-
-        # 2. Response truncated (hit max_response_length)
-        if self.penalty_on_truncated and valid_response_length >= response_length:
-            hard_penalize = True
-            hard_penalty_reason.append("truncated")
-
-        # 3. Multiple \boxed{} in response
-        if self.penalty_on_multi_boxed:
-            import re as _re
-
-            boxed_count = len(_re.findall(r'\\boxed\{', response_str))
-            if boxed_count > 1:
-                hard_penalize = True
-                hard_penalty_reason.append(f"multi_boxed={boxed_count}")
-
-        # 4. Bad format: mismatched <step>/<conclusion> tags
-        if self.penalty_on_bad_format:
-            step_open = response_str.count("<step>")
-            step_close = response_str.count("</step>")
-            has_conclusion_outside_step = False
-            # Simple heuristic: <conclusion> after the last </step>
-            last_step_close = response_str.rfind("</step>")
-            last_conclusion = response_str.rfind("<conclusion>")
-            if last_conclusion > last_step_close and last_step_close != -1:
-                has_conclusion_outside_step = True
-            has_fol_reward = any(rt in {"fol", "fol_old"} for rt in self.step_reward_types)
-            no_xml_step = self.use_xml and has_fol_reward and step_open == 0 and step_close == 0
-            if no_xml_step:
-                hard_penalize = True
-                hard_penalty_reason.append("bad_format(no_xml_step)")
-                reward_extra_info["num_steps"] = 0
-            elif step_open != step_close or has_conclusion_outside_step:
-                hard_penalize = True
-                hard_penalty_reason.append(
-                    f"bad_format(open={step_open},close={step_close},conclusion_outside={has_conclusion_outside_step})"
-                )
-
-        if hard_penalize:
-            penalty_val = self.penalty_score
-            if self.use_xml and response_str.count("<step>") == 0 and response_str.count("</step>") == 0:
-                penalty_rewards = [(max(0, int(valid_response_length) - 1), penalty_val)]
+        # The unified rules live in format_penalty.assess_response (shared with the tree
+        # manager): truncation and the boxed contract are whole-response, a badly formatted
+        # step is penalized ALONE while the valid steps still verify, and the step-count cap
+        # penalizes only the suffix.
+        decision = assess_response(
+            response_str,
+            step_positions,
+            use_xml=self.use_xml,
+            valid_response_length=int(valid_response_length),
+            response_length=int(response_length),
+            penalty_score=self.penalty_score,
+            penalty_max_steps=self.penalty_max_steps,
+            penalty_on_truncated=self.penalty_on_truncated,
+            penalty_on_multi_boxed=self.penalty_on_multi_boxed,
+            penalty_on_bad_format=self.penalty_on_bad_format,
+        )
+        if decision.reasons:
+            reward_extra_info["penalty_reason"] = "|".join(decision.reasons)
+        if decision.penalized:
+            reward_extra_info["process_reward_penalized"] = True
+        if decision.num_steps_override is not None:
+            reward_extra_info["num_steps"] = decision.num_steps_override
+        if decision.outcome_override is not None:
+            # A response without any \boxed answer forfeits the outcome.
+            score = float(decision.outcome_override)
+            reward_extra_info["acc"] = score
+        if decision.first_boxed_end is not None:
+            # Several \boxed answers: the FIRST one is the committed answer. The initial
+            # grade read the full text (whose LAST boxed is the exploitable one), so regrade
+            # on the prefix that ends with the first boxed.
+            regrade = await _grade_outcome(response_str[: decision.first_boxed_end])
+            if isinstance(regrade, dict):
+                score = regrade["score"]
+                reward_extra_info.update(regrade)
             else:
-                penalty_rewards = [(int(pos), penalty_val) for _, pos in step_positions]
+                score = regrade
+            reward_extra_info["acc"] = score
+        if decision.skip_verifier:
             for reward_type in self.step_reward_types:
-                reward_extra_info[f"{reward_type}_step_reward"] = penalty_rewards
-            reward_extra_info["process_reward_penalized"] = True
-            reward_extra_info["penalty_reason"] = "|".join(hard_penalty_reason)
+                reward_extra_info[f"{reward_type}_step_reward"] = list(decision.process_rewards)
             return {"reward_score": score, "reward_extra_info": reward_extra_info}
-
-        if penalty_step_indices:
-            reward_extra_info["process_reward_penalized"] = True
-            reward_extra_info["penalty_reason"] = "|".join(penalty_reason)
+        penalty_step_indices = decision.penalty_step_indices
+        # The whole-response Isabelle call must not see the invalid steps (each is already
+        # penalized by index above) nor anything past the committed first \boxed, but it must
+        # keep the answer text even when the unclosed tail block swallowed the \boxed line;
+        # the per-step FOL loop skips the same indices instead.
+        response_for_verifier = verifier_response(response_str, decision)
+        # Reasoning tags outside every step block and each \boxed after the committed
+        # first one cost one penalty_score at their own token position (mapped here, where
+        # the tokenizer lives); appended per reward type below.
+        extra_penalty_char_ends = list(decision.extra_boxed_char_ends)
+        if decision.stray_tag_char_end is not None:
+            extra_penalty_char_ends.append(decision.stray_tag_char_end)
+        extra_penalty_positions = [
+            char_end_to_token_pos(valid_response_ids, self.tokenizer,
+                                  char_end, int(valid_response_length))
+            for char_end in extra_penalty_char_ends
+        ]
 
         # 2.2 Extract prompt text for reward functions that need it
         raw_prompt = data_item.non_tensor_batch.get("raw_prompt", [])
@@ -512,20 +505,21 @@ class StepRewardManager(RewardManagerBase):
 
             fol_shared_state = None
             if reward_type == "fol" and (self.api_config or {}).get("fol_task_type") == "math":
-                from verl.utils.reward_score.formal_verify import compute_solution_reward_isabelle
+                from verl.utils.reward_score.formal_verify import \
+                    compute_solution_reward_isabelle
                 loop = asyncio.get_event_loop()
                 isabelle_rewards, isabelle_debug = await loop.run_in_executor(
                     self._executor,
                     lambda: compute_solution_reward_isabelle(
                         problem=prompt_text,
-                        response=response_str,
+                        response=response_for_verifier,
                         ground_truth=(extra_info or {}).get(
                             "math_final_answer",
                             (extra_info or {}).get("answer", "")),
                         api_config=self.api_config,
                         return_debug=True,
                         # Steps beyond penalty_max_steps get penalty_score and
-                        # their verdicts are discarded (see mapping below) --
+                        # Their per-step results are not used (see mapping below).
                         # don't waste judge/prover time computing them.
                         max_steps=self.penalty_max_steps,
                     ),
@@ -540,6 +534,9 @@ class StepRewardManager(RewardManagerBase):
                         ri += 1
                     else:
                         step_rewards.append((int(token_end_pos), 0.0))
+                for extra_pos in extra_penalty_positions:
+                    place_extra_penalty(step_rewards, extra_pos, self.penalty_score,
+                                        max(0, int(valid_response_length) - 1))
                 step_rewards.sort(key=lambda item: item[0])
                 reward_extra_info[f"{reward_type}_step_reward"] = step_rewards
                 # Per-response Isabelle metrics (mirror Z3 fol_judge/* pattern).
@@ -570,15 +567,15 @@ class StepRewardManager(RewardManagerBase):
                     (d.get("translation_attempts_givens") or 0)
                     + (d.get("translation_attempts_steps") or 0))
                 # Wall profile + cache/restart gauges (2026-07-11 review #6).
-                reward_extra_info["isabelle_judge_http_wall_s"] = float(
-                    d.get("judge_http_wall_s") or 0.0)
-                reward_extra_info["isabelle_translate_validate_wall_s"] = float(
-                    d.get("translate_validate_wall_s") or 0.0)
+                reward_extra_info["isabelle_judge_http_wall_time"] = float(
+                    d.get("judge_http_wall_time") or 0.0)
+                reward_extra_info["isabelle_translate_validate_wall_time"] = float(
+                    d.get("translate_validate_wall_time") or 0.0)
                 reward_extra_info["isabelle_prove_calls"] = int(d.get("prove_calls") or 0)
-                reward_extra_info["isabelle_prove_queue_s"] = float(d.get("prove_queue_s") or 0.0)
-                reward_extra_info["isabelle_prove_run_s"] = float(d.get("prove_run_s") or 0.0)
+                reward_extra_info["isabelle_prove_queue_time"] = float(d.get("prove_queue_time") or 0.0)
+                reward_extra_info["isabelle_prove_run_time"] = float(d.get("prove_run_time") or 0.0)
                 reward_extra_info["isabelle_prove_cache_hits"] = int(d.get("prove_cache_hits") or 0)
-                reward_extra_info["isabelle_reward_wall_s"] = float(d.get("reward_wall_s") or 0.0)
+                reward_extra_info["isabelle_reward_wall_time"] = float(d.get("reward_wall_time") or 0.0)
                 reward_extra_info["isabelle_pool_restarts"] = int(d.get("pool_restarts") or 0)
                 reward_extra_info["isabelle_thm_cache_hit_rate"] = float(d.get("thm_cache_hit_rate") or 0.0)
                 reward_extra_info["isabelle_tr_cache_hit_rate"] = float(d.get("tr_cache_hit_rate") or 0.0)
@@ -587,12 +584,10 @@ class StepRewardManager(RewardManagerBase):
                 reward_extra_info["isabelle_judge_retry_calls"] = int(d.get("judge_retry_calls") or 0)
                 reward_extra_info["isabelle_translation_mem_hits"] = int(d.get("translation_mem_hits") or 0)
                 reward_extra_info["isabelle_translation_disk_hits"] = int(d.get("translation_disk_hits") or 0)
-                reward_extra_info["isabelle_translation_flight_hits"] = int(d.get("translation_flight_hits") or 0)
+                reward_extra_info["isabelle_translation_shared_hits"] = int(d.get("translation_shared_hits") or 0)
                 reward_extra_info["isabelle_translation_xproc_hits"] = int(d.get("translation_xproc_hits") or 0)
                 reward_extra_info["isabelle_translation_failures"] = int(d.get("translation_failures") or 0)
-                # Per-step verdict symbols (o=rewarded, x=unverified,
-                # c=premises-inconsistent, m=transcription-missing,
-                # g=guard-failed) for the [Step Rewards] sample print.
+                # Per-step verification result symbols (o=rewarded, x=unverified, c=premises-inconsistent, m=transcription-missing, g=guard-failed) for the [Step Rewards] sample print.
                 reward_extra_info["isabelle_pattern"] = str(d.get("pattern") or "")
                 # ALWAYS set the key (empty string when no error): batch
                 # collation asserts every response has the same
@@ -604,9 +599,9 @@ class StepRewardManager(RewardManagerBase):
             if reward_type == "fol":
                 from verl.utils.reward_score.formal_verify import (
                     _has_student_premise_conclusion_duplicate,
-                    check_step_format_fol,
                     prepare_fol_shared_state,
                 )
+                from verl.utils.step_splitter import check_step_format
 
                 # Some responses have only malformed XML steps or copied
                 # premise/conclusion duplicates. compute_step_reward_fol will
@@ -617,7 +612,7 @@ class StepRewardManager(RewardManagerBase):
                 for i, (step_text, _token_end_pos) in enumerate(step_positions):
                     if i in penalty_step_indices:
                         continue
-                    if "<step>" in step_text and not check_step_format_fol(step_text):
+                    if "<step>" in step_text and not check_step_format(step_text):
                         continue
                     if _has_student_premise_conclusion_duplicate(step_text):
                         continue
@@ -635,12 +630,16 @@ class StepRewardManager(RewardManagerBase):
                         ),
                     )
 
-            # Pre-build all step histories so calls can run in parallel
+            # Pre-build all step histories so calls can run in parallel. A penalized step's
+            # text must not leak into later steps' cumulative context either (`step` /
+            # `dependency_graph` modes): the history keeps the current step and only the
+            # non-penalized earlier steps.
             call_args = []
             for i, (step_text, token_end_pos) in enumerate(step_positions):
                 if i in penalty_step_indices:
                     continue
-                history = [s for s, _ in step_positions[: i + 1]]
+                history = [s for j, (s, _) in enumerate(step_positions[: i + 1])
+                           if j not in penalty_step_indices]
                 call_args.append((step_text, prompt_text, history, token_end_pos))
 
             loop = asyncio.get_event_loop()
@@ -736,6 +735,9 @@ class StepRewardManager(RewardManagerBase):
                 if i < len(step_positions):
                     _, token_end_pos = step_positions[i]
                     step_rewards.append((int(token_end_pos), self.penalty_score))
+            for extra_pos in extra_penalty_positions:
+                place_extra_penalty(step_rewards, extra_pos, self.penalty_score,
+                                    max(0, int(valid_response_length) - 1))
             step_rewards.sort(key=lambda item: item[0])
 
             key = f"{reward_type}_step_reward"

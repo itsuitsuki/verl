@@ -4,31 +4,32 @@ is needed.
 
 v1 reaped ANY poly with sustained ~100% CPU and mass-killed HEALTHY provers
 grinding queued checks (8 kills/12min incl. 3-at-once -> pool wedge). v2 reaps
-only polys in an OVERSIZED (>2) poly tree -- the zombie-with-replacement
-signature -- and always protects the 2 newest-started polys (the live prover
+only polys in an OVERSIZED (>2) poly tree; the zombie-with-replacement
+signature; and always protects the 2 newest-started polys (the live prover
 pair). Linux-only (server_pool uses os.sysconf)."""
 import os
 
 import pytest
 
 from verl.utils.isabelle_utils import server_pool as sp
+from verl.utils.isabelle_utils._server_pool import processes
 
 
 @pytest.fixture
 def pool(tmp_path, monkeypatch):
     p = sp.IsabelleServerPool(num_workers=1, base_dir=str(tmp_path))
     p.workers[0].jvm_pid = 9999
-    monkeypatch.setattr(sp, "_read_stat",
+    monkeypatch.setattr(processes, "_read_stat",
                         lambda pid: (1, 1, 1, 100) if pid == 9999 else None)
     return p
 
 
 def _wire(monkeypatch, polys):
     """polys: {pid: {"cpu": int, "start": int}} mutable state."""
-    monkeypatch.setattr(sp, "_descendants",
+    monkeypatch.setattr(processes, "_descendants",
                         lambda root: {pid: (0, 0, 0) for pid in polys})
     monkeypatch.setattr(
-        sp, "_poly_cpu_state",
+        processes, "_poly_cpu_state",
         lambda pid: ("R", polys[pid]["cpu"], polys[pid]["start"])
         if pid in polys else None)
     killed = []

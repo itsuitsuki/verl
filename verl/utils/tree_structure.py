@@ -42,7 +42,8 @@ import numpy as np
 import torch
 
 from verl.utils.fol_utils.common import check_step_format_fol
-from verl.utils.step_splitter import default_split_fn, get_split_fn
+from verl.utils.step_splitter import (default_split_fn, find_stray_xml_tags,
+                                      first_boxed_end, get_split_fn)
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -286,17 +287,29 @@ class TreeManager:
             and not check_step_format_fol(step_text or "")
         )
 
-    def _should_penalize_path_format(self, path_text: str) -> bool:
-        """Match the round-0 bad-format precheck on a full path/branch string."""
-        if not (self.use_xml and self.penalty_on_bad_format):
-            return False
-        text = path_text or ""
-        step_open = text.count("<step>")
-        step_close = text.count("</step>")
-        last_step_close = text.rfind("</step>")
-        last_conclusion = text.rfind("<conclusion>")
-        has_conclusion_outside_step = last_conclusion > last_step_close and last_step_close != -1
-        return step_open != step_close or has_conclusion_outside_step
+    def _mark_branch_extra_boxed(self, fork_node: "TreeNode", branch_nodes: list) -> None:
+        """Unified boxed rule for a branch path (multi-boxed format error, not the branch outcome): the FIRST \\boxed on the path is the committed answer (evaluate_leaves grades the prefix ending there), every LATER \\boxed costs ITS OWN node the external PRM score (a no-op when that node is the terminal answer tail, which carries no process reward anyway), and nodes without an extra \\boxed keep their verdicts. Replaces the old whole-branch penalty on the count."""
+        if not (self.penalty_on_multi_boxed and branch_nodes):
+            return
+        ancestor_text = "".join(node.step_text or "" for node in fork_node.path_from_root())
+        committed = re.search(r"\\boxed\{", ancestor_text) is not None
+        for node in branch_nodes:
+            extra = len(re.findall(r"\\boxed\{", node.step_text or ""))
+            if extra == 0:
+                continue
+            if not committed:
+                committed = True
+                extra -= 1
+            if extra > 0:
+                self._mark_ext_prm_penalty([node], "extra_boxed")
+
+    def _mark_branch_stray_tags(self, response_text: str, branch_nodes: list) -> None:
+        """Unified format rule for newly generated branch text: per-step defects are penalized per node at scoring time (_should_penalize_step_format), so the only branch-level rule left is reasoning tags OUTSIDE every step block. Those cost the LAST process-rewardable branch node its external PRM score (the junk trails the steps; the terminal answer tail carries no process reward, so marking it would be a no-op), matching the step manager's localized stray-tag penalty; the other branch nodes keep their own verdicts. Replaces the old whole-branch penalty on a tag-count mismatch or an outside conclusion."""
+        if not (self.use_xml and self.penalty_on_bad_format and branch_nodes):
+            return
+        if find_stray_xml_tags(response_text or ""):
+            rewardable = [node for node in branch_nodes if node.process_rewardable]
+            self._mark_ext_prm_penalty(rewardable[-1:], "stray_xml_tags")
 
     def _mark_ext_prm_penalty(self, nodes: list["TreeNode"], reason: str) -> None:
         for node in nodes:
@@ -414,6 +427,13 @@ class TreeManager:
                     tok_end = min(tok_end, valid_resp_len)
                     step_ranges.append((_prev, tok_end, step_text))
                     _prev = tok_end
+                if _prev < valid_resp_len:
+                    # Tokens after the last </step> (the \boxed answer, EOS) belong to the
+                    # response: everything that rebuilds a path from node token_ids
+                    # (build_flat_batch training rows, full_token_ids outcome grading) only
+                    # sees tokens that live in some node, so the tail must be a node too.
+                    step_ranges.append(
+                        (_prev, valid_resp_len, response_text[xml_steps[-1][2]:]))
             else:
                 # Delimiter: split directly in token space (no BPE drift)
                 step_ranges = split_tokens_by_delimiter(
@@ -448,6 +468,9 @@ class TreeManager:
                     token_start=step_token_start,
                     token_end=step_token_end,
                     tree_idx=i,
+                    process_rewardable=not (
+                        self.use_xml and self._is_terminal_answer_segment(step_text)
+                    ),
                 )
 
                 if prev_node is not None:
@@ -788,6 +811,12 @@ class TreeManager:
                     tok_end = min(tok_end, valid_resp_len)
                     step_ranges.append((_prev, tok_end, step_text))
                     _prev = tok_end
+                if _prev < valid_resp_len:
+                    # Same tail rule as initialize_trees: the branch's \boxed answer and EOS
+                    # live after the last </step> and must land in a node, or the flattened
+                    # training row and the leaf outcome text lose them.
+                    step_ranges.append(
+                        (_prev, valid_resp_len, response_text[xml_steps[-1][2]:]))
             else:
                 step_ranges = split_tokens_by_delimiter(
                     valid_resp_ids, self.tokenizer
@@ -866,18 +895,13 @@ class TreeManager:
                 if repeated_branch:
                     self._mark_ext_prm_penalty(branch_nodes, "repetition")
 
-                # Align forked branches with the round-0 anti-hacking precheck.
-                # Scope the penalty to newly generated branch nodes; ancestors
+                # Align forked branches with the unified format rules.
+                # Scope the penalties to newly generated branch nodes; ancestors
                 # keep their previously assigned scores.
-                full_path_text = "".join(n.step_text or "" for n in fork_node.path_from_root()) + response_text
                 if self.penalty_on_truncated and prev_node.finish_reason == "length" and not truncated_by_max_steps:
                     self._mark_ext_prm_penalty(branch_nodes, "truncated")
-                if self.penalty_on_multi_boxed:
-                    boxed_count = len(re.findall(r"\\boxed\{", full_path_text))
-                    if boxed_count > 1:
-                        self._mark_ext_prm_penalty(branch_nodes, f"multi_boxed={boxed_count}")
-                if self._should_penalize_path_format(full_path_text):
-                    self._mark_ext_prm_penalty(branch_nodes, "bad_format_path")
+                self._mark_branch_extra_boxed(fork_node, branch_nodes)
+                self._mark_branch_stray_tags(response_text, branch_nodes)
 
         return new_nodes
 
@@ -1068,7 +1092,14 @@ class TreeManager:
                     # Match StepRewardManager semantics: step_history includes
                     # the current step, so cumulative FOL verifies the full
                     # prefix ending at this node rather than only ancestors.
-                    step_history = [n.step_text for n in path]
+                    # A format-penalized ancestor's text must not leak into the
+                    # cumulative context (same rule as the step manager); the
+                    # current node stays regardless, its own penalty short
+                    # circuits in _run_task before any translation.
+                    step_history = [
+                        n.step_text for n in path
+                        if n is node or not self._should_penalize_step_format(n.step_text)
+                    ]
                     tasks.append(
                         (
                             node,
@@ -1088,11 +1119,9 @@ class TreeManager:
             node, prm_name, prompt_text, step_history, extra_info, fol_shared_state = task
             reward_fn = ext_prm_fns[prm_name]
             if prm_name == "fol" and node.ext_prm_penalty:
-                debug = None
                 debug = {
                     "path_penalty_closed": True,
                     "path_penalty_reason": node.ext_prm_penalty_reason,
-                    "path_penalty_score": self.penalty_score,
                     "judge_usage": {
                         "calls": 0,
                         "prompt_tokens": 0,
@@ -1102,12 +1131,10 @@ class TreeManager:
                 }
                 return node, prm_name, self.penalty_score, debug
             if prm_name == "fol" and self._should_penalize_step_format(node.step_text):
-                api_config = getattr(reward_fn, "keywords", {}).get("api_config") or {}
-                format_failed_score = float(api_config.get("fol_format_failed_score", 0.0))
-                debug = None
+                # Unified rule: every training-layer format penalty is penalty_score (the
+                # backend's own defensive check returns 0.0 only for direct callers).
                 debug = {
                     "format_failed_closed": True,
-                    "format_failed_score": format_failed_score,
                     "judge_usage": {
                         "calls": 0,
                         "prompt_tokens": 0,
@@ -1115,7 +1142,7 @@ class TreeManager:
                         "total_tokens": 0,
                     },
                 }
-                return node, prm_name, format_failed_score, debug
+                return node, prm_name, self.penalty_score, debug
             kwargs = {"extra_info": extra_info}
             if prm_name == "fol" and fol_shared_state is not None:
                 kwargs["fol_shared_state"] = fol_shared_state
@@ -1203,6 +1230,17 @@ class TreeManager:
                 # Build full response text
                 response_ids = leaf.full_token_ids()
                 response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                # Unified boxed rule (matching the step manager): with several \boxed the
+                # FIRST is the committed answer, so the outcome is graded on the prefix
+                # ending there; with none the outcome is forfeited as penalty_score,
+                # whatever the dataset scorer would have extracted from the plain text.
+                if self.penalty_on_multi_boxed:
+                    n_boxed = len(re.findall(r"\\boxed\{", response_text))
+                    if n_boxed == 0:
+                        leaf.correctness = float(self.penalty_score)
+                        continue
+                    if n_boxed > 1:
+                        response_text = response_text[: first_boxed_end(response_text)]
 
                 # Get ground truth from template
                 data_source = None

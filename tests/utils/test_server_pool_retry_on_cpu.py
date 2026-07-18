@@ -1,22 +1,12 @@
-"""CPU-only unit tests for IsabelleServerPool's check-retry / hard-timeout
-recovery. These mock ``_run_one_check`` so NO Isabelle server is started -- they
-exercise only the control flow of ``_check_uncached``:
+"""CPU-only tests for IsabelleServerPool retry, timeout, and RSS handling.
 
-  * a transient ``worker_error`` (hard-timeout or worker crash) is retried on a
-    fresh worker, up to ``MAX_CHECK_ATTEMPTS``, so the verification is recovered
-    instead of lost to a fail-closed ``x``;
-  * a persistent ``worker_error`` exhausts the attempts and returns fail-closed;
-  * a genuine proof failure (no ``worker_error``) is returned immediately and is
-    never retried.
-
-Regression guard for the 2026-07-08 step-135 Isabelle-pool deadlock fix
-(single-flight leader wedged -> followers waited forever). See
-verl/utils/isabelle_utils/server_pool.py.
+These tests mock `_run_one_check`, so no Isabelle server is started. A transient worker error is retried on another worker, a persistent worker error exhausts MAX_CHECK_ATTEMPTS, and a genuine proof failure returns immediately. The pending-request tests also cover the deadlock fixed after step 135, where a stopped request owner left every waiting caller blocked indefinitely.
 """
 
 import queue
 
 from verl.utils.isabelle_utils import server_pool as sp
+from verl.utils.isabelle_utils._server_pool import processes
 
 WORKER_ERROR = {"success": False, "worker_error": True, "errors": ["hard timeout"]}
 OK = {"success": True, "elapsed": 1.0, "errors": []}
@@ -29,8 +19,7 @@ class _FakeWorker:
 
 
 def _pool_with_mock(seq):
-    """Pool whose ``_run_one_check`` returns ``seq[i]`` on the i-th call (clamped
-    to the last entry). No ``start()`` -> no Isabelle. Returns (pool, counter)."""
+    """Return a pool whose `_run_one_check` uses successive values from `seq`, reusing the last value after the sequence is exhausted."""
     pool = sp.IsabelleServerPool(num_workers=2, base_dir="/tmp/retry_unit_test")
     pool.idle = queue.Queue()
     for wid in range(2):
@@ -50,26 +39,35 @@ def _pool_with_mock(seq):
 def test_retry_recovers_transient_wedge():
     pool, calls = _pool_with_mock([WORKER_ERROR, OK])
     r = pool._check_uncached("dummy theorem")
-    assert r["success"] is True
-    assert r["attempts"] == 2
+    assert r.proved is True
+    assert r.attempts == 2
     assert calls["n"] == 2
 
 
 def test_persistent_wedge_is_fail_closed():
     pool, calls = _pool_with_mock([WORKER_ERROR])
     r = pool._check_uncached("dummy theorem")
-    assert r["success"] is False
-    assert r["worker_error"] is True
-    assert r["attempts"] == sp.IsabelleServerPool.MAX_CHECK_ATTEMPTS
+    assert r.proved is False
+    assert r.infrastructure_failure is True
+    assert r.attempts == sp.IsabelleServerPool.MAX_CHECK_ATTEMPTS
     assert calls["n"] == sp.IsabelleServerPool.MAX_CHECK_ATTEMPTS
 
 
 def test_genuine_proof_failure_not_retried():
     pool, calls = _pool_with_mock([GENUINE_FAIL, OK])
     r = pool._check_uncached("dummy theorem")
-    assert r["success"] is False
-    assert r["attempts"] == 1
+    assert r.proved is False
+    assert r.attempts == 1
     assert calls["n"] == 1
+
+
+def test_each_worker_process_tree_memory_limit_override():
+    pool = sp.IsabelleServerPool(
+        num_workers=1,
+        base_dir="/tmp/proc_tree_mem_limit_unit",
+        each_worker_proc_tree_mem_max_gb=3.5,
+    )
+    assert pool.EACH_WORKER_PROC_TREE_MEM_MAX_KB == int(3.5 * 1048576)
 
 
 # ---- per-check RSS ceiling (host-memory bound; 2026-07-08 OOM root cause) ----
@@ -111,15 +109,14 @@ def _bare_pool(base):
 
 
 def test_recycle_slow_check_scans_immediately(monkeypatch):
-    # The RSS scan is gated (every 5th check OR after a slow one); a SLOW
-    # check (>5s) scans right away, so a leak born of a heavy proof is caught
-    # on the very next turnaround.
+    # The RSS scan runs every fifth check or immediately after a slow check. A
+    # slow check (>5s) therefore detects excessive memory on this turnaround.
     pool = _bare_pool("/tmp/rss_unit_over")
-    monkeypatch.setattr(sp, "_poly_tree_rss_kb",
-                        lambda pid: pool.WORKER_RSS_CAP_KB + 1)
+    monkeypatch.setattr(processes, "_poly_tree_rss_kb",
+                        lambda pid: pool.EACH_WORKER_PROC_TREE_MEM_MAX_KB + 1)
     w = _RecordingWorker(elapsed=6.0)
     r = pool._run_one_check(w, "thm")
-    assert r["success"] is True            # result still delivered to caller
+    assert r.proved is True                # result still delivered to caller
     assert ("stop", False) in w.events     # recycled with fast-kill (killpg)
     assert ("start",) in w.events          # JVM rebuilt -> all poly reset
     assert pool.idle.qsize() == 1          # returned to the pool afterwards
@@ -127,9 +124,9 @@ def test_recycle_slow_check_scans_immediately(monkeypatch):
 
 def test_recycle_fast_checks_scan_every_fifth(monkeypatch):
     # Fast checks skip the full-/proc scan until the 5th turnaround.
-    pool = _bare_pool("/tmp/rss_unit_gate")
-    monkeypatch.setattr(sp, "_poly_tree_rss_kb",
-                        lambda pid: pool.WORKER_RSS_CAP_KB + 1)
+    pool = _bare_pool("/tmp/rss_unit_every_fifth")
+    monkeypatch.setattr(processes, "_poly_tree_rss_kb",
+                        lambda pid: pool.EACH_WORKER_PROC_TREE_MEM_MAX_KB + 1)
     w = _RecordingWorker(elapsed=1.0)
     for i in range(4):
         pool._run_one_check(w, "thm")
@@ -141,10 +138,10 @@ def test_recycle_fast_checks_scan_every_fifth(monkeypatch):
 
 def test_no_recycle_when_poly_rss_under_cap(monkeypatch):
     pool = _bare_pool("/tmp/rss_unit_under")
-    monkeypatch.setattr(sp, "_poly_tree_rss_kb", lambda pid: 1024)  # 1 MB
+    monkeypatch.setattr(processes, "_poly_tree_rss_kb", lambda pid: 1024)  # 1 MB
     w = _RecordingWorker(elapsed=6.0)      # slow -> scans every time
     for _ in range(6):
         r = pool._run_one_check(w, "thm")
         pool.idle.get()
-        assert r["success"] is True
+        assert r.proved is True
     assert w.events == []                  # healthy worker NOT recycled

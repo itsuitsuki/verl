@@ -36,13 +36,11 @@ from typing import Callable, Optional
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
+from verl.experimental.reward_loop.reward_manager.format_penalty import (
+    assess_response, place_extra_penalty)
 from verl.utils.reward_score import default_compute_score
-from verl.utils.step_splitter import (
-    default_split_fn,
-    get_step_token_positions,
-    split_by_xml_step_tags,
-    split_response_into_steps,
-)
+from verl.utils.step_splitter import (char_end_to_token_pos, default_split_fn,
+                                      get_step_token_positions)
 
 
 def _compute_step_reward_random(step_text: str, prompt_text: str, step_history: list[str], **kwargs) -> float:
@@ -151,12 +149,6 @@ class TreeRewardManager(RewardManagerBase):
             algo_cfg_fol.get("fol_judge_use_outlines", False),
         )
         self.api_config["fol_judge_use_outlines"] = bool(fol_judge_use_outlines)
-        fol_format_failed_score = reward_cfg_fol.get(
-            "fol_format_failed_score",
-            algo_cfg_fol.get("fol_format_failed_score", None),
-        )
-        if fol_format_failed_score is not None:
-            self.api_config["fol_format_failed_score"] = float(fol_format_failed_score)
         self.validate_with_step_reward = _as_bool(
             reward_cfg_fol.get("validate_with_step_reward", algo_cfg_fol.get("validate_with_step_reward", True))
         )
@@ -334,26 +326,28 @@ class TreeRewardManager(RewardManagerBase):
             if self.reward_router_address is not None
             else {}
         )
-        if self.is_async_reward_score:
-            result = await self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                **extra_reward_kwargs,
-            )
-        else:
-            result = await self.loop.run_in_executor(
+        async def _grade_outcome(solution_str):
+            """One outcome-grader call; also used to regrade on the first-boxed prefix when the response contains several \\boxed answers."""
+            if self.is_async_reward_score:
+                return await self.compute_score(
+                    data_source=data_source,
+                    solution_str=solution_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                    **extra_reward_kwargs,
+                )
+            return await self.loop.run_in_executor(
                 None,
                 lambda: self.compute_score(
                     data_source=data_source,
-                    solution_str=response_str,
+                    solution_str=solution_str,
                     ground_truth=ground_truth,
                     extra_info=extra_info,
                     **extra_reward_kwargs,
                 ),
             )
 
+        result = await _grade_outcome(response_str)
         if isinstance(result, dict):
             score = result["score"]
         else:
@@ -363,6 +357,9 @@ class TreeRewardManager(RewardManagerBase):
         if isinstance(result, dict):
             reward_extra_info.update(result)
 
+        # Validation reports plain benchmark accuracy: the format rules below (including the
+        # boxed contract) shape TRAINING rewards only, so returning here keeps validation
+        # curves comparable with baselines and published numbers.
         if _as_bool(data_item.non_tensor_batch.get("__validate__", False)) and not self.validate_with_step_reward:
             reward_extra_info["validation_skipped_step_reward"] = True
             return {"reward_score": score, "reward_extra_info": reward_extra_info}
@@ -375,73 +372,73 @@ class TreeRewardManager(RewardManagerBase):
             reward_extra_info["num_steps"] = len(step_positions)
 
             # --- Anti-reward-hacking precheck ---
-            # Hard path penalties skip all expensive external-PRM calls. Max-step
-            # overflow is finer grained: keep the prefix and penalize only the suffix.
-            hard_penalize = False
-            hard_penalty_reason = []
-            penalty_step_indices = set()
-            penalty_reason = []
-
-            num_steps = len(step_positions)
-
-            if self.penalty_max_steps > 0 and num_steps > self.penalty_max_steps:
-                penalty_step_indices.update(range(self.penalty_max_steps, num_steps))
-                penalty_reason.append(f"num_steps={num_steps}>{self.penalty_max_steps}")
-
-            if self.penalty_on_truncated and valid_response_length >= response_length:
-                hard_penalize = True
-                hard_penalty_reason.append("truncated")
-
-            if self.penalty_on_multi_boxed:
-                import re as _re
-
-                boxed_count = len(_re.findall(r'\\boxed\{', response_str))
-                if boxed_count > 1:
-                    hard_penalize = True
-                    hard_penalty_reason.append(f"multi_boxed={boxed_count}")
-
-            if self.penalty_on_bad_format:
-                step_open = response_str.count("<step>")
-                step_close = response_str.count("</step>")
-                has_conclusion_outside_step = False
-                last_step_close = response_str.rfind("</step>")
-                last_conclusion = response_str.rfind("<conclusion>")
-                if last_conclusion > last_step_close and last_step_close != -1:
-                    has_conclusion_outside_step = True
-                has_fol_reward = any(rt in {"fol", "fol_old"} for rt in self.step_reward_types)
-                no_xml_step = self.use_xml and has_fol_reward and step_open == 0 and step_close == 0
-                if no_xml_step:
-                    hard_penalize = True
-                    hard_penalty_reason.append("bad_format(no_xml_step)")
-                    reward_extra_info["num_steps"] = 0
-                elif step_open != step_close or has_conclusion_outside_step:
-                    hard_penalize = True
-                    hard_penalty_reason.append(
-                        f"bad_format(open={step_open},close={step_close},conclusion_outside={has_conclusion_outside_step})"
-                    )
-
-            if hard_penalize:
-                penalty_val = self.penalty_score
-                if self.use_xml and response_str.count("<step>") == 0 and response_str.count("</step>") == 0:
-                    penalty_rewards = [(max(0, int(valid_response_length) - 1), penalty_val)]
-                else:
-                    penalty_rewards = [(int(pos), penalty_val) for _, pos in step_positions]
-                for reward_type in self.step_reward_types:
-                    reward_extra_info[f"{reward_type}_step_reward"] = penalty_rewards
+            # The unified rules live in format_penalty.assess_response (shared with the step
+            # manager): truncation and the boxed contract are whole-response, a badly
+            # formatted step is penalized ALONE while the valid steps still verify, and the
+            # step-count cap penalizes only the suffix.
+            decision = assess_response(
+                response_str,
+                step_positions,
+                use_xml=self.use_xml,
+                valid_response_length=int(valid_response_length),
+                response_length=int(response_length),
+                penalty_score=self.penalty_score,
+                penalty_max_steps=self.penalty_max_steps,
+                penalty_on_truncated=self.penalty_on_truncated,
+                penalty_on_multi_boxed=self.penalty_on_multi_boxed,
+                penalty_on_bad_format=self.penalty_on_bad_format,
+            )
+            if decision.reasons:
+                reward_extra_info["penalty_reason"] = "|".join(decision.reasons)
+            if decision.penalized:
                 reward_extra_info["process_reward_penalized"] = True
-                reward_extra_info["penalty_reason"] = "|".join(hard_penalty_reason)
+            if decision.num_steps_override is not None:
+                reward_extra_info["num_steps"] = decision.num_steps_override
+            if decision.outcome_override is not None:
+                # A response without any \boxed answer forfeits the outcome.
+                score = float(decision.outcome_override)
+                reward_extra_info["acc"] = score
+            if decision.first_boxed_end is not None:
+                # Several \boxed answers: the FIRST one is the committed answer. The initial
+                # grade read the full text (whose LAST boxed is the exploitable one), so
+                # regrade on the prefix that ends with the first boxed.
+                regrade = await _grade_outcome(response_str[: decision.first_boxed_end])
+                if isinstance(regrade, dict):
+                    score = regrade["score"]
+                    reward_extra_info.update(regrade)
+                else:
+                    score = regrade
+                reward_extra_info["acc"] = score
+            if decision.skip_verifier:
+                for reward_type in self.step_reward_types:
+                    reward_extra_info[f"{reward_type}_step_reward"] = list(decision.process_rewards)
                 return {"reward_score": score, "reward_extra_info": reward_extra_info}
+            penalty_step_indices = decision.penalty_step_indices
+            # Reasoning tags outside every step block and each \boxed after the committed
+            # first one cost one penalty_score at their own token position (mapped here,
+            # where the tokenizer lives).
+            extra_penalty_char_ends = list(decision.extra_boxed_char_ends)
+            if decision.stray_tag_char_end is not None:
+                extra_penalty_char_ends.append(decision.stray_tag_char_end)
+            extra_penalty_positions = [
+                char_end_to_token_pos(valid_response_ids, self.tokenizer,
+                                      char_end, int(valid_response_length))
+                for char_end in extra_penalty_char_ends
+            ]
 
-            if penalty_step_indices:
+            if penalty_step_indices or extra_penalty_positions:
+                # Prefill the penalties so the defer_initial_ext_prm early return below still
+                # carries them; the per-type loop later rebuilds the full list.
                 penalty_rewards = [
                     (int(step_positions[i][1]), self.penalty_score)
                     for i in sorted(penalty_step_indices)
                     if i < len(step_positions)
                 ]
+                for extra_pos in extra_penalty_positions:
+                    place_extra_penalty(penalty_rewards, extra_pos, self.penalty_score,
+                                        max(0, int(valid_response_length) - 1))
                 for reward_type in self.step_reward_types:
                     reward_extra_info[f"{reward_type}_step_reward"] = penalty_rewards
-                reward_extra_info["process_reward_penalized"] = True
-                reward_extra_info["penalty_reason"] = "|".join(penalty_reason)
 
             # TreeManager can optionally compute original-chain external PRMs
             # after initialization. This keeps the anti-hacking fast path above
@@ -479,11 +476,15 @@ class TreeRewardManager(RewardManagerBase):
                 # (same pattern as StepRewardManager). For LLM-based reward
                 # functions (self_eval / fol) this is the difference between
                 # N sequential blocking calls and ceil(N/16) concurrent ones.
+                # A penalized step's text must not leak into later steps'
+                # cumulative context either: the history keeps the current step
+                # and only the non-penalized earlier steps.
                 call_args = []
                 for i, (step_text, token_end_pos) in enumerate(step_positions):
                     if i in penalty_step_indices:
                         continue
-                    history = [s for s, _ in step_positions[: i + 1]]
+                    history = [s for j, (s, _) in enumerate(step_positions[: i + 1])
+                               if j not in penalty_step_indices]
                     call_args.append((step_text, prompt_text, history, token_end_pos))
 
                 loop = asyncio.get_event_loop()
@@ -509,6 +510,9 @@ class TreeRewardManager(RewardManagerBase):
                     if i < len(step_positions):
                         _, token_end_pos = step_positions[i]
                         step_rewards.append((int(token_end_pos), self.penalty_score))
+                for extra_pos in extra_penalty_positions:
+                    place_extra_penalty(step_rewards, extra_pos, self.penalty_score,
+                                        max(0, int(valid_response_length) - 1))
                 step_rewards.sort(key=lambda item: item[0])
 
                 key = f"{reward_type}_step_reward"

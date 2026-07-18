@@ -8,7 +8,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 #   HF_ENDPOINT=https://hf-mirror.com hf download open-r1/Big-Math-RL-Verified-Processed \
 #       --repo-type dataset --local-dir "$RAW_DIR"
 RAW_DIR=${RAW_DIR:-"$REPO_ROOT/data/raw_bigmath_processed"}
-DATA_DIR=${DATA_DIR:-"$REPO_ROOT/data/bigmath"}
+DATA_DIR=${DATA_DIR:-"$REPO_ROOT/data/bigmath_clean"}
 PROMPT_FILE=${PROMPT_FILE:-math_reasoning.txt}
 SOLVE_RATE_MIN=${SOLVE_RATE_MIN:-0.0}
 SOLVE_RATE_MAX=${SOLVE_RATE_MAX:-0.9}

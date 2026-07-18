@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Constrained Python expression -> Isabelle/HOL term transpiler (v5).
 
-The judge writes plain Python boolean expressions (a language it has seen
+The translator writes plain Python boolean expressions (a language it has seen
 orders of magnitude more often than Isabelle); we validate them against a
 strict AST whitelist and transpile mechanically. All mechanical checks
 (number windows, transcription, vacuity) read the AST, not regexes.
@@ -34,39 +34,39 @@ FUNCS = {
     "comb": (None, 2), "choose": (None, 2),
     "log": ("log", 2), "ln": ("ln", 1), "exp": ("exp", 1),
     "sin": ("sin", 1), "cos": ("cos", 1), "tan": ("tan", 1),
+    "arcsin": ("arcsin", 1), "arccos": ("arccos", 1), "arctan": ("arctan", 1),
     "min": ("min", 2), "max": ("max", 2),
     "prime": ("prime", 1),
-    # Pigeonhole meta-functions (map to `min_rep` in Math_Verify_Base):
+    # Pigeonhole meta-functions (map to `min_rep` in Isa_Step_Base):
     #   guarantee_pair(n)    = fewest draws over n categories forcing TWO in one
     #                          category = n + 1        (= min_rep n 2)
     #   guarantee_same(n, k) = fewest draws forcing k in one category
     #                          = n*(k-1) + 1           (= min_rep n k)
     # min_rep's closed form is CERTIFIED by the proven `min_rep_correct`
-    # (sufficiency AND minimality), so the judge only supplies the category
+    # (sufficiency AND minimality), so the translator only supplies the category
     # count (and k); the pigeonhole content is fixed and sound -- it cannot be
     # invented or gotten wrong.
     "guarantee_pair": ("min_rep", 1),
     "guarantee_same": ("min_rep", 2),
 }
-REAL_ONLY_FUNCS = {"sqrt", "log", "ln", "exp", "sin", "cos", "tan"}
+REAL_ONLY_FUNCS = {"sqrt", "log", "ln", "exp", "sin", "cos", "tan",
+                   "arcsin", "arccos", "arctan"}
 NAT_VALUED_FUNCS = {"factorial", "fact", "comb", "choose",
                     "guarantee_pair", "guarantee_same"}
 # Uninterpreted-function names. `f(...)`, `g(...)`, `h(...)` (never in FUNCS)
 # are UNDEFINED functions constrained only by equations -- represented as
 # `fixes f :: "real => ... => real"` and applied as `f arg`. Used for
 # functional equations (f(x+y)=f(x)+f(y), f(log b x)=x). A single defined
-# function is still inlined by the judge; these are the undefined ones.
+# function is still inlined by the translator; these are the undefined ones.
 FUNC_VARS = {"f", "g", "h"}
 
 
-def _pv(name: str) -> str:
-    """Prefix a free-variable / uninterpreted-function name so it can never
-    collide with an Isabelle constant. The Math_Verify session (HOL-Analysis
-    + Probability) defines constants like `AE` (almost-everywhere); a geometry
-    segment named `AE` would otherwise parse as that constant and the theorem
-    would fail. The AST-level logic (answer-exclusion, def/claim split, number
-    windows) keeps using the ORIGINAL names -- only the emitted Isabelle term
-    and its fixes carry the prefix, consistently."""
+def _add_prefix_pv(name: str) -> str:
+    """Prefix a free-variable / uninterpreted-function name so it can never collide with an Isabelle constant.
+    
+    Example: The Isa_Step session (HOL-Analysis + Probability) defines constants like `AE` (almost-everywhere); 
+    a geometry segment named `AE` would otherwise parse as that constant and the theorem would fail. 
+    The AST-level logic (answer-exclusion, def/claim split, number windows) keeps using the ORIGINAL names. Only the emitted Isabelle term and its fixes carry the prefix, consistently."""
     return "pv_" + name
 
 
@@ -137,7 +137,7 @@ def _const_frac(n: "ast.Constant") -> Fraction:
 
 def _check_aggregate(n: "ast.Call"):
     """Validate a sum()/prod() aggregate node's shape; raise otherwise.
-    Accepted: sum(<expr> for <var> in range(lo[, hi]))  -- one generator, a
+    Accepted: sum(<expr> for <var> in range(lo[, hi])); one generator, a
     plain index variable, no `if` filter, a literal/expression range with 1-2
     args (no step). Returns (comp, generator, [range args])."""
     fn = n.func.id
@@ -279,6 +279,25 @@ def analyze(node):
     return idents, consts, needs_real
 
 
+def mod_int_vars(node) -> set:
+    """Names appearing anywhere inside an operand of `%` (mod) or `//`
+    (floordiv). In pyexpr `%`/`//` are INTEGER operations, so their operands
+    must be int-typed: if the enclosing proposition has a real carrier (e.g. a
+    mixed conjunction `n % 2 == 0 and x > 3.5`) the translator may declare `n`
+    real, and `n mod (2::real)` is not something Isabelle can evaluate; a
+    correct even/odd (divisibility) step then fails (2026-07-15). The engine
+    forces these names to int; genuine real uses coerce via `real n`, and mod
+    requires an int operand, so the retyping is sound."""
+    out = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Mod, ast.FloorDiv)):
+            for side in (n.left, n.right):
+                for sub in ast.walk(side):
+                    if isinstance(sub, ast.Name):
+                        out.add(sub.id)
+    return out
+
+
 def func_arities(node) -> dict:
     """Map each applied uninterpreted-function name (f/g/h) to its arity, so
     the engine can declare `fixes f :: "real => ... => real"`. A function name
@@ -324,12 +343,7 @@ def _const_eval(n):
 
 
 def is_nonlinear(node) -> bool:
-    """True if the expression is nonlinear in its variables: a variable base
-    raised to a literal power >= 2, a product of two variable-bearing factors,
-    or a variable in a denominator. These are exactly the goals `sos` can
-    discharge but `linarith`/`presburger` cannot, so the engine routes them to
-    an sos rescue. (`const ** var` is powr, handled separately, not flagged;
-    `2 * x` has a literal factor, so it stays linear.)"""
+    """Return whether the expression contains nonlinear variable operations."""
     def has_var(n):
         # A function name (the `func` of a Call, e.g. comb in comb(8,2)) is a
         # Name node but NOT a variable -- exclude it so comb(5,2)/comb(8,2)
@@ -357,18 +371,18 @@ def is_nonlinear(node) -> bool:
 
 def is_linear_arith(node) -> bool:
     """True iff `node` (a boolean premise expression) is affine in its
-    variables with constant coefficients -- the fragment where `linarith`
+    variables with constant coefficients; the fragment where `linarith`
     (reals) / `presburger` (integers) are COMPLETE decision procedures, so a
-    fast linarith/presburger consistency probe over such premises is SOUND: it
+    fast linarith/presburger premise-consistency check over such premises is SOUND: it
     can never miss a contradiction a heavier tactic would find. STRICTER than
     `not is_nonlinear`: it also rejects any opaque/transcendental function
     applied to a variable (sin(x), sqrt(x), log(b, x)), a variable modulus or
-    floor-division, and a variable exponent -- linarith treats those as free
+    floor-division, and a variable exponent; linarith treats those as free
     atoms, so a hidden contradiction there (sin(x) == 2) would be missed by the
-    probe yet exploitable ex-falso by the step-proof's stronger tactics. A
-    function of only CONSTANT arguments (sqrt(2), comb(5, 2)) is a constant atom
-    and stays linear. Returns False on anything it cannot certify linear (so the
-    caller falls back to the heavy ALTERNATION probe)."""
+    linear consistency check but could still be used by stronger claim tactics.
+    A function of only CONSTANT arguments (sqrt(2), comb(5, 2)) is a constant
+    atom and stays linear. Returns False on anything it cannot certify linear,
+    so the caller uses the general ALTERNATION tactic instead."""
     def has_var(n):
         func_ids = {id(x.func) for x in ast.walk(n)
                     if isinstance(x, ast.Call) and isinstance(x.func, ast.Name)}
@@ -563,7 +577,22 @@ def transpile(node, var_types: dict, carrier: str, bound=None) -> str:
                 p2 = t(n.args[2], bound)     # a (integral) / point (deriv,limit)
                 p3 = t(n.args[3], bound)     # b (integral) / value (deriv,limit)
                 if fname == "integral":
-                    return f"(integral {{{p2}..{p3}}} (%{v}. {body}))"
+                    # Oriented definite integral: the textbook int_a^b with a > b is
+                    # -int_b^a, while Isabelle's {a..b} is the EMPTY set (integral 0,
+                    # which could validate a claimed 0 for a nonzero oriented value,
+                    # e.g. under a premise a > b). Numeric bounds are reordered with
+                    # the sign made explicit; symbolic bounds emit the conditional
+                    # oriented form, so the claim is provable only where the order
+                    # resolves (simp resolves constants like 0 <= pi; an order only
+                    # the premises decide resolves there or fails closed).
+                    a_val, b_val = _const_eval(n.args[2]), _const_eval(n.args[3])
+                    if a_val is not None and b_val is not None:
+                        if a_val > b_val:
+                            return f"(- (integral {{{p3}..{p2}}} (%{v}. {body})))"
+                        return f"(integral {{{p2}..{p3}}} (%{v}. {body}))"
+                    return (f"(if {p2} \\<le> {p3} "
+                            f"then integral {{{p2}..{p3}}} (%{v}. {body}) "
+                            f"else - (integral {{{p3}..{p2}}} (%{v}. {body})))")
                 if fname == "deriv":
                     return (f"(((%{v}. {body}) has_real_derivative ({p3})) "
                             f"(at ({p2})))")
@@ -572,7 +601,7 @@ def transpile(node, var_types: dict, carrier: str, bound=None) -> str:
             if fname in FUNC_VARS and fname not in FUNCS:
                 # uninterpreted function application f(a, b) -> (pv_f a b)
                 fargs = " ".join(t(a, bound) for a in n.args)
-                return f"({_pv(fname)} {fargs})"
+                return f"({_add_prefix_pv(fname)} {fargs})"
             if fname == "prime":
                 # Boolean predicate. `prime` needs an integer argument; under a
                 # real carrier the term is ill typed, so fail closed rather than
@@ -582,10 +611,14 @@ def transpile(node, var_types: dict, carrier: str, bound=None) -> str:
                     raise PyExprError("prime() requires an integer argument")
                 return f"(prime ({t(n.args[0], bound)}))"
             if fname in ("comb", "choose"):
-                a, b = (t(x, bound) for x in n.args)
-                inner = f"((nat {a}) choose (nat {b}))" \
-                    if carrier != "nat" else f"({a} choose {b})"
-                return f"({carrier} {inner})" if carrier != "nat" else inner
+                # `choose :: nat => nat => nat`, so the args must be nat, NOT the
+                # proposition carrier. Under a real carrier `t(x)` gives (k::real)
+                # and `nat (k::real)` is ill typed (`nat :: int => nat`), which
+                # made a correct binomial-probability step fail (2026-07-15).
+                # Transpile the args as int, `nat`-wrap, then lift to the carrier.
+                a, b = (transpile(x, var_types, "int", bound) for x in n.args)
+                inner = f"((nat {a}) choose (nat {b}))"
+                return inner if carrier == "nat" else f"({carrier} {inner})"
             if fname in ("guarantee_pair", "guarantee_same"):
                 # min_rep :: nat => nat => nat. guarantee_pair(n) fixes k = 2.
                 a = t(n.args[0], bound)
@@ -596,7 +629,10 @@ def transpile(node, var_types: dict, carrier: str, bound=None) -> str:
             iname, _ = FUNCS[fname]
             args = " ".join(t(a, bound) for a in n.args)
             if fname in ("factorial", "fact") and carrier != "nat":
-                return f"({carrier} (fact (nat {t(n.args[0], bound)})))"
+                # same `nat :: int => nat` typing as comb: int-transpile the arg
+                # so `nat (k::real)` (ill typed) is never emitted.
+                return (f"({carrier} (fact (nat "
+                        f"{transpile(n.args[0], var_types, 'int', bound)})))")
             if fname == "floor" or fname in ("ceil", "ceiling"):
                 # floor/ceiling :: real => int; lift back to the carrier
                 if carrier == "real":
@@ -608,7 +644,7 @@ def transpile(node, var_types: dict, carrier: str, bound=None) -> str:
                 return _coerce_bound(n.id, bound)
             if n.id in CONSTANTS:
                 return CONSTANTS[n.id]   # pi -> Isabelle's real pi, unprefixed
-            return _pv(n.id)             # free var: prefix to avoid const clash
+            return _add_prefix_pv(n.id)             # free var: prefix to avoid const clash
         if isinstance(n, ast.Constant):
             return num(_const_frac(n))   # exact source-text value if annotated
         raise PyExprError(f"untranspilable node {type(n).__name__}")

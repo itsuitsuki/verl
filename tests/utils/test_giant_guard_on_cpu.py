@@ -1,8 +1,9 @@
 """CPU-only tests for the giant-number guard (tactics.py, 2026-07-11). A goal
 or premise carrying a huge literal, a >=1000 literal exponent, a factorial of
 >=100, or a power tower makes the leading simp/presburger of ALTERNATION grind
-60-75s past the 15s watchdog (measured). is_dangerous_isabelle flags these so
-the engine routes them to eval alone / treats probes as undetermined."""
+60-75s past the 15s watchdog (measured). is_dangerous_isabelle routes claims
+to eval alone and marks premise consistency as unknown without running the
+expensive check."""
 from verl.utils.isabelle_utils.tactics import (
     SAFE_DANGEROUS, is_dangerous_isabelle,
 )

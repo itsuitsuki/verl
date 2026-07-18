@@ -1,4 +1,4 @@
-# Math_Verify Isabelle session — source bundle & deploy
+# Isa_Step Isabelle session — source bundle & deploy
 
 This directory is the **version-controlled source** for the Isabelle/HOL session
 that the step-reward engine (`../server_pool.py`, `../engine.py`, `../tactics.py`)
@@ -9,8 +9,8 @@ and is a build artifact; these files are what regenerate it.
 
 | File | Deploy target (datatech, shared) | Purpose |
 |------|----------------------------------|---------|
-| `ROOT` | `/2022533109/zhouchuyan/isabelle/math_verify/ROOT` | session definition (parent `HOL-Analysis` + `HOL-Number_Theory`/`HOL-Real_Asymp`/`HOL-Probability`, `quick_and_dirty` so `sorry` is allowed) |
-| `Math_Verify_Base.thy` | `/2022533109/zhouchuyan/isabelle/math_verify/Math_Verify_Base.thy` | base theory: re-exports Analysis/Real_Asymp/Sum_of_Squares/Code_Target_Numeral/Number_Theory/Approximation **plus** the precompiled quadrant-trig meta-theorems (`div_sqrt_eq`, `cos_abs_from_tan`, `sin/cos_from_tan_c{pos,neg}`, `cos_{pos,neg}_q1..q4`, `sin_pos_upper`/`sin_neg_lower`) that `engine.trig_quadrant_theorem` instantiates |
+| `ROOT` | `/2022533109/zhouchuyan/isabelle/isa_step/ROOT` | session definition (parent `HOL-Analysis` + `HOL-Number_Theory`/`HOL-Real_Asymp`/`HOL-Probability`/`HOL-Algebra`; no `quick_and_dirty` — nothing uses `sorry`, and the runtime options pin `quick_and_dirty=false` so the kernel enforces it) |
+| `Isa_Step_Base.thy` | `/2022533109/zhouchuyan/isabelle/isa_step/Isa_Step_Base.thy` | base theory: re-exports Analysis/Real_Asymp/Sum_of_Squares/Code_Target_Numeral/Number_Theory/Approximation **plus** HOL-Algebra (Coset/Multiplicative_Group/Ring, for the direct group/ring/field checks since the 2026-07-17 pool merge) **plus** the general trigonometric value and sign meta-theorems (`div_sqrt_eq`, `cos_abs_from_tan`, `sin/cos_from_tan_c{pos,neg}`, `cos_from_sin_c{pos,neg}`, `sin_from_cos_s{pos,neg}`, `cos_{pos,neg}_q1..q4`, `sin_pos_upper`/`sin_neg_lower`) that the trig proof attempts instantiate (`verl/utils/isabelle_utils/trigonometry.py`), and the pigeonhole `min_rep` battery |
 | `env.sh` | `/2022533109/zhouchuyan/isabelle/env.sh` | sets `ISABELLE_HOME` + `ISABELLE_HOME_USER` to the shared dir (no node-local `~/.isabelle` symlink; survives container restart) |
 
 ## Two out-of-repo edits NOT captured as full files (documented here)
@@ -36,22 +36,26 @@ and is a build artifact; these files are what regenerate it.
 
    ```
    /2022533109/zhouchuyan/isabelle/afp-2026-06-12/thys
-   /2022533109/zhouchuyan/isabelle/math_verify
+   /2022533109/zhouchuyan/isabelle/isa_step
    ```
 
-## Rebuild (after editing Math_Verify_Base.thy)
+## Rebuild (after editing Isa_Step_Base.thy)
 
 ```sh
 source /2022533109/zhouchuyan/isabelle/env.sh
-cd /2022533109/zhouchuyan/isabelle/math_verify
-isabelle build -b Math_Verify        # ~1m10s; heap -> shared user/heaps/, restart-safe
+cd /2022533109/zhouchuyan/isabelle/isa_step
+isabelle build -b Isa_Step        # heap -> shared user/heaps/, restart-safe; was ~1m10s pre-merge, longer with the HOL-Algebra theories (HOL-Algebra's own heap already exists in user/heaps from the former domain pools)
 ```
 
-Then in `server_pool.py`:
-- `THEORY_IMPORTS` must be the **session-qualified** import `"Math_Verify.Math_Verify_Base"`
-  (a bare `Math_Verify_Base` fails to resolve to the session theory).
-- Bump `_THM_CACHE_VERSION` (session content changed) so stale disk-cached
-  verdicts are invalidated. Current: `v3`.
+Then in `_server_pool/config.py`:
+- `THEORY_IMPORTS` must be the **session-qualified** import `"Isa_Step.Isa_Step_Base"`
+  (a bare `Isa_Step_Base` fails to resolve to the session theory).
+- NO theorem-cache version bump is needed for a heap rebuild: cache entries are keyed
+  by a fingerprint that includes the session heap, so the rebuild makes every old entry
+  unreachable automatically (project CLAUDE.md rule 8). `_THM_CACHE_VERSION` changes only
+  when the CACHE ENTRY FORMAT changes. Current: `v0`.
+- Stop any live pool BEFORE the rebuild (never rebuild a heap a running pool is using),
+  and restart reward workers afterwards so new pools load the new heap.
 
 ## Transfer note (post-container-restart)
 

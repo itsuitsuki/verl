@@ -1,8 +1,8 @@
-session Math_Verify = "HOL-Analysis" +
-  options [quick_and_dirty]
+session Isa_Step = "HOL-Analysis" +
   sessions
     "HOL-Number_Theory"
     "HOL-Real_Asymp"
     "HOL-Probability"
+    "HOL-Algebra"
   theories
-    Math_Verify_Base
+    Isa_Step_Base

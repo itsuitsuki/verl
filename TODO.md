@@ -528,13 +528,13 @@ Z3 的根本限制：
      - Successful declarations are cached under `/tmp/verl_fol_shared_preprocess_cache` by default.
      - `FOL_SHARED_PREPROCESS_DISK_CACHE=0` disables it.
      - `FOL_SHARED_PREPROCESS_DISK_CACHE_DIR=/path/to/cache` changes the cache directory.
-     - `FOL_SHARED_PREPROCESS_DISK_CACHE_VERSION=...` can be bumped to invalidate old cache entries after prompt/pipeline changes.
+     - `SHARED_PREPROCESS_DISK_CACHE_VERSION=...` can be bumped to invalidate old cache entries after prompt/pipeline changes.
      - A 64-record / 4-prompt / 16-process smoke test reduced actual fake preprocess calls to 4.
   5. Done in working tree: add cross-process exact verify reward cache.
      - Exact verify rewards are cached under `/tmp/verl_fol_verify_cache` by default.
      - `FOL_VERIFY_DISK_CACHE=0` disables it.
      - `FOL_VERIFY_DISK_CACHE_DIR=/path/to/cache` changes the cache directory.
-     - `FOL_VERIFY_DISK_CACHE_VERSION=...` can be bumped to invalidate old cache entries after prompt/pipeline changes.
+     - `VERIFY_DISK_CACHE_VERSION=...` can be bumped to invalidate old cache entries after prompt/pipeline changes.
      - A 64-record / 4-exact-key / 16-process smoke test reduced actual fake `verify_step` calls to 4, with 60 disk-cache hits.
   6. Recheck whether `+reward.api_config.max_tokens=512` or `768` is safe for FOL judge quality after no-step waste is removed.
 - Continue reducing invalid FOL translation.
