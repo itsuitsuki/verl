@@ -9,7 +9,8 @@ from pathlib import Path
 import datasets
 import pandas as pd
 
-from bigmath_quality import build_group_flags, clean_record, exclusion_flags
+from bigmath_quality import (build_group_flags, clean_record, exclusion_flags,
+                             repaired_record)
 
 
 def sha256(path: Path) -> str:
@@ -72,11 +73,12 @@ def process_records(records: list[dict], save_dir: Path, data_source: str,
                     source_description: str, system_prompt: str | None,
                     instruction: str, stage_counts: dict | None = None) -> dict:
     """Quality-filter canonical records and write one dataset's outputs."""
-    group_flags = build_group_flags(records)
+    canonical_records = [repaired_record(record) for record in records]
+    group_flags = build_group_flags(canonical_records)
     clean_records = []
     quarantine = []
     flag_counts = Counter()
-    for record in records:
+    for record in canonical_records:
         flags = clean_record(record, group_flags)
         flag_counts.update(flags)
         excluded = exclusion_flags(flags)

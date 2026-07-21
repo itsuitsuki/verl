@@ -135,6 +135,7 @@ class StepRewardManager(RewardManagerBase):
                                           algo_cfg.get("isabelle_worker_rss_cap_gb", None))
         if isabelle_rss_cap is not None:
             self.api_config["isabelle_worker_rss_cap_gb"] = float(isabelle_rss_cap)
+
         print(f"FOL config 'fol_cumulative_mode' is set to: {self.api_config.get('fol_cumulative_mode', 'current_only')}")
 
         # FOL pipeline / translation mode
@@ -173,7 +174,17 @@ class StepRewardManager(RewardManagerBase):
                 self.step_reward_types = [srt]
             else:
                 self.step_reward_types = list(srt)
-                
+
+        if (("fol" in self.step_reward_types)
+                and self.api_config.get("fol_task_type") == "math"):
+            missing = [name for name in ("model", "base_url")
+                       if not self.api_config.get(name)]
+            if missing:
+                raise ValueError(
+                    "Math formal verification requires explicit reward.api_config "
+                    "field(s): " + ", ".join(missing)
+                )
+
         # Initialize pluggable reward functions registry
         self.step_reward_fns = {
             "random": _compute_step_reward_random
@@ -341,6 +352,7 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_prove_cache_hits": 0,
                         "isabelle_reward_wall_time": 0.0,
                         "isabelle_pool_restarts": 0,
+                        "isabelle_external_solver_reaps": 0,
                         "isabelle_thm_cache_hit_rate": 0.0,
                         "isabelle_tr_cache_hit_rate": 0.0,
                         "isabelle_judge_http_calls": 0,
@@ -577,6 +589,8 @@ class StepRewardManager(RewardManagerBase):
                 reward_extra_info["isabelle_prove_cache_hits"] = int(d.get("prove_cache_hits") or 0)
                 reward_extra_info["isabelle_reward_wall_time"] = float(d.get("reward_wall_time") or 0.0)
                 reward_extra_info["isabelle_pool_restarts"] = int(d.get("pool_restarts") or 0)
+                reward_extra_info["isabelle_external_solver_reaps"] = int(
+                    d.get("external_solver_reaps") or 0)
                 reward_extra_info["isabelle_thm_cache_hit_rate"] = float(d.get("thm_cache_hit_rate") or 0.0)
                 reward_extra_info["isabelle_tr_cache_hit_rate"] = float(d.get("tr_cache_hit_rate") or 0.0)
                 # Real HTTP judge load vs per-layer cache reuse (2026-07-11).

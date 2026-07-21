@@ -7,7 +7,7 @@ Writes one JSONL row per (problem, sample): dataset, idx, sample, problem (the u
 content, which is exactly what the step reward manager passes to the engine as `problem`),
 ground_truth (extra_info math_final_answer, the field the reward manager reads), response.
 
-  python -u e2e_rollout.py --out rollouts.jsonl   (needs the policy vLLM at --url)
+  python -u pipeline_rollout.py --out rollouts.jsonl   (needs the policy vLLM at --url)
 """
 import argparse
 import json

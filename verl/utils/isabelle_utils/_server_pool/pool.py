@@ -85,6 +85,11 @@ class IsabelleServerPool:
         self._dispatchers: list[threading.Thread] = []
         self._disp_lock = threading.Lock()
 
+    @property
+    def external_solver_reaps(self):
+        """Return the process-cumulative number of external solver groups removed."""
+        return sum(worker.external_solver_reaps for worker in self.workers)
+
     def start(self):
         t0 = time.time()
         try:
@@ -197,7 +202,13 @@ class IsabelleServerPool:
                 len(runaways), runaways, self._runaway_streak * interval)
 
     def _has_repeated_timeout(self, theorem_code: str) -> bool:
-        """Return whether the theorem has reached the timeout limit within the history interval."""
+        """Return whether the exact theorem reached the recent timeout limit.
+
+        Timeout history intentionally uses the original text rather than the
+        normalized cache key. Alpha-equivalent proofs can have different parser
+        or runtime behavior, so sharing a timeout cut could create false
+        negatives even though sharing a stable PROVED/UNPROVED result is safe.
+        """
         now = time.time()
         with self._cache_lock:
             rec = self._timeout_history.get(theorem_code)
@@ -229,6 +240,7 @@ class IsabelleServerPool:
             premise_consistency_unknown=True, errors=[reason])
 
     def check(self, theorem_code: str) -> "state_classes.VerificationOutcome":
+        key = theorem_cache.normalize_theorem_text(theorem_code)
         while True:
             if self._has_repeated_timeout(theorem_code):
                 with self._cache_lock:
@@ -236,32 +248,32 @@ class IsabelleServerPool:
                 return self._incomplete_result(
                     "premise consistency unknown: two prior timeouts")
             with self._cache_lock:
-                cached = self._cache.get(theorem_code)
+                cached = self._cache.get(key)
                 if cached is not None:
-                    self._cache.move_to_end(theorem_code)
+                    self._cache.move_to_end(key)
                     self.cache_hits += 1
                     out = state_classes.VerificationOutcome.from_raw(cached)
                     out.cache_hit = True
                     out.queue_wait = 0.0
                     out.check_time = 0.0
                     return out
-                event = self._pending_checks.get(theorem_code)
+                event = self._pending_checks.get(key)
                 owner = event is None
                 if owner:
                     event = threading.Event()
-                    self._pending_checks[theorem_code] = event
+                    self._pending_checks[key] = event
                     self.cache_misses += 1
                     break
             if not event.wait(self.verify_timeout + 30.0):
                 with self._cache_lock:
-                    if self._pending_checks.get(theorem_code) is event:
-                        self._pending_checks.pop(theorem_code, None)
+                    if self._pending_checks.get(key) is event:
+                        self._pending_checks.pop(key, None)
         cache_file_lock, owns_cache_file_lock = None, False
         try:
-            disk = theorem_cache._thm_disk_load(theorem_code, self._thm_fprint)
+            disk = theorem_cache._thm_disk_load(key, self._thm_fprint)
             if disk is not None and "success" in disk:
                 with self._cache_lock:
-                    self._cache[theorem_code] = dict(disk)
+                    self._cache[key] = dict(disk)
                     while len(self._cache) > self.CACHE_MAX_ENTRIES:
                         self._cache.popitem(last=False)
                     self.cache_hits += 1
@@ -271,20 +283,20 @@ class IsabelleServerPool:
                 out.check_time = 0.0
                 return out
             if theorem_cache._thm_disk_enabled():
-                cache_file_lock = theorem_cache._thm_disk_path(theorem_code, self._thm_fprint) + ".lock"
+                cache_file_lock = theorem_cache._thm_disk_path(key, self._thm_fprint) + ".lock"
                 owns_cache_file_lock = cache_lock.acquire(
                     cache_file_lock, stale_s=3 * self.verify_timeout
                 )
                 if not owns_cache_file_lock:
                     got = cache_lock.wait(
                         cache_file_lock,
-                        lambda: theorem_cache._thm_disk_load(theorem_code, self._thm_fprint),
+                        lambda: theorem_cache._thm_disk_load(key, self._thm_fprint),
                         deadline_s=self.verify_timeout + 45.0,
                         poll_s=0.25,
                     )
                     if got is not None and "success" in got:
                         with self._cache_lock:
-                            self._cache[theorem_code] = dict(got)
+                            self._cache[key] = dict(got)
                             while len(self._cache) > self.CACHE_MAX_ENTRIES:
                                 self._cache.popitem(last=False)
                             self.cache_hits += 1
@@ -301,10 +313,10 @@ class IsabelleServerPool:
             if cacheable:
                 entry = result.to_cache_entry()
                 with self._cache_lock:
-                    self._cache[theorem_code] = entry
+                    self._cache[key] = entry
                     while len(self._cache) > self.CACHE_MAX_ENTRIES:
                         self._cache.popitem(last=False)
-                theorem_cache._thm_disk_store(theorem_code, entry, self._thm_fprint)
+                theorem_cache._thm_disk_store(key, entry, self._thm_fprint)
             elif owns_cache_file_lock:
                 cache_lock.mark_failed(cache_file_lock)
             return result
@@ -312,8 +324,8 @@ class IsabelleServerPool:
             if owns_cache_file_lock:
                 cache_lock.release(cache_file_lock)
             with self._cache_lock:
-                if self._pending_checks.get(theorem_code) is event:
-                    self._pending_checks.pop(theorem_code, None)
+                if self._pending_checks.get(key) is event:
+                    self._pending_checks.pop(key, None)
             event.set()
 
     def submit(self, theorem_code: str):
@@ -322,10 +334,11 @@ class IsabelleServerPool:
         All callers share one FIFO. Memory-cache hits resolve immediately without entering the queue."""
         from concurrent.futures import Future
         fut = Future()
+        key = theorem_cache.normalize_theorem_text(theorem_code)
         with self._cache_lock:
-            cached = self._cache.get(theorem_code)
+            cached = self._cache.get(key)
             if cached is not None:
-                self._cache.move_to_end(theorem_code)
+                self._cache.move_to_end(key)
                 self.cache_hits += 1
                 out = state_classes.VerificationOutcome.from_raw(cached)
                 out.cache_hit = True

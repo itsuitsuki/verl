@@ -44,6 +44,10 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.isabelle_metrics import (
+    ISABELLE_PROFILE_METRIC_MAP,
+    aggregate_mapped_metrics,
+)
 from verl.trainer.ppo.metric_utils import (compute_data_metrics,
                                            compute_throughout_metrics,
                                            compute_timing_metrics,
@@ -2326,13 +2330,9 @@ class RayPPOTrainer:
                     # Wall profile (2026-07-11 review #6): pure judge HTTP
                     # wall is disjoint from prover queue/run; end-to-end
                     # translate+validate wall is also kept for latency analysis.
-                    "isabelle_judge_http_wall_s": "isabelle/judge_http_wall_s",
-                    "isabelle_translate_validate_wall_s": "isabelle/translate_validate_wall_s",
+                    **ISABELLE_PROFILE_METRIC_MAP,
                     "isabelle_prove_calls": "isabelle/prove_calls",
-                    "isabelle_prove_queue_s": "isabelle/prove_queue_s",
-                    "isabelle_prove_run_s": "isabelle/prove_run_s",
                     "isabelle_prove_cache_hits": "isabelle/prove_cache_hits",
-                    "isabelle_reward_wall_s": "isabelle/reward_wall_s",
                     "isabelle_pool_restarts": "isabelle/pool_restarts",
                     "isabelle_thm_cache_hit_rate": "isabelle/thm_cache_hit_rate",
                     "isabelle_tr_cache_hit_rate": "isabelle/tr_cache_hit_rate",
@@ -2347,20 +2347,15 @@ class RayPPOTrainer:
                 }
                 isabelle_cumulative_gauges = {
                     "isabelle_pool_restarts",
+                    "isabelle_external_solver_reaps",
                     "isabelle_thm_cache_hit_rate",
                     "isabelle_tr_cache_hit_rate",
                 }
-                for batch_key, metric_prefix in fol_judge_metric_map.items():
-                    if batch_key in batch.non_tensor_batch:
-                        vals = np.asarray(batch.non_tensor_batch[batch_key], dtype=np.float32)
-                        metrics[f"{metric_prefix}/mean"] = float(np.mean(vals))
-                        metrics[f"{metric_prefix}/max"] = float(np.max(vals))
-                        metrics[f"{metric_prefix}/min"] = float(np.min(vals))
-                        if batch_key in isabelle_cumulative_gauges:
-                            # These are per-process cumulative snapshots taken
-                            # as responses finish; max is the closest available
-                            # batch-end value. Keep mean/min for skew diagnosis.
-                            metrics[f"{metric_prefix}/current"] = float(np.max(vals))
+                metrics.update(aggregate_mapped_metrics(
+                    batch.non_tensor_batch,
+                    fol_judge_metric_map,
+                    isabelle_cumulative_gauges,
+                ))
                 if "isabelle_n_steps" in batch.non_tensor_batch:
                     n_iso = np.asarray(batch.non_tensor_batch["isabelle_n_steps"], dtype=np.float32)
                     iso_denom = np.maximum(n_iso, 1.0)

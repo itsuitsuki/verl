@@ -78,6 +78,20 @@ def _manager(compute_score, step_reward_type="random", step_reward_fns=None, api
         step_reward_type=step_reward_type, step_reward_fns=step_reward_fns)
 
 
+def _math_api_config():
+    return {
+        "fol_task_type": "math",
+        "model": "Qwen3.6-35B-A3B",
+        "base_url": "http://127.0.0.1:4873/v1",
+    }
+
+
+def test_math_isabelle_requires_explicit_translator_config():
+    with pytest.raises(ValueError, match="model, base_url"):
+        _manager(lambda **kw: 1.0, step_reward_type="fol",
+                 api_config={"fol_task_type": "math"})
+
+
 def _run(manager, data):
     return manager.loop.run_until_complete(manager.run_single(data))
 
@@ -119,7 +133,7 @@ def test_isabelle_rewards_map_to_original_positions_and_response_is_cleaned(monk
 
     monkeypatch.setattr(formal_verify, "compute_solution_reward_isabelle", isabelle_stub)
     manager = _manager(lambda **kw: 1.0, step_reward_type="fol",
-                       api_config={"fol_task_type": "math"})
+                       api_config=_math_api_config())
     response = VALID1 + INVALID + VALID2 + " \\boxed{7}"
     out = _run(manager, _data_proto(response))
 
@@ -132,6 +146,32 @@ def test_isabelle_rewards_map_to_original_positions_and_response_is_cleaned(monk
     assert VALID1 in seen["response"] and "\\boxed{7}" in seen["response"]
 
 
+def test_isabelle_profile_metrics_use_training_batch_keys(monkeypatch):
+    debug = {
+        "judge_http_wall_time": 1.25,
+        "translate_validate_wall_time": 2.5,
+        "prove_queue_time": 3.75,
+        "prove_run_time": 4.5,
+        "reward_wall_time": 5.25,
+        "external_solver_reaps": 6,
+    }
+
+    def isabelle_stub(problem, response, ground_truth, **kwargs):
+        return [1.0], debug
+
+    monkeypatch.setattr(formal_verify, "compute_solution_reward_isabelle", isabelle_stub)
+    manager = _manager(lambda **kw: 1.0, step_reward_type="fol",
+                       api_config=_math_api_config())
+    out = _run(manager, _data_proto(VALID1 + " \\boxed{7}"))
+    extra = out["reward_extra_info"]
+    assert extra["isabelle_judge_http_wall_time"] == 1.25
+    assert extra["isabelle_translate_validate_wall_time"] == 2.5
+    assert extra["isabelle_prove_queue_time"] == 3.75
+    assert extra["isabelle_prove_run_time"] == 4.5
+    assert extra["isabelle_reward_wall_time"] == 5.25
+    assert extra["isabelle_external_solver_reaps"] == 6
+
+
 def test_isabelle_valid_steps_survive_a_boxed_swallowing_unclosed_step(monkeypatch):
     seen = {}
 
@@ -141,7 +181,7 @@ def test_isabelle_valid_steps_survive_a_boxed_swallowing_unclosed_step(monkeypat
 
     monkeypatch.setattr(formal_verify, "compute_solution_reward_isabelle", isabelle_stub)
     manager = _manager(lambda **kw: 1.0, step_reward_type="fol",
-                       api_config={"fol_task_type": "math"})
+                       api_config=_math_api_config())
     response = VALID1 + "\n<step>\n<premise>r</premise>\n<conclusion>d</conclusion>\n\\boxed{7}"
     out = _run(manager, _data_proto(response))
 

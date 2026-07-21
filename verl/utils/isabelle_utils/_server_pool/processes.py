@@ -84,6 +84,50 @@ def _prover_groups(jvm_pid, own_pgrp):
     return out
 
 
+_EXTERNAL_SOLVER_NAMES = frozenset({"csdp", "veriT"})
+
+
+def _process_name(pid):
+    """Return the Linux process name from `/proc/<pid>/comm`, or None if it vanished."""
+    try:
+        with open(f"/proc/{pid}/comm", "rb") as fh:
+            return fh.read().strip().decode()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _external_solver_groups(jvm_pid, own_pgrp):
+    """Return self-led `csdp` and `veriT` process groups below one worker JVM.
+
+    Isabelle launches each external solver below a setsid-created bash leader. The solver is not itself the group leader, so the group is selected through the solver's process-group ID and accepted only when that leader is also a descendant of this JVM and still satisfies `pid == pgrp == session`."""
+    descendants = _descendants(jvm_pid)
+    out = {}
+    for pid, meta in descendants.items():
+        if not meta or _process_name(pid) not in _EXTERNAL_SOLVER_NAMES:
+            continue
+        pgrp, _sess, _start = meta
+        if pgrp == own_pgrp:
+            continue
+        leader_meta = descendants.get(pgrp)
+        if not leader_meta:
+            continue
+        leader_pgrp, leader_sess, leader_start = leader_meta
+        if pgrp == leader_pgrp == leader_sess:
+            out[pgrp] = leader_start
+    return out
+
+
+def _kill_external_solver_groups(jvm_pid, own_pgrp):
+    """Terminate completed theorem checks' external solver groups below one JVM.
+
+    Returns the number of groups successfully signaled. `_kill_pgid` rechecks the leader start time immediately before signaling, preventing a recycled PID from identifying an unrelated group."""
+    killed = 0
+    for pgid, start in _external_solver_groups(jvm_pid, own_pgrp).items():
+        if _kill_pgid(pgid, start):
+            killed += 1
+    return killed
+
+
 _PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
 
 

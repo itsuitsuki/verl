@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -51,6 +52,112 @@ def test_flags_non_math_prompt_answer_mismatch():
         "olympiads",
     )
     assert "non_math_prompt_with_math_answer" in flags
+
+
+def test_chinese_math_prompt_skips_english_non_math_heuristic():
+    assert "non_math_prompt_with_math_answer" not in quality.row_flags(
+        "将两个相同的白球放入三个袋子，求没有空袋的放法数。",
+        "723",
+        "math_dapo",
+    )
+
+
+def test_repairs_only_contextually_identified_control_characters():
+    cases = {
+        "value \x0crac{1}{2}": r"value \frac{1}{2}",
+        "angle = \x08eta": r"angle = \beta",
+        "de\x0cne": "define",
+        "satis\x0ces": "satisfies",
+        "satis\x0cfies": "satisfies",
+        "in\x0cfinite": "infinite",
+        "\x0crst": "first",
+        "\x0ctting together": "fitting together",
+        "\x0cnd the distance": "find the distance",
+        "\x0cnd the area": "find the area",
+        "\x0cfirst": "first",
+        "\x0cfive": "five",
+        "\x0cfigure": "figure",
+        "\x0cfinds": "finds",
+        "fi\x0cve": "five",
+        "\x0cfind $p(10)$": "find $p(10)$",
+        "\x0cequal 2020": "equal 2020",
+        "2 | \x0cx^2 - 9 |": "2 | x^2 - 9 |",
+        "a \\le b \x14 \\le c": r"a \le b  \le c",
+        "a \x01 \\cdot b": r"a  \cdot b",
+        "\x0c\x0cand": "and",
+        "\x0c\x0cequal": "equal",
+        "\x0cand": "and",
+        "di\x0bfference": "difference",
+        "x \x14\\le y": r"x \le y",
+        "x \\le\x14 y": r"x \le y",
+        "\\cdot \x01 c": r"\cdot  c",
+        "\x12\\{1,2\\}": r"\{1,2\}",
+        "\x12(x+1)": "(x+1)",
+        "180^\\circ\x0e with": r"180^\circ with",
+        "$\\star$ \x88 $x \\le 2y$": r"$\star$ $x \le 2y$",
+    }
+    for source, expected in cases.items():
+        assert quality.repair_unambiguous_encoding(source) == expected
+
+
+def test_repairs_exact_source_latex_aliases_and_literal_newlines():
+    cases = {
+        r"\df{a}{b}": r"\frac{a}{b}",
+        r"\bR \bN \bC \bZ \bQ": r"\mathbb{R} \mathbb{N} \mathbb{C} \mathbb{Z} \mathbb{Q}",
+        r"\dd x": r"\,\mathrm{d} x",
+        r"a-\sqrtb": r"a-\sqrt{b}",
+        r"\ frac{a}{b} + \ sqrt{c}": r"\frac{a}{b} + \sqrt{c}",
+        r"text\n\n$f(x)$": "text\n\n$f(x)$",
+        r"table\n| a | b |\n| 1 | 2 |": "table\n| a | b |\n| 1 | 2 |",
+        r"given\n$$\nx=1\n$$\nanswer": "given\n$$\nx=1\n$$\nanswer",
+    }
+    for source, expected in cases.items():
+        assert quality.repair_source_latex(source) == expected
+
+
+def test_flags_malformed_math_delimiters_without_flagging_currency():
+    assert "malformed_math_delimiters" in quality.row_flags(
+        "则 $x=1。", "1", "math_dapo"
+    )
+    assert "malformed_math_delimiters" in quality.row_flags(
+        r"满足\(1) $x=1$。", "1", "math_dapo"
+    )
+    assert "malformed_math_delimiters" not in quality.row_flags(
+        "A ticket costs $5.", "5", "math_dapo"
+    )
+    assert "malformed_math_delimiters" not in quality.row_flags(
+        r"$a=1$ and \(b=2\).", "3", "math_dapo"
+    )
+
+    assert quality.repair_unambiguous_encoding("word \x0czebra") == "word \x0czebra"
+    assert "bad_encoding" in quality.row_flags("word \x0czebra", "4", "test")
+    assert "bad_encoding" in quality.row_flags("word \x88zebra", "4", "test")
+
+
+def test_repaired_record_keeps_other_control_characters():
+    record = {"prompt": "\x0crac{1}{2}", "answer": "4", "source_index": 1}
+    fixed = quality.repaired_record(record)
+    assert fixed["prompt"] == r"\frac{1}{2}"
+    assert fixed["answer"] == "4"
+
+
+
+
+def test_strips_only_exact_embedded_chinese_response_instruction_suffix():
+    instruction = (
+        "让我们一步一步地思考。请以“Answer: \\boxed{<final_answer>}”的格式输出最终答案。"
+        "如果是选择题，请按顺序输出正确的选项，不带任何标点或空格。"
+        "对于其他类型的问题，请只输出最终答案的数值。"
+    )
+    record = {
+        "source_index": 1,
+        "prompt": "求 $1+1$。\n" + instruction,
+        "answer": "2",
+    }
+    assert quality.repaired_record(record)["prompt"] == "求 $1+1$。"
+    assert quality.strip_embedded_response_instruction(
+        "题目中提到让我们一步一步地思考，但后缀并不完整。"
+    ) == "题目中提到让我们一步一步地思考，但后缀并不完整。"
 
 
 def test_flags_forum_administration_without_banning_forum_math():
@@ -117,3 +224,58 @@ def test_shared_verl_schema_matches_existing_math_files():
         "math_solution", "math_final_answer", "fol_context", "fol_question",
         "fol_options",
     }
+
+
+def test_processing_uses_repaired_records_before_grouping(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_write(records, path):
+        captured[path.name] = records
+
+    monkeypatch.setattr(shared, "write_dataset", fake_write)
+    monkeypatch.setattr(shared, "sha256", lambda path: "test-hash")
+    shared.process_records(
+        records=[
+            {"source_index": 1, "prompt": "Find \x0crac{1}{2}.", "answer": "2", "source": "test"},
+            {"source_index": 2, "prompt": r"Find \frac{1}{2}.", "answer": "2", "source": "test"},
+        ],
+        save_dir=tmp_path,
+        data_source="test",
+        source_description="test",
+        system_prompt=None,
+        instruction="test",
+    )
+    assert len(captured["train.parquet"]) == 1
+    assert captured["train.parquet"][0]["extra_info"]["math_question"] == r"Find \frac{1}{2}."
+    assert captured["quarantine.parquet"][0]["reason"] == "duplicate_prompt_equivalent_answer"
+    report = json.loads((tmp_path / "quality_report.json").read_text())
+    assert report["counts"]["clean_output"] == 1
+    assert report["counts"]["quarantine"] == 1
+
+
+def test_stripping_embedded_instruction_precedes_duplicate_grouping(monkeypatch, tmp_path):
+    captured = {}
+    instruction = (
+        "让我们一步一步地思考。请以“Answer: \\boxed{<final_answer>}”的格式输出最终答案。"
+        "如果是选择题，请按顺序输出正确的选项，不带任何标点或空格。"
+        "对于其他类型的问题，请只输出最终答案的数值。"
+    )
+
+    monkeypatch.setattr(
+        shared, "write_dataset",
+        lambda records, path: captured.__setitem__(path.name, records),
+    )
+    monkeypatch.setattr(shared, "sha256", lambda path: "test-hash")
+    shared.process_records(
+        records=[
+            {"source_index": 1, "prompt": "求 $1+1$。\n" + instruction, "answer": "2", "source": "test"},
+            {"source_index": 2, "prompt": "求 $1+1$。", "answer": "2", "source": "test"},
+        ],
+        save_dir=tmp_path,
+        data_source="test",
+        source_description="test",
+        system_prompt=None,
+        instruction="test",
+    )
+    assert len(captured["train.parquet"]) == 1
+    assert captured["quarantine.parquet"][0]["reason"] == "duplicate_prompt_equivalent_answer"

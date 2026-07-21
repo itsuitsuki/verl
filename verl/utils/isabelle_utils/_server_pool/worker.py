@@ -37,6 +37,7 @@ class IsabelleWorker:
         self.addr: tuple[str, int, str] | None = None
         self.session_id: str | None = None
         self.counter = 0
+        self.external_solver_reaps = 0
         self.pending_names: list[str] = []
         self.lock = threading.Lock()
         self.mgmt_lock = threading.Lock()
@@ -155,64 +156,82 @@ class IsabelleWorker:
     def check(self, theorem_code: str) -> "state_classes.VerificationOutcome":
         """Check one theorem and classify the PIDE result.
 
-        A proof succeeds only when exactly one target node is present, fully processed, and consolidated. Missing, duplicate, or canceled nodes are infrastructure failures; an unfinished node is incomplete."""
+        A proof succeeds only when exactly one target node is present, fully processed, and consolidated. Missing, duplicate, or canceled nodes are infrastructure failures; an unfinished node is incomplete. External solver groups are removed before this serialized worker can accept another theorem."""
         with self.lock:
-            self.counter += 1
-            name = f"V{self.counter}_{uuid.uuid4().hex[:8]}"
-            (self.master_dir / f"{name}.thy").write_text(
-                f"theory {name}\n  imports Prelude\nbegin\n\n{theorem_code}\n\nend\n")
-            t0 = time.time()
-            task = self.conn.request_task("use_theories", {
-                "session_id": self.session_id,
-                "theories": [name],
-                "master_dir": str(self.master_dir),
-                "check_delay": 0.02,
-            })
-            kind, payload = self.conn.wait_task(self.verify_timeout, task=task)
-            elapsed = time.time() - t0
-            if kind != "FINISHED":
-                return state_classes.VerificationOutcome(
-                    outcome=state_classes.ProofOutcome.WORKER_ERROR,
-                    elapsed=elapsed, errors=[f"{kind}: {str(payload)[:200]}"])
-            errors = [e.get("message", str(e)) if isinstance(e, dict) else str(e)
-                      for e in payload.get("errors", [])]
-            self.pending_names.append(name)
-            if self.counter % self.purge_every == 0:
-                batch = list(self.pending_names)
-                self.pending_names.clear()
-                self._enqueue_purge(batch)
-            node_st = None
-            node_seen = 0
-            for nd in payload.get("nodes", []):
-                if nd.get("theory_name", "").endswith(name):
-                    node_seen += 1
-                    node_st = nd.get("status", {})
-            if node_seen != 1:
-                reason = ("target node missing from PIDE payload"
-                          if node_seen == 0
-                          else f"duplicate target nodes ({node_seen})")
-                return state_classes.VerificationOutcome(
-                    outcome=state_classes.ProofOutcome.WORKER_ERROR,
-                    elapsed=elapsed, errors=[reason])
-            st = node_st
-            if st.get("canceled"):
-                return state_classes.VerificationOutcome(
-                    outcome=state_classes.ProofOutcome.WORKER_ERROR,
-                    elapsed=elapsed, errors=[f"node canceled: {st}"])
-            consolidated_full = bool(st.get("consolidated")
-                                     and st.get("percentage") == 100)
-            node_ok = bool(st.get("ok") and consolidated_full
-                           and st.get("failed", 1) == 0)
-            if not node_ok and not errors:
-                errors = [f"node not consolidated: {st}"]
-            if bool(payload.get("ok")) and node_ok:
-                outcome = state_classes.ProofOutcome.PROVED
-            elif not node_ok and not consolidated_full:
-                outcome = state_classes.ProofOutcome.INCOMPLETE
-            else:
-                outcome = state_classes.ProofOutcome.UNPROVED
+            try:
+                return self._check_locked(theorem_code)
+            finally:
+                self._cleanup_external_solvers()
+
+    def _cleanup_external_solvers(self):
+        """Remove `csdp` and `veriT` groups left after one completed check."""
+        if self.jvm_pid is None:
+            return
+        try:
+            self.external_solver_reaps += processes._kill_external_solver_groups(
+                self.jvm_pid, os.getpgrp())
+        except Exception as error:  # noqa: BLE001 -- cleanup cannot change a proof result
+            print(f"[pool] worker {self.wid} external solver cleanup failed: {error!r}",
+                  flush=True)
+
+    def _check_locked(self, theorem_code: str) -> "state_classes.VerificationOutcome":
+        """Run one theorem while the caller holds the worker lock."""
+        self.counter += 1
+        name = f"V{self.counter}_{uuid.uuid4().hex[:8]}"
+        (self.master_dir / f"{name}.thy").write_text(
+            f"theory {name}\n  imports Prelude\nbegin\n\n{theorem_code}\n\nend\n")
+        t0 = time.time()
+        task = self.conn.request_task("use_theories", {
+            "session_id": self.session_id,
+            "theories": [name],
+            "master_dir": str(self.master_dir),
+            "check_delay": 0.02,
+        })
+        kind, payload = self.conn.wait_task(self.verify_timeout, task=task)
+        elapsed = time.time() - t0
+        if kind != "FINISHED":
             return state_classes.VerificationOutcome(
-                outcome=outcome, elapsed=elapsed, errors=errors)
+                outcome=state_classes.ProofOutcome.WORKER_ERROR,
+                elapsed=elapsed, errors=[f"{kind}: {str(payload)[:200]}"])
+        errors = [e.get("message", str(e)) if isinstance(e, dict) else str(e)
+                  for e in payload.get("errors", [])]
+        self.pending_names.append(name)
+        if self.counter % self.purge_every == 0:
+            batch = list(self.pending_names)
+            self.pending_names.clear()
+            self._enqueue_purge(batch)
+        node_st = None
+        node_seen = 0
+        for nd in payload.get("nodes", []):
+            if nd.get("theory_name", "").endswith(name):
+                node_seen += 1
+                node_st = nd.get("status", {})
+        if node_seen != 1:
+            reason = ("target node missing from PIDE payload"
+                      if node_seen == 0
+                      else f"duplicate target nodes ({node_seen})")
+            return state_classes.VerificationOutcome(
+                outcome=state_classes.ProofOutcome.WORKER_ERROR,
+                elapsed=elapsed, errors=[reason])
+        st = node_st
+        if st.get("canceled"):
+            return state_classes.VerificationOutcome(
+                outcome=state_classes.ProofOutcome.WORKER_ERROR,
+                elapsed=elapsed, errors=[f"node canceled: {st}"])
+        consolidated_full = bool(st.get("consolidated")
+                                 and st.get("percentage") == 100)
+        node_ok = bool(st.get("ok") and consolidated_full
+                       and st.get("failed", 1) == 0)
+        if not node_ok and not errors:
+            errors = [f"node not consolidated: {st}"]
+        if bool(payload.get("ok")) and node_ok:
+            outcome = state_classes.ProofOutcome.PROVED
+        elif not node_ok and not consolidated_full:
+            outcome = state_classes.ProofOutcome.INCOMPLETE
+        else:
+            outcome = state_classes.ProofOutcome.UNPROVED
+        return state_classes.VerificationOutcome(
+            outcome=outcome, elapsed=elapsed, errors=errors)
 
     def _enqueue_purge(self, batch: list[str]):
         """Queue theory names for asynchronous removal.

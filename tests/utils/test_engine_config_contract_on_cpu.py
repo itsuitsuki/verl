@@ -25,22 +25,44 @@ def clean_singleton(monkeypatch):
     yield
 
 
+def test_missing_translator_config_is_rejected_loudly(clean_singleton):
+    with pytest.raises(ValueError, match="model, base_url"):
+        fv._get_isabelle_engine({})
+    with pytest.raises(ValueError, match="model"):
+        fv._get_isabelle_engine({"base_url": "http://127.0.0.1:4873/v1"})
+    with pytest.raises(ValueError, match="base_url"):
+        fv._get_isabelle_engine({"model": "Qwen3.6-35B-A3B"})
+
+
+def test_explicit_translator_config_builds_engine(clean_singleton):
+    engine = fv._get_isabelle_engine({
+        "model": "Qwen3.6-35B-A3B",
+        "base_url": "http://127.0.0.1:4873/v1",
+    })
+    assert engine.config.translator_model == "Qwen3.6-35B-A3B"
+    assert engine.config.translator_url == "http://127.0.0.1:4873/v1"
+
+
 def test_same_effective_config_reuses_the_engine(clean_singleton):
-    first = fv._get_isabelle_engine({"isabelle_pool_workers": 3, "fol_timeout": 45})
-    second = fv._get_isabelle_engine({"isabelle_pool_workers": 3, "fol_timeout": 45})
-    assert first is second
-
-
-def test_default_config_callers_share_one_engine(clean_singleton):
-    first = fv._get_isabelle_engine(None)
-    second = fv._get_isabelle_engine({})
+    cfg = {
+        "model": "Qwen3.6-35B-A3B",
+        "base_url": "http://127.0.0.1:4873/v1",
+        "isabelle_pool_workers": 3,
+        "fol_timeout": 45,
+    }
+    first = fv._get_isabelle_engine(cfg)
+    second = fv._get_isabelle_engine(cfg)
     assert first is second
 
 
 def test_different_config_is_rejected_loudly(clean_singleton):
-    fv._get_isabelle_engine({"isabelle_pool_workers": 3, "fol_timeout": 45})
+    base = {
+        "model": "Qwen3.6-35B-A3B",
+        "base_url": "http://127.0.0.1:4873/v1",
+    }
+    fv._get_isabelle_engine({**base, "isabelle_pool_workers": 3, "fol_timeout": 45})
     with pytest.raises(RuntimeError) as excinfo:
-        fv._get_isabelle_engine({"isabelle_pool_workers": 1, "fol_timeout": 120})
+        fv._get_isabelle_engine({**base, "isabelle_pool_workers": 1, "fol_timeout": 120})
     message = str(excinfo.value)
     assert "pool_workers" in message
     assert "verify_timeout" in message

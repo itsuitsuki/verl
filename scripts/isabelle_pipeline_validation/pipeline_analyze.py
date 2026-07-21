@@ -9,7 +9,7 @@ Definitions used here:
   format-failed responses have no parseable steps at all (n_steps=0) and are reported as a
   response-level rate, not in the step table.
 
-  python -u e2e_analyze.py --records records.jsonl --debug-dir debug --audit-out audit.jsonl
+  python -u pipeline_analyze.py --records records.jsonl --debug-dir debug --audit-out audit.jsonl
 """
 import argparse
 import json
@@ -32,12 +32,7 @@ def main():
 
     audit = open(args.audit_out, "w", encoding="utf-8")
     n_audit = 0
-    header = ("%-10s %5s %6s %6s %6s %6s | %5s %5s %5s %5s %5s %5s %6s | %6s %7s %6s %6s"
-              % ("dataset", "resp", "fmt%", "giv%", "stp%", "outc%",
-                 "o", "x", "c", "u", "g", "m", "t",
-                 "steps", "reach%", "o/all%", "o/rch%"))
-    print(header)
-    print("-" * len(header))
+    measured = {}   # per-dataset measured values, printed as labeled tables after the loop
 
     grand = Counter()
     grand_steps = grand_reached = grand_resp = 0
@@ -101,28 +96,66 @@ def main():
                     n_audit += 1
 
         reached = sum(sym[c] for c in "oxcugm")
-        print("%-10s %5d %6.1f %6.1f %6.1f %6.1f | %5d %5d %5d %5d %5d %5d %6d | %6d %7.1f %6.1f %6.1f"
-              % (ds, n, 100.0 * len(fmt) / max(1, n), 100.0 * len(giv) / max(1, len(fmt)),
-                 100.0 * len(stp) / max(1, len(giv)), 100.0 * outc / max(1, n),
-                 sym["o"], sym["x"], sym["c"], sym["u"], sym["g"], sym["m"], sym["t"],
-                 total_steps, 100.0 * reached / max(1, total_steps),
-                 100.0 * sym["o"] / max(1, total_steps),
-                 100.0 * sym["o"] / max(1, reached)))
-        if errors:
-            print("           !! %d responses errored: %s"
-                  % (len(errors), [e.get("error") for e in errors[:3]]))
+        measured[ds] = {
+            "n": n, "errors": errors, "parsed": total_steps, "reached": reached, "sym": sym,
+            "format_ok": 100.0 * len(fmt) / max(1, n),
+            "givens_ok": 100.0 * len(giv) / max(1, len(fmt)),
+            "steps_ok": 100.0 * len(stp) / max(1, len(giv)),
+            "checkable_steps": 100.0 * reached / max(1, total_steps),
+            "reward_rate": 100.0 * sym["o"] / max(1, total_steps),
+            "o_among_checkable": 100.0 * sym["o"] / max(1, reached),
+            "outcome_acc": 100.0 * outc / max(1, n),
+        }
         grand.update(sym)
         grand_steps += total_steps
         grand_reached += reached
         grand_resp += n
 
-    print("-" * len(header))
-    print("%-10s %5d %s | %5d %5d %5d %5d %5d %5d %6d | %6d %7.1f %6.1f %6.1f"
-          % ("TOTAL", grand_resp, " " * 27,
-             grand["o"], grand["x"], grand["c"], grand["u"], grand["g"], grand["m"], grand["t"],
-             grand_steps, 100.0 * grand_reached / max(1, grand_steps),
-             100.0 * grand["o"] / max(1, grand_steps),
-             100.0 * grand["o"] / max(1, grand_reached)))
+    # Every column below is computed above from this records file; none is hand-entered.
+    # Names and definitions match the 260717 Notion "Overall (process reward engine)" table.
+    print("Definitions (all values are percentages measured on %s):" % args.records)
+    print("  format_ok = response parses to <step>/<premise>/<conclusion> + one \\boxed{}.")
+    print("  givens_ok = among format_ok responses, the problem givens formalized.")
+    print("  steps_ok  = among givens_ok responses, the reasoning steps formalized.")
+    print("  checkable_steps   = steps that reached the prover / all parsed steps of format_ok responses.")
+    print("  reward_rate       = o steps / all parsed steps of format_ok responses.")
+    print("  o_among_checkable = o steps / checkable steps.")
+    print("  outcome_acc       = responses whose \\boxed{} equals the reference answer.\n")
+
+    fmt_a = "%-32s %9s %9s %8s %15s %11s %17s %11s"
+    head_a = fmt_a % ("dataset", "format_ok", "givens_ok", "steps_ok", "checkable_steps",
+                      "reward_rate", "o_among_checkable", "outcome_acc")
+    print(head_a)
+    print("-" * len(head_a))
+    for ds in sorted(measured):
+        d = measured[ds]
+        print(fmt_a % (ds, "%.1f" % d["format_ok"], "%.1f" % d["givens_ok"],
+                       "%.1f" % d["steps_ok"], "%.1f" % d["checkable_steps"],
+                       "%.1f" % d["reward_rate"], "%.1f" % d["o_among_checkable"],
+                       "%.1f" % d["outcome_acc"]))
+        if d["errors"]:
+            print("  !! %d responses errored: %s"
+                  % (len(d["errors"]), [e.get("error") for e in d["errors"][:3]]))
+    print("-" * len(head_a))
+    print(fmt_a % ("TOTAL", "", "", "", "%.1f" % (100.0 * grand_reached / max(1, grand_steps)),
+                   "%.1f" % (100.0 * grand["o"] / max(1, grand_steps)),
+                   "%.1f" % (100.0 * grand["o"] / max(1, grand_reached)), ""))
+
+    # The checkable-step result-symbol counts behind checkable_steps and reward_rate.
+    print("\nResult-symbol detail (one symbol per checkable step; t = parsed but never reached):")
+    print("  o proved+rewarded, x unproved, c premise-contradiction, u consistency-undecided,")
+    print("  g guard-withheld, m number-omitted.")
+    fmt_b = "%-32s %8s %6s %6s %6s %6s %5s %5s %8s"
+    head_b = fmt_b % ("dataset", "parsed", "o", "x", "c", "u", "g", "m", "t")
+    print(head_b)
+    print("-" * len(head_b))
+    for ds in sorted(measured):
+        s = measured[ds]["sym"]
+        print(fmt_b % (ds, measured[ds]["parsed"], s["o"], s["x"], s["c"],
+                       s["u"], s["g"], s["m"], s["t"]))
+    print("-" * len(head_b))
+    print(fmt_b % ("TOTAL", grand_steps, grand["o"], grand["x"], grand["c"],
+                   grand["u"], grand["g"], grand["m"], grand["t"]))
 
     if direct_counts:
         print("\ndirect-domain steps (dataset, reason -> count):")

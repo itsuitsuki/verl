@@ -6,7 +6,7 @@ Positive cases must verify;
 negative cases (wrong value, wrong sign, quadrant-impossible tangent, conflicting evidence, empty or endpoint bounds, mismatched angles) must not.
 
 Run on a node with the rebuilt Isa_Step heap:
-    bash scripts/isabelle_e2e_validation/with_env.sh python -u scripts/isabelle_e2e_validation/validate_trig_matrix.py
+    bash scripts/isabelle_pipeline_validation/with_env.sh python -u scripts/isabelle_pipeline_validation/validate_trig_matrix.py
 Exit code 0 = every expectation held.
 """
 import os

@@ -4,11 +4,54 @@ The cache stores the same stable proof outcomes as the in-memory memo. Change th
 import hashlib
 import json
 import os
+import re
 
 from verl.utils.isabelle_utils._server_pool import config
 
+# The memo and disk key are computed from normalize_theorem_text() (2026-07-21),
+# which alpha-renames pv_ free variables and collapses whitespace so alpha-equivalent
+# steps share one proof outcome. No version bump needed: normalized keys contain \x00
+# placeholders that raw text never has, so old v0 entries cannot collide with new ones;
+# entries whose theorems have no pv_ variables normalize to the original text and
+# are reused from the existing cache.
 _THM_CACHE_VERSION = os.environ.get("ISABELLE_THEOREM_CACHE_VERSION", "v0")
 _THM_ENV_FPRINT: dict = {}
+
+_PV_FIX_RE = re.compile(
+    r"\bfixes\s+"
+    r"(?P<names>pv_[A-Za-z0-9_']*(?:\s+(?:and\s+)?pv_[A-Za-z0-9_']*)*)"
+    r"\s*::"
+)
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_theorem_text(theorem_code: str) -> str:
+    """Map alpha-equivalent generated theorems onto one cache-key string.
+
+    Only names declared by theorem-header ``fixes ... ::`` clauses are renamed.
+    This avoids touching a coincidentally ``pv_``-prefixed Isabelle constant or a
+    direct-domain theorem that merely mentions such a token. Each distinct fixed
+    variable receives a positional placeholder in order of declaration, and each
+    run of whitespace is collapsed; numerals, operators, term structure, types,
+    assumption labels, tactics, and every other identifier remain untouched. The
+    value is a hashing key only; Isabelle always receives the original theorem.
+    """
+    names = []
+    seen = set()
+    for match in _PV_FIX_RE.finditer(theorem_code):
+        for name in re.findall(r"\bpv_[A-Za-z0-9_']*\b", match.group("names")):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    if names:
+        name_re = re.compile(
+            r"\b(?:" + "|".join(re.escape(name) for name in names) + r")\b"
+        )
+        positions = {name: idx for idx, name in enumerate(names)}
+        theorem_code = name_re.sub(
+            lambda match: f"\x00{positions[match.group(0)]}\x00", theorem_code
+        )
+    return _WS_RE.sub(" ", theorem_code).strip()
 
 
 def _thm_env_fprint(session=None, imports=None, options=None) -> str:

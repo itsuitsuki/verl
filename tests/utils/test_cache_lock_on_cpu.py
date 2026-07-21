@@ -20,6 +20,9 @@ from verl.utils.isabelle_utils._server_pool import theorem_cache
 from verl.utils.isabelle_utils import translator
 
 THM = 'theorem chk:\n  shows "(2::nat) + 2 = 4"\n  using assms by (simp)'
+# The pool keys the theorem cache by the normalized theorem text, so a test that
+# simulates another process must build the same disk lock/store path from THM_KEY.
+THM_KEY = theorem_cache.normalize_theorem_text(THM)
 
 
 # ---------- primitives ----------
@@ -155,7 +158,7 @@ def test_theorem_after_other_process_failure(tmp_path, monkeypatch):
         return {"success": True, "elapsed": 0.01, "errors": []}
 
     monkeypatch.setattr(pool, "_check_uncached", fake_uncached)
-    lock = theorem_cache._thm_disk_path(THM, pool._thm_fprint) + ".lock"
+    lock = theorem_cache._thm_disk_path(THM_KEY, pool._thm_fprint) + ".lock"
     os.makedirs(os.path.dirname(lock), exist_ok=True)
     with open(lock, "w") as file:
         file.write("99999")
@@ -173,7 +176,7 @@ def test_theorem_waits_for_other_process_result(tmp_path, monkeypatch):
         return {"success": True, "elapsed": 0.01, "errors": []}
 
     monkeypatch.setattr(pool, "_check_uncached", fake_uncached)
-    lock = theorem_cache._thm_disk_path(THM, pool._thm_fprint) + ".lock"
+    lock = theorem_cache._thm_disk_path(THM_KEY, pool._thm_fprint) + ".lock"
     os.makedirs(os.path.dirname(lock), exist_ok=True)
     with open(lock, "w") as file:
         file.write("99999")
@@ -181,7 +184,7 @@ def test_theorem_waits_for_other_process_result(tmp_path, monkeypatch):
     def _store_result():
         time.sleep(0.3)
         theorem_cache._thm_disk_store(
-            THM,
+            THM_KEY,
             {"success": False, "elapsed": 0.5, "errors": ["by fails"]},
             pool._thm_fprint,
         )

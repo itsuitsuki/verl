@@ -6,7 +6,7 @@ an `|` chain) parses and behaves: a branch that only rewrites must fail cleanly 
 branch still closes the goal, and a false goal must stay unproved.
 
 Run on a node with the Isa_Step heap:
-    bash scripts/isabelle_e2e_validation/with_env.sh python -u scripts/isabelle_e2e_validation/validate_tactic_fixes.py
+    bash scripts/isabelle_pipeline_validation/with_env.sh python -u scripts/isabelle_pipeline_validation/validate_tactic_fixes.py
 Exit code 0 = every expectation held.
 """
 import os

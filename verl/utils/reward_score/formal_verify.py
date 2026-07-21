@@ -850,14 +850,25 @@ _isabelle_engine_lock = threading.Lock()
 
 
 def _isabelle_config_from(api_config: dict | None):
-    """The effective IsabelleConfig a reward api_config maps to. Pure translation, no side effects: used both to build the engine and to check that a later caller agrees with the engine already built."""
+    """The effective IsabelleConfig a reward api_config maps to.
+
+    The translator model and URL are required inputs. Keeping them explicit
+    prevents a misspelled or omitted Hydra override from silently producing
+    zero process rewards or selecting an unintended translator.
+    """
     from verl.utils.isabelle_utils.engine import IsabelleConfig
     cfg = api_config or {}
+    missing = [name for name in ("model", "base_url") if not cfg.get(name)]
+    if missing:
+        raise ValueError(
+            "Isabelle translator configuration missing required reward.api_config "
+            "field(s): " + ", ".join(missing)
+        )
     # fol_timeout aligns with the Z3 path: per-verification deadline in seconds. Default 60 matches the pool's VERIFY_TIMEOUT.
     timeout = cfg.get("fol_timeout") or cfg.get("timeout") or 60.0
     return IsabelleConfig(
         translator_url=cfg.get("base_url", "http://127.0.0.1:4873/v1"),
-        translator_model=cfg.get("model", "Qwen3.6-35B-A3B"),
+        translator_model=cfg.get("model"),
         pool_workers=int(cfg.get("isabelle_pool_workers", 32)),
         verify_timeout=float(timeout),
         api_timeout=float(cfg.get("api_timeout") or 240.0),
@@ -968,6 +979,7 @@ def compute_solution_reward_isabelle(
         "prove_cache_hits": 0,
         "reward_wall_time": 0.0,
         "pool_restarts": 0,
+        "external_solver_reaps": 0,
         "thm_cache_hit_rate": 0.0,
         "tr_cache_hit_rate": 0.0,
         # Count actual judge HTTP requests separately from cache reuse. The old
@@ -1062,6 +1074,8 @@ def compute_solution_reward_isabelle(
         debug["reward_wall_time"] = float(prof.get("reward_wall_time") or 0.0)
         try:
             debug["pool_restarts"] = int(engine.pool.restart_count)
+            debug["external_solver_reaps"] = int(
+                engine.pool.external_solver_reaps)
             _ch = int(engine.pool.cache_hits)
             _cm = int(engine.pool.cache_misses)
             debug["thm_cache_hit_rate"] = _ch / max(1, _ch + _cm)

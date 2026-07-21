@@ -1,5 +1,5 @@
 #!/bin/bash
-# Environment wrapper for the e2e validation scripts on datatech: Isabelle 2025,
+# Environment wrapper for the full-pipeline validation scripts on datatech: Isabelle 2025,
 # the verl conda env, and the shared repo on PYTHONPATH. Usage:
 #   bash with_env.sh python -u <script> [args...]
 source /2022533109/zhouchuyan/isabelle/env.sh
