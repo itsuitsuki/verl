@@ -2,15 +2,15 @@
 set -x
 
 # Math Step-GDPO on Combined Math Set
-# Math counterpart of fol_step_gdpo_combined.sh
+# Math counterpart of fol_step_gdpo_logic_combined.sh
 
 # Requires: Isabelle 2025 installed, translator vLLM running at OPENAI_BASE_URL,
-# or set JUDGE_MODEL/JUDGE_DEVICES to auto-start one.
+# or set TRANSLATOR_MODEL/TRANSLATOR_DEVICES to auto-start one.
 
 # Model via TRAIN_MODEL (HF-style id resolved under the shared models dir, or a
 # literal path); training GPUs via plain CUDA_VISIBLE_DEVICES:
-#   TRAIN_MODEL=Qwen/Qwen3-4B CUDA_VISIBLE_DEVICES=x,y bash bash_scripts/math/train/math_step_gdpo_isabelle_combined.sh
-#   TRAIN_MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=x,y bash bash_scripts/math/train/math_step_gdpo_isabelle_combined.sh
+#   TRAIN_MODEL=Qwen/Qwen3-4B CUDA_VISIBLE_DEVICES=x,y bash bash_scripts/math/train/math_step_gdpo_math_combined.sh
+#   TRAIN_MODEL=Qwen/Qwen3-8B CUDA_VISIBLE_DEVICES=x,y bash bash_scripts/math/train/math_step_gdpo_math_combined.sh
 
 # Source Isabelle environment
 if [ -f /2022533109/zhouchuyan/isabelle/env.sh ]; then
@@ -62,53 +62,53 @@ fi
 MODEL_TAG=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 
 export FOL_MODEL="Qwen3.6-35B-A3B"
-JUDGE_PORT=${JUDGE_PORT:-4873}
-# Default to the resident local judge (tmux "judge") on this node; unset
-# OPENAI_BASE_URL explicitly AND set JUDGE_MODEL to auto-start one instead.
-export OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://127.0.0.1:${JUDGE_PORT}/v1}
+TRANSLATOR_PORT=${TRANSLATOR_PORT:-4873}
+# Default to the resident local translator (tmux "translator1-4873") on this node;
+# unset OPENAI_BASE_URL explicitly AND set TRANSLATOR_MODEL to auto-start one instead.
+export OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://127.0.0.1:${TRANSLATOR_PORT}/v1}
 
 RUN_STAMP="math_combined_${MODEL_TAG}_$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="logs/${RUN_STAMP}"          # judge.log only (created on judge auto-start)
+LOG_DIR="logs/${RUN_STAMP}"          # translator.log only (created on translator auto-start)
 
 mkdir -p logs
 exec > >(tee -a "logs/${RUN_STAMP}.log") 2>&1
 echo "Logging to logs/${RUN_STAMP}.log"
 
-# --- Judge setup (auto-start only when no external judge is given) ---
-JUDGE_PID=""
+# --- Translator setup (auto-start only when no external translator is given) ---
+TRANSLATOR_PID=""
 if [ -z "$OPENAI_BASE_URL" ]; then
-    JUDGE_MODEL=${JUDGE_MODEL:?'JUDGE_MODEL or OPENAI_BASE_URL must be set'}
-    JUDGE_TP=${JUDGE_TP:-2}
-    JUDGE_DEVICES=${JUDGE_DEVICES:-0,1}
+    TRANSLATOR_MODEL=${TRANSLATOR_MODEL:?'TRANSLATOR_MODEL or OPENAI_BASE_URL must be set'}
+    TRANSLATOR_TP=${TRANSLATOR_TP:-2}
+    TRANSLATOR_DEVICES=${TRANSLATOR_DEVICES:-0,1}
     mkdir -p "$LOG_DIR"
-    echo "Starting local judge on GPU $JUDGE_DEVICES (TP=$JUDGE_TP)... log: $LOG_DIR/judge.log"
-    CUDA_VISIBLE_DEVICES=$JUDGE_DEVICES vllm serve $JUDGE_MODEL \
+    echo "Starting local translator on GPU $TRANSLATOR_DEVICES (TP=$TRANSLATOR_TP)... log: $LOG_DIR/translator.log"
+    CUDA_VISIBLE_DEVICES=$TRANSLATOR_DEVICES vllm serve $TRANSLATOR_MODEL \
         --served-model-name Qwen3.6-35B-A3B \
-        --port $JUDGE_PORT \
+        --port $TRANSLATOR_PORT \
         --max-model-len 12288 \
-        --tensor-parallel-size $JUDGE_TP \
+        --tensor-parallel-size $TRANSLATOR_TP \
         --gpu-memory-utilization 0.90 \
         --enable-prefix-caching \
         --max-num-seqs 256 \
-        > "$LOG_DIR/judge.log" 2>&1 &
-    JUDGE_PID=$!
-    export OPENAI_BASE_URL="http://127.0.0.1:${JUDGE_PORT}/v1"
+        > "$LOG_DIR/translator.log" 2>&1 &
+    TRANSLATOR_PID=$!
+    export OPENAI_BASE_URL="http://127.0.0.1:${TRANSLATOR_PORT}/v1"
 
-    echo "Waiting for judge..."
+    echo "Waiting for translator..."
     for i in $(seq 1 300); do
-        if curl -s http://127.0.0.1:$JUDGE_PORT/health > /dev/null 2>&1; then
-            echo "Judge ready after ${i}s"
+        if curl -s http://127.0.0.1:$TRANSLATOR_PORT/health > /dev/null 2>&1; then
+            echo "Translator ready after ${i}s"
             break
         fi
         sleep 1
     done
-    if ! curl -s http://127.0.0.1:$JUDGE_PORT/health > /dev/null 2>&1; then
-        echo "ERROR: Judge failed to start"
-        kill $JUDGE_PID 2>/dev/null
+    if ! curl -s http://127.0.0.1:$TRANSLATOR_PORT/health > /dev/null 2>&1; then
+        echo "ERROR: Translator failed to start"
+        kill $TRANSLATOR_PID 2>/dev/null
         exit 1
     fi
 else
-    echo "Using external judge at $OPENAI_BASE_URL"
+    echo "Using external translator at $OPENAI_BASE_URL"
 fi
 
 TRAIN_DEVICES=${CUDA_VISIBLE_DEVICES:-0,2}
@@ -117,8 +117,23 @@ echo "Model: $MODEL_PATH | Training GPUs: $TRAIN_DEVICES ($N_GPUS)"
 
 EXP_NAME=${EXP_NAME:-${MODEL_TAG}_step_gdpo_isabelle_math_combined_v3}
 
+# --- Reap leftover Isabelle/Poly processes from a previous crash ---
+_jvms=$(pgrep -cf '[I]sabelle2025' || true)
+_polys=$(pgrep -c -x poly || true)
+if [ "${_jvms:-0}" -gt 0 ] || [ "${_polys:-0}" -gt 0 ]; then
+    echo "Reaping leftovers: ${_jvms:-0} Isabelle JVMs, ${_polys:-0} Poly/ML"
+    pgrep -f '[I]sabelle2025' | xargs -r kill -9 2>/dev/null
+    pgrep -x poly | xargs -r kill -9 2>/dev/null
+    sleep 3
+fi
+
 # --- Training ---
 # fol_task_type=math routes step rewards to Isabelle verification (not Z3).
+# nccl_timeout raises the collective watchdog above PyTorch's 30-minute default.
+# A step here takes 18-45 minutes and the slowest single reward computation has been measured at 34 minutes,
+# so a rank that trails one phase behind the others exceeds the default window; the ranks already waiting in
+# the collective then abort and take the whole job down (measured 2026-08-06 on step 539: ranks 0/2/3 waited
+# 1800 s for an FSDP all-gather that rank 1 never joined).
 CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_gdpo \
     +algorithm.step_reward_type=fol \
@@ -139,7 +154,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     reward.num_workers=4 \
     +algorithm.step_reward_max_workers=128 \
     +algorithm.isabelle_pool_workers=3 \
-    +algorithm.isabelle_worker_rss_cap_gb=12 \
+    +algorithm.isabelle_each_worker_proc_tree_mem_max_gb=12 \
     "data.train_files=[data/gsm8k/train.parquet,data/math/train.parquet,data/bigmath_clean/train.parquet]" \
     "data.val_files=[data/gsm8k/test.parquet,data/math500/test.parquet,data/aime24/test.parquet,data/aime25/test.parquet,data/amc23/test.parquet,data/minervamath/test.parquet,data/olympiadbench/test.parquet]" \
     data.train_batch_size=16 \
@@ -152,6 +167,7 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
     ++data.apply_chat_template_kwargs.enable_thinking=false \
     ++data.seed=42 \
     actor_rollout_ref.model.path=$TRAIN_MODEL \
+    actor_rollout_ref.nccl_timeout=7200 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -196,17 +212,17 @@ CUDA_VISIBLE_DEVICES=$TRAIN_DEVICES python3 -u -m verl.trainer.main_ppo \
 # resume_mode is left at the base-config default (auto); pass it and any other
 # Hydra override straight through "$@". Examples:
 #   from-scratch official run:
-#     bash math_step_gdpo_isabelle_combined.sh trainer.resume_mode=disable
+#     bash math_step_gdpo_math_combined.sh trainer.resume_mode=disable
 #   resume with 4 pool workers + full pattern logging:
-#     bash math_step_gdpo_isabelle_combined.sh \
+#     bash math_step_gdpo_math_combined.sh \
 #         ++algorithm.isabelle_pool_workers=4 \
-#         ++algorithm.isabelle_worker_rss_cap_gb=12 \
+#         ++algorithm.isabelle_each_worker_proc_tree_mem_max_gb=12 \
 #         +trainer.print_all_step_patterns=true
 # print_all_step_patterns defaults OFF via self.config.trainer.get(..., False).
 
 TRAIN_EXIT=$?
 echo "Training finished with exit code $TRAIN_EXIT"
-if [ -n "$JUDGE_PID" ]; then
-    kill $JUDGE_PID 2>/dev/null
+if [ -n "$TRANSLATOR_PID" ]; then
+    kill $TRANSLATOR_PID 2>/dev/null
 fi
 exit $TRAIN_EXIT
