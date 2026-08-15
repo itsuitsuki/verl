@@ -22,6 +22,7 @@ Configurable via api_config keys (``fol_*`` prefix kept for backward compatibili
   - timeout: float (default 30.0 Z3 / 60.0 Isabelle) -- per-verification deadline
   - fol_cumulative_mode: "current_only" (default) | "step" | "dependency_graph"
   - isabelle_pool_workers: int (Isabelle path only)
+  - isabelle_remote_pool_url: str (Isabelle path only) -- base URL of a remote verification server (verl.utils.isabelle_utils.remote_server) on a CPU-only node; empty runs the pool locally
 
 Exports:
   - check_step_format_fol
@@ -876,6 +877,7 @@ def _isabelle_config_from(api_config: dict | None):
         translate_chunk_steps=int(cfg.get("isabelle_translate_chunk_steps") or 20),
         step_check_parallelism=int(cfg.get("isabelle_step_check_parallelism") or 4),
         runaway_cpu_s=float(cfg.get("isabelle_runaway_cpu_s") or 90.0),
+        remote_pool_url=str(cfg.get("isabelle_remote_pool_url") or ""),
     )
 
 

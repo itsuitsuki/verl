@@ -139,6 +139,8 @@ class IsabelleConfig:
     step_check_parallelism: int = 4
     # A prover process burning ~100% CPU for longer than this many seconds is treated as a runaway (native tactic that ignored the cooperative timeout) and reaped. Hydra config knob, was the ISABELLE_RUNAWAY_CPU_S env var.
     runaway_cpu_s: float = 90.0
+    # Base URL of a remote Isabelle verification server (verl.utils.isabelle_utils.remote_server) running on a CPU-only node, e.g. "http://10.15.171.204:8477". Empty string (the default) runs the pool locally in this process; when set, pool_workers, the RSS cap, and runaway_cpu_s are the SERVER's business and the local values are ignored.
+    remote_pool_url: str = ""
 
 
 # Response Processing
@@ -258,16 +260,24 @@ class IsabelleEngine:
 
     def __init__(self, config: IsabelleConfig | None = None):
         self.config = config or IsabelleConfig()
-        # base_dir MUST be per-process: multiple RewardLoopWorker processes each build their own engine,
-        # and IsabelleWorker.start() executes rmtree to its master_dir.
-        # A shared path lets a later process wipe an earlier process's live worker dirs (ENOENT on the next theory write).
-        # verify_timeout is a POOL arg (not a module-global mutation), so two engines cannot clobber each other's timeout.
-        self.pool = server_pool.IsabelleServerPool(
-            num_workers=self.config.pool_workers,
-            base_dir=f"/tmp/isabelle_pool_engine_{os.getpid()}",
-            each_worker_proc_tree_mem_max_gb=self.config.each_worker_proc_tree_mem_max_gb,
-            verify_timeout=self.config.verify_timeout,
-            runaway_cpu_seconds=self.config.runaway_cpu_s)
+        if self.config.remote_pool_url:
+            # Remote prover pool on a CPU-only node: workers, caches, retry, and reapers all live in the
+            # server process (remote_server.py); this side only sends theorems over HTTP. Both pool classes
+            # share the check/submit/shutdown surface, so everything below this branch is identical.
+            from verl.utils.isabelle_utils._server_pool.remote_pool import \
+                RemoteIsabellePool
+            self.pool = RemoteIsabellePool(self.config.remote_pool_url)
+        else:
+            # base_dir MUST be per-process: multiple RewardLoopWorker processes each build their own engine,
+            # and IsabelleWorker.start() executes rmtree to its master_dir.
+            # A shared path lets a later process wipe an earlier process's live worker dirs (ENOENT on the next theory write).
+            # verify_timeout is a POOL arg (not a module-global mutation), so two engines cannot clobber each other's timeout.
+            self.pool = server_pool.IsabelleServerPool(
+                num_workers=self.config.pool_workers,
+                base_dir=f"/tmp/isabelle_pool_engine_{os.getpid()}",
+                each_worker_proc_tree_mem_max_gb=self.config.each_worker_proc_tree_mem_max_gb,
+                verify_timeout=self.config.verify_timeout,
+                runaway_cpu_seconds=self.config.runaway_cpu_s)
         self.pool.start()
         atexit.register(self._safe_shutdown)
 

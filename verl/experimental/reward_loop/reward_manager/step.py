@@ -135,6 +135,9 @@ class StepRewardManager(RewardManagerBase):
                                           algo_cfg.get("isabelle_worker_rss_cap_gb", None))
         if isabelle_rss_cap is not None:
             self.api_config["isabelle_worker_rss_cap_gb"] = float(isabelle_rss_cap)
+        isabelle_remote_url = reward_cfg.get("isabelle_remote_pool_url", algo_cfg.get("isabelle_remote_pool_url", None))
+        if isabelle_remote_url is not None:
+            self.api_config["isabelle_remote_pool_url"] = str(isabelle_remote_url)
 
         print(f"FOL config 'fol_cumulative_mode' is set to: {self.api_config.get('fol_cumulative_mode', 'current_only')}")
 

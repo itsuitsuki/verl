@@ -4,17 +4,22 @@ set -x
 
 # Outcome-only greedy pass@1 test runner.
 #
-# This script is intentionally independent of training reward scripts. It does
-# not launch FOL judges, self-eval judges, or step-reward validation. It only
-# loads the base actor or a checkpoint and evaluates dataset outcome accuracy.
-#
 # Typical use:
 #   CUDA_VISIBLE_DEVICES=1 \
-#   DATA_DIR=/2022533109/zhouchuyan/verl/data/logiqa2k_prompt_v2 \
-#   MODEL_PATH=/2022533109/zhouchuyan/models/Qwen2.5-1.5B-Instruct \
-#   CHECKPOINT_PATH=checkpoints/verl-fol/qwen1.5b_step_gdpo_fol_gpu2_v4/global_step_1844 \
-#   RUN_NAME=qwen1.5b_step_gdpo_fol_logiqa_test_final1844 \
-#   bash bash_scripts/eval/pass_at_1_test.sh 2>&1 | tee test_fol_step_gdpo_logiqa_final1844.log
+#   bash bash_scripts/eval/pass_at_1_test.sh \
+#       actor_rollout_ref.model.path=/path/to/model \
+#       data.val_files=/path/to/test.parquet \
+#       trainer.experiment_name=my_eval_run \
+#       trainer.resume_mode=resume_path \
+#       trainer.resume_from_path=/path/to/checkpoint \
+#       2>&1 | tee eval.log
+#
+# Shell-level variables (only the ones that need shell logic):
+#   MODEL_PATH    — base model (auto-detects cluster paths)
+#   DATA_NAME     — dataset name for path resolution (default: logiqa2k_prompt_v2)
+#   EVAL_RUNS     — number of greedy eval runs (default: 3)
+#
+# Everything else goes through Hydra "$@" overrides.
 
 HOME_DIR=${HOME:-/root}
 DATA_NAME=${DATA_NAME:-logiqa2k_prompt_v2}
@@ -30,20 +35,9 @@ if [ ! -d "$MODEL_PATH" ] && [ -d "/2022533109/zhouchuyan/models/Qwen2.5-1.5B-In
 fi
 
 VAL_FILE=${VAL_FILE:-${TEST_FILE:-"$DATA_DIR/test.parquet"}}
-# main_ppo only DATALOADS train_files (never trains: val-only run). Eval-only
-# benches (math500 / aime / amc / minerva / olympiadbench) ship test.parquet
-# only, so allow a dummy train file from another dataset (2026-07-11).
 TRAIN_FILE=${TRAIN_FILE:-"$DATA_DIR/train.parquet"}
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-${RESUME_FROM_PATH:-}}
 RUN_NAME=${RUN_NAME:-"$(basename "$MODEL_PATH")_${DATA_NAME}_pass_at_1"}
-
-VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1536}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.50}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-128}
-MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export WANDB_ENTITY=${WANDB_ENTITY:-verl-fol}
@@ -99,13 +93,13 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
         +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
         +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-        +reward_model.reward_kwargs.max_resp_len="$MAX_RESPONSE_LENGTH" \
+        +reward_model.reward_kwargs.max_resp_len=1536 \
         data.train_files="$TRAIN_FILE" \
         data.val_files="$VAL_FILE" \
         data.train_batch_size=4 \
-        data.val_batch_size="$VAL_BATCH_SIZE" \
-        data.max_prompt_length="$MAX_PROMPT_LENGTH" \
-        data.max_response_length="$MAX_RESPONSE_LENGTH" \
+        data.val_batch_size=32 \
+        data.max_prompt_length=2048 \
+        data.max_response_length=1536 \
         data.filter_overlong_prompts=True \
         data.truncation=error \
         data.dataloader_num_workers=0 \
@@ -123,13 +117,13 @@ for run_i in $(seq 1 "$EVAL_RUNS"); do
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
         actor_rollout_ref.rollout.name=vllm \
-        actor_rollout_ref.rollout.gpu_memory_utilization="$GPU_MEMORY_UTILIZATION" \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.50 \
         actor_rollout_ref.rollout.n=1 \
         actor_rollout_ref.rollout.temperature=0 \
         actor_rollout_ref.rollout.top_p=1.0 \
-        actor_rollout_ref.rollout.max_model_len="$MAX_MODEL_LEN" \
-        actor_rollout_ref.rollout.max_num_seqs="$MAX_NUM_SEQS" \
-        actor_rollout_ref.rollout.max_num_batched_tokens="$MAX_NUM_BATCHED_TOKENS" \
+        actor_rollout_ref.rollout.max_model_len=4096 \
+        actor_rollout_ref.rollout.max_num_seqs=128 \
+        actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
         actor_rollout_ref.rollout.enforce_eager=True \
         actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
         actor_rollout_ref.rollout.val_kwargs.n=1 \
