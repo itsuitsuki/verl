@@ -1,6 +1,6 @@
-"""CPU-only tests for the judge translation cache.
+"""CPU-only tests for the translator cache.
 
-call_judge is mocked, so no real judge is needed. The tests cover the memory LRU, concurrent identical-request deduplication, and disk cache. Identical prompts, such as one problem's givens across 16 rollouts, use one judge call. Failed translations are not cached, and disk entries survive a cold memory cache.
+call_translator is mocked, so no real translator is needed. The tests cover the memory LRU, concurrent identical-request deduplication, and disk cache. Identical prompts, such as one problem's givens across 16 rollouts, use one translator call. Failed translations are not cached, and disk entries survive a cold memory cache.
 """
 
 import threading
@@ -32,7 +32,7 @@ def test_memory_cache_collapses_identical(monkeypatch, tmp_path):
         calls["n"] += 1
         return "T:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", fake)
+    monkeypatch.setattr(translator, "call_translator", fake)
     r1 = translator.translate("PROB", _ok_parse, _ok_validate, translator_url="u", translator_model="m")
     r2 = translator.translate("PROB", _ok_parse, _ok_validate, translator_url="u", translator_model="m")
     assert r1[0] == "T:PROB" and r2[0] == "T:PROB"
@@ -50,7 +50,7 @@ def test_concurrent_identical_requests_share_one_call(monkeypatch, tmp_path):
         time.sleep(0.3)  # Allow the other callers to observe the pending request.
         return "T:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", slow)
+    monkeypatch.setattr(translator, "call_translator", slow)
     out = []
 
     def work():
@@ -63,7 +63,7 @@ def test_concurrent_identical_requests_share_one_call(monkeypatch, tmp_path):
     for t in ts:
         t.join()
     assert all(x == "T:SAME" for x in out)
-    assert calls["n"] == 1               # 16 concurrent -> judge hit ONCE
+    assert calls["n"] == 1               # 16 concurrent -> translator hit ONCE
 
 
 def test_failed_translation_not_cached(monkeypatch, tmp_path):
@@ -75,15 +75,15 @@ def test_failed_translation_not_cached(monkeypatch, tmp_path):
         calls["n"] += 1
         return "bad"
 
-    monkeypatch.setattr(translator, "call_judge", fake)
+    monkeypatch.setattr(translator, "call_translator", fake)
     r1 = translator.translate("P", lambda r: None, _ok_validate, translator_url="u", translator_model="m")
     r2 = translator.translate("P", lambda r: None, _ok_validate, translator_url="u", translator_model="m")
     assert r1[0] is None and r2[0] is None
-    assert calls["n"] >= 2               # failures not cached -> judge re-called
+    assert calls["n"] >= 2               # failures not cached -> translator re-called
 
 
-def test_failed_shared_request_limits_judge_calls(monkeypatch, tmp_path):
-    # Sixteen concurrent callers used to run separate three-attempt loops after the first request failed, producing 48 judge calls. The failure is now shared, with at most two shared attempts of MAX_TRIES calls each.
+def test_failed_shared_request_limits_translator_calls(monkeypatch, tmp_path):
+    # Sixteen concurrent callers used to run separate three-attempt loops after the first request failed, producing 48 translator calls. The failure is now shared, with at most two shared attempts of MAX_TRIES calls each.
     monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
     _reset()
     calls = {"n": 0}
@@ -95,7 +95,7 @@ def test_failed_shared_request_limits_judge_calls(monkeypatch, tmp_path):
         time.sleep(0.05)
         return "unparseable"
 
-    monkeypatch.setattr(translator, "call_judge", failing)
+    monkeypatch.setattr(translator, "call_translator", failing)
     outs = []
 
     def work():
@@ -121,7 +121,7 @@ def test_key_covers_parser_identity(monkeypatch, tmp_path):
         calls["n"] += 1
         return "T:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", fake)
+    monkeypatch.setattr(translator, "call_translator", fake)
 
     def parse_a(r):
         return r
@@ -146,7 +146,7 @@ def test_key_covers_function_body(monkeypatch, tmp_path):
         calls["n"] += 1
         return "T:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", fake)
+    monkeypatch.setattr(translator, "call_translator", fake)
 
     def parse_v1(r):
         return r + ":V1"
@@ -175,10 +175,11 @@ def test_fn_digest_ignores_line_shifts():
 
 
 def test_http_posts_counted_not_cache_markers(monkeypatch, tmp_path):
-    # Cache metadata must not count as judge HTTP requests.
+    # Cache metadata must not count as translator HTTP requests.
     monkeypatch.setenv("ISABELLE_TRANSLATE_CACHE_DIR", str(tmp_path))
     _reset()
     posts = {"n": 0}
+    tokenizes = {"n": 0}
 
     class _Resp:
         def raise_for_status(self):
@@ -188,7 +189,18 @@ def test_http_posts_counted_not_cache_markers(monkeypatch, tmp_path):
             return {"choices": [{"message": {"content": "T:ok"},
                                  "finish_reason": "stop"}]}
 
+    class _TokenizeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"count": 12, "max_model_len": 12288}
+
     def fake_post(url, json=None, timeout=None):
+        # Measuring the prompt is not translator load and must stay out of the post count.
+        if url.endswith("/tokenize"):
+            tokenizes["n"] += 1
+            return _TokenizeResp()
         posts["n"] += 1
         if posts["n"] == 1:
             raise OSError("first endpoint down")     # forces one retry
@@ -200,6 +212,7 @@ def test_http_posts_counted_not_cache_markers(monkeypatch, tmp_path):
                         translator_url="u", translator_model="m")
     assert r[0] == "T:ok"
     atts = r[1]
+    assert tokenizes["n"] >= 1              # the prompt was measured, not estimated
     assert atts[0]["http_posts"] == 2       # 1 failed + 1 successful post
     assert atts[0]["http_wall_time"] >= 0.0
     # cached second call: marker only, no http_posts key
@@ -218,9 +231,9 @@ def test_disk_cache_survives_cold_memory(monkeypatch, tmp_path):
         calls["n"] += 1
         return "D:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", fake)
+    monkeypatch.setattr(translator, "call_translator", fake)
     translator.translate("DK", _ok_parse, _ok_validate, translator_url="u", translator_model="m")  # -> disk
     _reset()                             # cold memory cache (simulate new process)
     r = translator.translate("DK", _ok_parse, _ok_validate, translator_url="u", translator_model="m")
     assert r[0] == "D:DK"
-    assert calls["n"] == 1               # 2nd came from DISK, no new judge call
+    assert calls["n"] == 1               # 2nd came from DISK, no new translator call

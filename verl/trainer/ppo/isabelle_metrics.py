@@ -4,7 +4,7 @@ import numpy as np
 
 
 ISABELLE_PROFILE_METRIC_MAP = {
-    "isabelle_judge_http_wall_time": "isabelle/judge_http_wall_s",
+    "isabelle_translator_http_wall_time": "isabelle/translator_http_wall_s",
     "isabelle_translate_validate_wall_time": "isabelle/translate_validate_wall_s",
     "isabelle_prove_queue_time": "isabelle/prove_queue_s",
     "isabelle_prove_run_time": "isabelle/prove_run_s",

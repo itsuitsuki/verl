@@ -489,7 +489,7 @@ class IsabelleServerPool:
                         and worker.jvm_pid is not None
                         and processes._poly_tree_rss_kb(worker.jvm_pid)
                         > self.EACH_WORKER_PROC_TREE_MEM_MAX_KB):
-                    self._book_restart(worker, "rss_cap")
+                    self._book_restart(worker, "proc_tree_mem_max")
                     worker.stop(graceful=False)
                     self._restart_or_mark_unavailable(worker)
             except Exception as e:  # noqa: BLE001 -- recycle must never crash

@@ -4,21 +4,20 @@ Isabelle/HOL step-level verification wired into verl's Step-GDPO RL loop as a pe
 
 **At a glance**
 
-- **Run training:** `bash bash_scripts/fv_step_gdpo_math.sh` (needs a judge vLLM + Isabelle env sourced).
+- **Run training:** `bash bash_scripts/fv_step_gdpo_math.sh` (needs a translator vLLM + Isabelle env sourced).
 - **Sanity check:** `bash bash_scripts/sanity_check_fv_math.sh` (3 steps, console-only).
 - **Engine:** `verl/utils/isabelle_utils/engine.py` — `IsabelleEngine.verify_solution(problem, response, ground_truth)`.
-- **Reward entry:** `verl/utils/reward_score/formal_verify.py:compute_solution_reward_isabelle` (renamed from `fol.py` on 2026-07-03; dispatched from `experimental/reward_loop/reward_manager/step.py` when `verify_task_type=math`).
-- **Status (2026-06-14):** D1–D6 complete (integration + 3-step sanity green on dt3); full-epoch training pending.
+- **Reward entry:** `verl/utils/reward_score/formal_verify.py:compute_solution_reward_isabelle` (dispatched from `experimental/reward_loop/reward_manager/step.py` when `verify_task_type=math`).
 
 ## Usage
 
-Isabelle/HOL step-level verification for **math** reasoning RL. When `fol_task_type=math`, each policy rollout is verified whole-solution: a judge LLM translates the natural-language `<step>` chain into constrained Python boolean expressions, which are transpiled to Isabelle terms and discharged by a pool of resident `isabelle server` workers (session `HOL-Number_Theory`). Per-step 0/1 rewards feed Step-GDPO.
+Isabelle/HOL step-level verification for **math** reasoning RL. When `fol_task_type=math`, each policy rollout is verified whole-solution: a translator LLM translates the natural-language `<step>` chain into constrained Python boolean expressions, which are transpiled to Isabelle terms and discharged by a pool of resident `isabelle server` workers (session `HOL-Number_Theory`). Per-step 0/1 rewards feed Step-GDPO.
 
-> **CORRECTION:** `fol_task_type=math` now routes to Isabelle verification (changed 2026-06-14); the old Z3 Int/Real arithmetic path is `fol_task_type=math_z3`. The top-level README's `fol_task_type=math` description ("pure Int/Real 算术 schema") was stale — fixed 2026-06-15 to point to this README.
+> `verify_task_type=math` routes to Isabelle verification; the Z3 Int/Real arithmetic path is `verify_task_type=math_z3`.
 
 ### 1. TL;DR
 
-One runnable training command (external judge already serving on `:4873`):
+One runnable training command (external translator already serving on `:4873`):
 
 ```bash
 source /2022533109/zhouchuyan/isabelle/env.sh      # ISABELLE_HOME + PATH + shared user heaps
@@ -32,12 +31,12 @@ OPENAI_BASE_URL=http://127.0.0.1:4873/v1 MODEL_PATH=/2022533109/zhouchuyan/model
 - **Isabelle 2025 env sourced** — `source /2022533109/zhouchuyan/isabelle/env.sh` sets `ISABELLE_HOME` (default in `server_pool.py`: `/2022533109/zhouchuyan/isabelle/Isabelle2025`) and points the per-node `~/.isabelle` at the shared user dir. The training scripts source it automatically if the file exists.
 - **`fontconfig` installed on each node** — `apt install fontconfig`. Without it `isabelle build` silently exits 0 producing no heaps (dt1/dt2/dt3 already have it).
 - **`HOL-Number_Theory` heaps prebuilt (shared)** — the pool starts session `HOL-Number_Theory` and additionally imports `Complex_Main`, `HOL-Library.Sum_of_Squares` (sos), `HOL-Library.Code_Target_Numeral`, `HOL-Number_Theory.Number_Theory`, `HOL-Decision_Procs.Approximation`. These heaps live in the shared user dir and are reused across nodes. To rebuild on a fresh node: `isabelle build -b -j 16 HOL-Number_Theory` (≈10 min wall on an H20 node; `HOL-Analysis` is the critical-path dependency).
-- **Judge vLLM reachable** — the `OPENAI_BASE_URL` endpoint must answer `/health` before launch. `fv_step_gdpo_math.sh` polls `/health` for up to 300s when it starts its own judge; for an external judge, verify reachability yourself first.
+- **Translator vLLM reachable** — the `OPENAI_BASE_URL` endpoint must answer `/health` before launch. `fv_step_gdpo_math.sh` polls `/health` for up to 300s when it starts its own translator; for an external translator, verify reachability yourself first.
 
-### 3. Judge vLLM launch
+### 3. Translator vLLM launch
 
-Serve the judge (Qwen3.6-35B-A3B, TP=2) on port 4873, in a tmux session named
-`judge`:
+Serve the translator (Qwen3.6-35B-A3B, TP=2) on port 4873, in a tmux session named
+`translator1-4873` (naming scheme translator<N>-<port>):
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5 vllm serve /root/run/models/Qwen3.6-35B-A3B --served-model-name Qwen3.6-35B-A3B --port 4873 --max-model-len 12288 --tensor-parallel-size 2 --gpu-memory-utilization 0.90 --enable-prefix-caching --max-num-seqs 256
@@ -56,18 +55,18 @@ CUDA_VISIBLE_DEVICES=6,7 python3 -m vllm.entrypoints.openai.api_server --model /
 
 > NOTE: renamed from `fol_step_gdpo_math.sh`; use `fv_step_gdpo_math.sh`.
 
-**External judge** (recommended - judge on another node/GPU):
+**External translator** (recommended - translator on another node/GPU):
 
 ```bash
 source /2022533109/zhouchuyan/isabelle/env.sh
 OPENAI_BASE_URL=http://127.0.0.1:4873/v1 MODEL_PATH=/2022533109/zhouchuyan/models/Qwen3-8B TRAIN_DEVICES=0,1,2,3 bash bash_scripts/fv_step_gdpo_math.sh
 ```
 
-**Self-hosted judge** (script launches vLLM itself, then trains on the rest):
+**Self-hosted translator** (script launches vLLM itself, then trains on the rest):
 
 ```bash
 source /2022533109/zhouchuyan/isabelle/env.sh
-MODEL_PATH=/2022533109/zhouchuyan/models/Qwen3-4B JUDGE_MODEL=/2022533109/zhouchuyan/models/Qwen3.6-35B-A3B JUDGE_DEVICES=0,1 TRAIN_DEVICES=2,3 bash bash_scripts/fv_step_gdpo_math.sh
+MODEL_PATH=/2022533109/zhouchuyan/models/Qwen3-4B TRANSLATOR_MODEL=/2022533109/zhouchuyan/models/Qwen3.6-35B-A3B TRANSLATOR_DEVICES=0,1 TRAIN_DEVICES=2,3 bash bash_scripts/fv_step_gdpo_math.sh
 ```
 
 Recognized env vars:
@@ -75,12 +74,12 @@ Recognized env vars:
 | Env var | Required | Default | Meaning |
 |---|---|---|---|
 | `MODEL_PATH` | yes | — | Policy model to train (also sets experiment tag). |
-| `OPENAI_BASE_URL` | one of these | — | External judge endpoint. If set, `TRAIN_DEVICES` defaults to `0,1`. |
-| `JUDGE_MODEL` | (if no `OPENAI_BASE_URL`) | — | Model path for the script-launched judge; `TRAIN_DEVICES` then defaults to `2,3`. |
+| `OPENAI_BASE_URL` | one of these | — | External translator endpoint. If set, `TRAIN_DEVICES` defaults to `0,1`. |
+| `TRANSLATOR_MODEL` | (if no `OPENAI_BASE_URL`) | — | Model path for the script-launched translator; `TRAIN_DEVICES` then defaults to `2,3`. |
 | `TRAIN_DEVICES` | no | `0,1` / `2,3` | GPUs for training; `N_GPUS` is derived from the comma count. |
-| `JUDGE_DEVICES` | no | `0,1` | GPUs for the self-hosted judge. |
-| `JUDGE_PORT` | no | `4873` | Judge port. |
-| `JUDGE_TP` | no | `2` | Judge tensor-parallel size. |
+| `TRANSLATOR_DEVICES` | no | `0,1` | GPUs for the self-hosted translator. |
+| `TRANSLATOR_PORT` | no | `4873` | Translator port. |
+| `TRANSLATOR_TP` | no | `2` | Translator tensor-parallel size. |
 | `DATA_DIR` | no | `data/gsm8k` | Must contain `train.parquet` + `test.parquet`. |
 | `WANDB_ENTITY` | no | `verl-fol` | Do not let it default to a personal entity. |
 
@@ -106,7 +105,7 @@ out immediately if unset).
 User-facing knobs (Hydra `+algorithm.*` flags; the reward manager forwards them
 into `api_config`, which `_get_isabelle_engine` reads):
 
-Naming note (2026-07-03): each `fol_*` knob gained a `verify_*` alias, which
+Naming note: each `fol_*` knob has a `verify_*` alias, which
 **takes precedence** when both are set. The Isabelle-side scripts use the new
 names; `fol_*` remains fully supported for the Z3 scripts and old runs. The
 "fol" prefix is historical — it means "formal-verification step reward", not
@@ -118,8 +117,8 @@ First-Order Logic specifically.
 | `isabelle_pool_workers` | `32` | Resident `isabelle server` JVMs per engine (`IsabelleConfig.pool_workers`). **Lower this for multi-worker RL** — each reward worker process builds its own engine + pool. |
 | `verify_timeout` ← `fol_timeout` | `60` (engine); scripts set `30` | Forwarded as `api_config["timeout"]`; `_get_isabelle_engine` reads it as `verify_timeout` — per-`use_theories` deadline (s) before a stuck worker is restarted and the call counts as failure. |
 | `verify_cumulative_mode` ← `fol_cumulative_mode` | `current_only` | Set `step` (as the scripts do) so each step is verified against its prior context. |
-| `base_url` | `http://127.0.0.1:4873/v1` | Judge endpoint → `IsabelleConfig.judge_url`. Sourced from env `OPENAI_BASE_URL`. |
-| `model` | `Qwen3.6-35B-A3B` | Judge model name → `IsabelleConfig.judge_model`. Sourced from env `FOL_MODEL` / `SELF_EVAL_MODEL`. |
+| `base_url` | `http://127.0.0.1:4873/v1` | Translator endpoint → `IsabelleConfig.translator_url`. Sourced from env `OPENAI_BASE_URL`. |
+| `model` | `Qwen3.6-35B-A3B` | Translator model name → `IsabelleConfig.translator_model`. Sourced from env `FOL_MODEL` / `SELF_EVAL_MODEL`. |
 | `reward.num_workers` | script `64` | Reward-side worker/thread count. Multiplies against `isabelle_pool_workers` for total JVM count. |
 
 `IsabelleConfig` also fixes `session="HOL-Number_Theory"` and `max_model_len=12288` (not exposed as Hydra flags).
@@ -132,8 +131,8 @@ Call the engine standalone (condensed from `scripts/isabelle_poc_math500/test_is
 from verl.utils.isabelle_utils.engine import IsabelleEngine, IsabelleConfig
 
 config = IsabelleConfig(
-    judge_url="http://127.0.0.1:4873/v1",
-    judge_model="Qwen3.6-35B-A3B",
+    translator_url="http://127.0.0.1:4873/v1",
+    translator_model="Qwen3.6-35B-A3B",
     pool_workers=8,          # 8 resident isabelle servers (~8s each to warm up)
     verify_timeout=60.0,     # per-verification deadline in seconds
 )
@@ -169,8 +168,8 @@ Per-response counts:
 `isabelle/format_ok`, `isabelle/givens_ok`, `isabelle/steps_ok`,
 `isabelle/outcome_correct`, `isabelle/n_steps`, `isabelle/verified_steps`,
 `isabelle/rewarded_steps`, `isabelle/neutral_steps`,
-`isabelle/guard_failed_steps`, `isabelle/judge_calls_givens`,
-`isabelle/judge_calls_steps`, `isabelle/judge_calls` (givens + steps).
+`isabelle/guard_failed_steps`, `isabelle/translator_calls_givens`,
+`isabelle/translator_calls_steps`, `isabelle/translator_calls` (givens + steps).
 
 Batch-normalized rates (`count / max(n_steps, 1)`):
 `isabelle/verified_rate`, `isabelle/rewarded_rate`, `isabelle/neutral_rate`,
@@ -180,7 +179,7 @@ Batch-normalized rates (`count / max(n_steps, 1)`):
 `isabelle/outcome_correct` tracks final-answer accuracy independently of
 step verification.
 
-**Unified `stepverify/*` namespace (2026-07-03):** both verifier backends (Z3 and Isabelle) additionally emit the same backend-neutral names, so runs overlay on one W&B panel: `stepverify/verified_steps` (verifier accepted: Z3 "entailed" / Isabelle "verified"), `stepverify/verified_rate`, `stepverify/proven_steps` (steps that earned reward 1 — for Z3 this equals entailed; for Isabelle, verified AND guards passed), `stepverify/n_steps`, `stepverify/translator_calls` (judge LLM translation calls). The backend-specific namespaces above are kept unchanged.
+**Unified `stepverify/*` namespace:** both verifier backends (Z3 and Isabelle) additionally emit the same backend-neutral names, so runs overlay on one W&B panel: `stepverify/verified_steps` (verifier accepted: Z3 "entailed" / Isabelle "verified"), `stepverify/verified_rate`, `stepverify/proven_steps` (steps that earned reward 1 — for Z3 this equals entailed; for Isabelle, verified AND guards passed), `stepverify/n_steps`, `stepverify/translator_calls` (translator LLM translation calls). The backend-specific namespaces above are kept unchanged.
 
 **Per-response step result pattern:** the engine builds a per-step result string `<pattern>` for each verification. It is no longer printed for every response because that produced excessive output; it appears in the trainer's `[Step Rewards]` sample through batch key `isabelle_pattern`. Symbols are evaluated in this priority order in `engine.py`: `o`>`c`>`u`>`m`>`g`>`x`.
 
@@ -189,13 +188,13 @@ step verification.
 | `o` | `rewarded` | verified AND guard_ok AND not inconsistent AND not transcription-missing — earns reward 1 |
 | `c` | `premise_consistency_inconsistent` | at this step index the accumulated-premise set is provably self-contradictory (see below) |
 | `u` | `premise_consistency_unknown` AND not `verified` | premise consistency could not be decided and the restricted claim checks did not prove the claim |
-| `m` | `verified` AND `transcription_missing` | Isabelle proved it, but the judge's translated term dropped a number the student's conclusion actually asserts — proof doesn't cover the real claim; fail-closed |
+| `m` | `verified` AND `transcription_missing` | Isabelle proved it, but the translator's translated term dropped a number the student's conclusion actually asserts — proof doesn't cover the real claim; fail-closed |
 | `g` | `verified` but not rewarded | proved but reward withheld: either a definition-only step (`neutral`, no proof obligation) or the translated term invented a number absent from source (`guard_invented`) |
 | `x` | none of the above | unverified — the step REACHED the prover but Isabelle could not derive its conclusion from premises whose consistency was established |
 
 When premise consistency is unknown, the engine uses a restricted verification path: it tries the primary tactic once with accumulated premises, then tries the canonical premise-free theorem and premise-free evaluation. Other premise-dependent tactics, nonzero synthesis, and tolerance are disabled. A successful restricted proof is still `o`; `u` means all permitted attempts failed.
 
-**`t` (translation-failed) — NOT a pattern symbol.** The pattern only holds one symbol per step that *reached the prover*. When the judge cannot formalize a step (givens/steps translation rejected — e.g. a bare-value conclusion `0.088` that is not a boolean proposition, so `steps_ok=False`), that XML step never produces a symbol. `formal_verify.py` counts these as `t_steps = n_steps - len(pattern)` and exposes `isabelle/t_steps` + `isabelle/t_rate`. Reward is 0 (fail-closed, same as `x`), but `t` is kept SEPARATE so `x_rate` reads as "model's reasoning was wrong" and `t_rate` as "translator/format could not formalize" — different fixes (RL reduces `x`; `t` is a translator-prompt / data-shape limit). **Invariant: `o + x + c + u + g + m + t == n_steps`**, so the seven per-step rates sum to 1. Distinct from `m`: `m` steps DID reach the prover and DID verify (they just have an unbacked number); `t` steps never reached the prover at all.
+**`t` (translation-failed) — NOT a pattern symbol.** The pattern only holds one symbol per step that *reached the prover*. When the translator cannot formalize a step (givens/steps translation rejected — e.g. a bare-value conclusion `0.088` that is not a boolean proposition, so `steps_ok=False`), that XML step never produces a symbol. `formal_verify.py` counts these as `t_steps = n_steps - len(pattern)` and exposes `isabelle/t_steps` + `isabelle/t_rate`. Reward is 0 (fail-closed, same as `x`), but `t` is kept SEPARATE so `x_rate` reads as "model's reasoning was wrong" and `t_rate` as "translator/format could not formalize" — different fixes (RL reduces `x`; `t` is a translator-prompt / data-shape limit). **Invariant: `o + x + c + u + g + m + t == n_steps`**, so the seven per-step rates sum to 1. Distinct from `m`: `m` steps DID reach the prover and DID verify (they just have an unbacked number); `t` steps never reached the prover at all.
 
 **On `c`:** each step is verified independently as its own mini-theorem (assumes-lifting; generated proofs contain no sorry). Every prior step's conclusion is admitted as an assumption regardless of whether it verified. `c` does **not** mean that one failed step makes all later steps fail. For each step, a dedicated check tries to prove `False` from the accumulated premises. The engine records the first inconsistent index in `premise_consistency_inconsistent_at`; every step at or after that index is tagged `c`.
 
@@ -207,7 +206,7 @@ Consequences:
 
 ## Design & Background
 
-> This section folds in the durable content of the original `isabelle-integration-plan.md` (drafted 2026-06-10, based on first-hand reading of the FoVer paper + repo). Naming has been corrected to shipped reality: the Isabelle reward path is selected with **`fol_task_type=math`** (the old Z3 math path is `fol_task_type=math_z3`, deprecated), the engine lives at **`verl/utils/isabelle_utils/engine.py`**, and training is driven by **`bash_scripts/fv_step_gdpo_math.sh`** (+ smoke test `bash_scripts/sanity_check_fv_math.sh`).
+> This section carries the durable content of the original integration plan, which was written against the FoVer paper and repo. The Isabelle reward path is selected with **`fol_task_type=math`** (the old Z3 math path is `fol_task_type=math_z3`, deprecated), the engine lives at **`verl/utils/isabelle_utils/engine.py`**, and training is driven by **`bash_scripts/fv_step_gdpo_math.sh`** (+ smoke test `bash_scripts/sanity_check_fv_math.sh`).
 
 **Goal**: wire step-level Isabelle/HOL verification into verl's online RL loop as a *process reward* signal. The Z3 path only covers logical reasoning (LogiQA / FOLIO / Reclor) and GSM8K arithmetic; it cannot handle the induction / number-theory / algebraic tricks that MATH-500 needs. Isabelle fills the GSM8K → MATH-500 gap. AIME / Olympiad is a stretch goal requiring a dedicated prover (see the Layer-4 roadmap). Z3 is **not** replaced — Isabelle is an additive verifier routed by `fol_task_type` in parallel with Z3.
 
@@ -220,7 +219,7 @@ Consequences:
 - **sledgehammer**: Isabelle's brute-force tool — dispatches external SMT/ATP solvers (Z3/CVC4/Vampire/E) to find a proof for an open goal. Expensive (seconds to tens of seconds). FoVer uses it to *generate* training data; **we do not use it as the primary path** (the translator picks the tactic; sledgehammer is a slow fallback).
 - **sorry**: Isabelle keyword meaning "skip proving this step, assume it holds". Disabled by default (anti-cheat); requires `quick_and_dirty=true`.
 - **Sorry trick (core method)**: to verify step K of an N-step proof, `sorry`-out the other N−1 steps and let Isabelle really check only step K. Turns "whole proof judged pass/fail as a unit" into "each step judged independently". This is how FoVer produces a step-level signal.
-- **Autoformalize**: automatically translate NL math into Isabelle syntax (`.thy`). Here the translator (judge model) does it — the analogue of the teacher model translating NL → Z3 code in the Z3 path.
+- **Autoformalize**: automatically translate NL math into Isabelle syntax (`.thy`). Here the translator (translator model) does it — the analogue of the teacher model translating NL → Z3 code in the Z3 path.
 - **miniF2F**: Polu et al. 2022 formal-math benchmark (AMC/AIME/IMO level), the standard Layer 3-4 benchmark.
 - **PutnamBench**: harder than miniF2F (Putnam level); current SOTA ~15-20%.
 - **DSP (Draft-Sketch-Prove)**: Jiang et al. 2023 — LLM writes a proof sketch, sledgehammer fills each step. FoVer's Checker class descends from this.
@@ -257,7 +256,7 @@ AIME's root failures: induction (must construct induction structure), Diophantin
 | AIME (in miniF2F) | ~30-40% | far from saturated |
 | MATH-500 | est. 60-70% | easier than miniF2F |
 
-**Our stack = Layer 3 equivalent**: a vllm judge (Qwen3.6-35B-A3B) is served, and training calls it via `OPENAI_BASE_URL` to translate NL → formal. The Isabelle integration just swaps the Z3 backend for the Isabelle backend (production script `bash_scripts/fv_step_gdpo_math.sh`); the translator stays 35B-A3B (or larger).
+**Our stack = Layer 3 equivalent**: a vllm translator (Qwen3.6-35B-A3B) is served, and training calls it via `OPENAI_BASE_URL` to translate NL → formal. The Isabelle integration just swaps the Z3 backend for the Isabelle backend (production script `bash_scripts/fv_step_gdpo_math.sh`); the translator stays 35B-A3B (or larger).
 
 **Layer 4 — dedicated prover models (SOTA, mostly Lean)**:
 
@@ -508,7 +507,7 @@ Type inference matters: GSM8K is almost all `::nat`; MATH-500 has heavy `::int` 
 
 #### 7.2 Coding-form translation (shipped production form)
 
-Motivation (judge = Qwen3.6-35B-A3B, chosen partly for coding: SWE-bench Verified 73.4%): convert the translation task into a coding task to raise success. The judge outputs a **constrained Python/boolean expression** (subset: `+ - * / ** sqrt fact choose mod` + comparison/logic connectives); a local `ast` walker validates the AST (whitelist) and transpiles to an Isabelle term. Semantic gaps are pinned in the subset: Python `/` (real) vs Isabelle int `div`; `**` vs `^`; negative `mod` differs; `Rational` vs float. Payoff: syntactic translation failures approach zero (the model's Python training data dwarfs its Isabelle data — LaTeX residue / missing `*` / `f(x)` / int-nat errors nearly vanish); all mechanical checks (type annotation, guard window, transcription completeness, empty proposition) move onto the AST, more reliable than regex; fewer retries. This became the shipped production form: `verl/utils/isabelle_utils/pyexpr.py` (AST whitelist + type-aware transpile) + the translator prompts `verl/prompts/isabelle_translate_givens.txt` and `verl/prompts/isabelle_translate_steps.txt`. The earlier Isabelle-direct / sledgehammer-placeholder prompt (§7.1) was superseded and retired. It does **not** solve semantic translation failures involving figures, combinatorial structure, or worded sum conditions; those require better examples or translator training.
+Motivation (translator = Qwen3.6-35B-A3B, chosen partly for coding: SWE-bench Verified 73.4%): convert the translation task into a coding task to raise success. The translator outputs a **constrained Python/boolean expression** (subset: `+ - * / ** sqrt fact choose mod` + comparison/logic connectives); a local `ast` walker validates the AST (whitelist) and transpiles to an Isabelle term. Semantic gaps are pinned in the subset: Python `/` (real) vs Isabelle int `div`; `**` vs `^`; negative `mod` differs; `Rational` vs float. Payoff: syntactic translation failures approach zero (the model's Python training data dwarfs its Isabelle data — LaTeX residue / missing `*` / `f(x)` / int-nat errors nearly vanish); all mechanical checks (type annotation, guard window, transcription completeness, empty proposition) move onto the AST, more reliable than regex; fewer retries. This became the shipped production form: `verl/utils/isabelle_utils/pyexpr.py` (AST whitelist + type-aware transpile) + the translator prompts `verl/prompts/isabelle_translate_givens.txt` and `verl/prompts/isabelle_translate_steps.txt`. The earlier Isabelle-direct / sledgehammer-placeholder prompt (§7.1) was superseded and retired. It does **not** solve semantic translation failures involving figures, combinatorial structure, or worded sum conditions; those require better examples or translator training.
 
 ---
 
@@ -546,14 +545,14 @@ Two translation-defect classes to catch mechanically beyond the all-sorry pre-ch
 
 The offline PoC (`scripts/isabelle_poc_math500/`) ran ~18 dated measurement rounds (n=18 → n=100 → six-dataset suite, pipeline v1 → v5.8). **Full dated logs are superseded; see memory `project_isabelle_v58_analysis.md` and the archived integration plan for the blow-by-blow.** Durable frozen results:
 
-- **v5.8 six-dataset baseline** (Qwen3-4B policy, thinking off, production XML prompt, coding-form translation; translation × verification product on the answer-correct subset): **GSM8K 91.3 / Minerva 65.4 / MATH-500 53.5 / OlympiadBench 48.3 / AMC 41.0 / AIME 36.8** (AIME via judge-generated n=57 trusted sample). Only GSM8K clears the 80% target; the rest are coverage-limited, not soundness-limited.
+- **v5.8 six-dataset baseline** (Qwen3-4B policy, thinking off, production XML prompt, coding-form translation; translation × verification product on the answer-correct subset): **GSM8K 91.3 / Minerva 65.4 / MATH-500 53.5 / OlympiadBench 48.3 / AMC 41.0 / AIME 36.8** (AIME via translator-generated n=57 trusted sample). Only GSM8K clears the 80% target; the rest are coverage-limited, not soundness-limited.
 - **Soundness holds**: step-level corrupt-injection false-positive rate **≤ 5%** on GSM8K and MATH (v5.8: 4.4–4.7% on the correct-answer subset) — fail-closed confirmed. Reached only after four soundness fixes: pool task-id result-matching (a `wait_task` mis-binding produced both FP and FN), watchdog false-success ("ok" only means "no error yet", not "consolidated" — any check >15s was silently scored as proved), consistency-check tactic strength ≥ target tactic (ex-falso asymmetry), and removal of the bogus sqrt-metis attempt.
 - **Stronger Isabelle libraries and tactics recovered 0/100 sampled Case-B failures**: upgrading the session from HOL-Number_Theory to HOL-Analysis and adding `force`, `algebra`, and `smt (verit)` did not prove any of the sampled failures. The failures were structural, such as conjunction handling and assumption chaining, rather than missing tactic strength.
-- **Translator multiplicative bridging (v5.9) nets only +1.25%** (5/400 uniquely-improved problems) and is buried in **±7% (~±25/400) judge translation stochasticity** — the three-run improvement-set intersection was only 10 problems. Not adopted (the conjunction cases it makes worse offset the gain); Python-layer conjunction splitting kept as a harmless no-op prep.
-- **35B judge thinking-on ≈ 4B parity**: the judge's own AIME solutions (12.3 steps, case-split/set style) are harder to formalize; judge-AIME translation × verification ≈ **34.8%**, matching the 4B policy — i.e. AIME's true position (~35-40%) is generator-independent.
+- **Translator multiplicative bridging (v5.9) nets only +1.25%** (5/400 uniquely-improved problems) and is buried in **±7% (~±25/400) translator translation stochasticity** — the three-run improvement-set intersection was only 10 problems. Not adopted (the conjunction cases it makes worse offset the gain); Python-layer conjunction splitting kept as a harmless no-op prep.
+- **35B translator thinking-on ≈ 4B parity**: the translator's own AIME solutions (12.3 steps, case-split/set style) are harder to formalize; translator-AIME translation × verification ≈ **34.8%**, matching the 4B policy — i.e. AIME's true position (~35-40%) is generator-independent.
 - **Slow sledgehammer checks proved 8/79 sampled v5.8 failure steps** (45-second timeout plus sound replay; MATH 19.2%, other datasets 0–12%). This improvement is too slow for the primary verification path.
 
-Failure-step taxonomy (856 failed steps across six datasets): **Case A** (isolated symbol — a symbol in the proposition was never `lhs == rhs`-bound in the premise chain; "model skips + judge didn't bridge") 41.7%; **Case B** (all symbols bound but the tactic didn't compute it) 58.3%. OlympiadBench is the only Case-A-dominant dataset (53.1%). Geometry keywords hit only 0.6% of propositions (geometry gets coordinatized during translation), so AFP-geometry priority was down-ranked.
+Failure-step taxonomy (856 failed steps across six datasets): **Case A** (isolated symbol — a symbol in the proposition was never `lhs == rhs`-bound in the premise chain; "model skips + translator didn't bridge") 41.7%; **Case B** (all symbols bound but the tactic didn't compute it) 58.3%. OlympiadBench is the only Case-A-dominant dataset (53.1%). Geometry keywords hit only 0.6% of propositions (geometry gets coordinatized during translation), so AFP-geometry priority was down-ranked.
 
 **Conclusion**: offline improvement levers are essentially exhausted (verifier extension 0%, translator bridging net ~1%, sledgehammer 10% but too slow). Further gains must come from RL training pushing the policy to emit complete derivation steps. GSM8K is training-ready; MATH/Minerva signal is usable but sparse.
 
@@ -584,7 +583,7 @@ To really attack AIME / Olympiad, Layer 3 must upgrade to Layer 4 (dedicated pro
 
 **Layer-4 ceilings**: DeepSeek-Prover-V1.5 ~55%, V2 ~70.8%, GoedelProver ~64%, Lean Copilot ~50% (all Lean); strongest Isabelle (DSP + retrieval) 50-55%. Layer 4 pushes AIME from ~30% to ~70%, but Isabelle lags Lean by ~a year.
 
-**Decision timing**: after first phase (Phase 1-4) — if MATH-500 training is strong, keep pushing toward AIME; if AIME trains acceptably on the outcome term alone, full Layer-4 config is not urgent; otherwise bring Layer-4 config + translator SFT (LoRA on the same judge base, deployed as base+adapter on one vLLM instance so both reward paths stay consistent) forward, then consider X1/X2.
+**Decision timing**: after first phase (Phase 1-4) — if MATH-500 training is strong, keep pushing toward AIME; if AIME trains acceptably on the outcome term alone, full Layer-4 config is not urgent; otherwise bring Layer-4 config + translator SFT (LoRA on the same translator base, deployed as base+adapter on one vLLM instance so both reward paths stay consistent) forward, then consider X1/X2.
 
 ---
 

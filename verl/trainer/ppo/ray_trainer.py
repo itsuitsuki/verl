@@ -2324,10 +2324,10 @@ class RayPPOTrainer:
                     "isabelle_g_steps": "isabelle/g_steps",
                     "isabelle_m_steps": "isabelle/m_steps",
                     "isabelle_t_steps": "isabelle/t_steps",
-                    "isabelle_judge_calls_givens": "isabelle/judge_calls_givens",
-                    "isabelle_judge_calls_steps": "isabelle/judge_calls_steps",
-                    "isabelle_judge_calls_total": "isabelle/judge_calls",
-                    # Wall profile (2026-07-11 review #6): pure judge HTTP
+                    "isabelle_translator_calls_givens": "isabelle/translator_calls_givens",
+                    "isabelle_translator_calls_steps": "isabelle/translator_calls_steps",
+                    "isabelle_translator_calls_total": "isabelle/translator_calls",
+                    # Wall profile (2026-07-11 review #6): pure translator HTTP
                     # wall is disjoint from prover queue/run; end-to-end
                     # translate+validate wall is also kept for latency analysis.
                     **ISABELLE_PROFILE_METRIC_MAP,
@@ -2336,14 +2336,24 @@ class RayPPOTrainer:
                     "isabelle_pool_restarts": "isabelle/pool_restarts",
                     "isabelle_thm_cache_hit_rate": "isabelle/thm_cache_hit_rate",
                     "isabelle_tr_cache_hit_rate": "isabelle/tr_cache_hit_rate",
-                    # Real judge HTTP load vs per-layer cache reuse.
-                    "isabelle_judge_http_calls": "isabelle/judge_http_calls",
-                    "isabelle_judge_retry_calls": "isabelle/judge_retry_calls",
+                    # Real translator HTTP load vs per-layer cache reuse.
+                    "isabelle_translator_http_calls": "isabelle/translator_http_calls",
+                    "isabelle_translator_retry_calls": "isabelle/translator_retry_calls",
                     "isabelle_translation_mem_hits": "isabelle/translation_mem_hits",
                     "isabelle_translation_disk_hits": "isabelle/translation_disk_hits",
                     "isabelle_translation_shared_hits": "isabelle/translation_shared_hits",
                     "isabelle_translation_xproc_hits": "isabelle/translation_xproc_hits",
                     "isabelle_translation_failures": "isabelle/translation_failures",
+                    # Why the translator retried, and whether the thinking it turns on for every
+                    # retry earns its cost: a thinking attempt generates about twenty times the
+                    # tokens of a first attempt, so these say which cause to attack.
+                    "isabelle_translator_fail_truncated": "isabelle/translator_fail_truncated",
+                    "isabelle_translator_fail_format": "isabelle/translator_fail_format",
+                    "isabelle_translator_fail_validate": "isabelle/translator_fail_validate",
+                    "isabelle_translator_fail_soft": "isabelle/translator_fail_soft",
+                    "isabelle_translator_fail_error": "isabelle/translator_fail_error",
+                    "isabelle_translator_thinking_calls": "isabelle/translator_thinking_calls",
+                    "isabelle_translator_thinking_clean": "isabelle/translator_thinking_clean",
                 }
                 isabelle_cumulative_gauges = {
                     "isabelle_pool_restarts",
@@ -2351,6 +2361,9 @@ class RayPPOTrainer:
                     "isabelle_thm_cache_hit_rate",
                     "isabelle_tr_cache_hit_rate",
                 }
+                # A key the batch does not carry is skipped, so the math path drops its unused
+                # fol_judge/* series here without any switch: the step reward manager never creates
+                # those keys when the task type is math.
                 metrics.update(aggregate_mapped_metrics(
                     batch.non_tensor_batch,
                     fol_judge_metric_map,
@@ -2393,13 +2406,13 @@ class RayPPOTrainer:
                 #   proven_steps                    = steps that earned reward 1
                 #                                     (Z3: = entailed; Isabelle: verified
                 #                                      AND guards passed)
-                #   translator_calls                = judge LLM translation calls
+                #   translator_calls                = translator LLM translation calls
                 # Backend-specific namespaces (fol_judge/*, isabelle/*) are kept.
                 if "isabelle_n_steps" in batch.non_tensor_batch:  # Isabelle backend
                     _sv_src = {
                         "stepverify/verified_steps": "isabelle_verified_steps",
                         "stepverify/proven_steps": "isabelle_rewarded_steps",
-                        "stepverify/translator_calls": "isabelle_judge_calls_total",
+                        "stepverify/translator_calls": "isabelle_translator_calls_total",
                         "stepverify/n_steps": "isabelle_n_steps",
                     }
                     _sv_denom_key = "isabelle_n_steps"

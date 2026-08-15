@@ -99,8 +99,8 @@ def test_translation_after_other_process_failure(monkeypatch, tmp_path):
         calls["n"] += 1
         return "T:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", fake)
-    key = translator._tr_key("P", "m", 12288, _ok_parse, _ok_validate, None)
+    monkeypatch.setattr(translator, "call_translator", fake)
+    key = translator._tr_key("P", "m", 12288, _ok_parse, _ok_validate)
     lock = translator._tr_disk_path(key) + ".lock"
     os.makedirs(os.path.dirname(lock), exist_ok=True)
     with open(lock, "w") as file:
@@ -121,8 +121,8 @@ def test_translation_waits_for_other_process_result(monkeypatch, tmp_path):
         calls["n"] += 1
         return "T:" + prompt
 
-    monkeypatch.setattr(translator, "call_judge", fake)
-    key = translator._tr_key("Q", "m", 12288, _ok_parse, _ok_validate, None)
+    monkeypatch.setattr(translator, "call_translator", fake)
+    key = translator._tr_key("Q", "m", 12288, _ok_parse, _ok_validate)
     lock = translator._tr_disk_path(key) + ".lock"
     os.makedirs(os.path.dirname(lock), exist_ok=True)
     with open(lock, "w") as file:

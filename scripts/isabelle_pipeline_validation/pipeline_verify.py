@@ -156,7 +156,7 @@ def main() -> None:
             "timeout": 60,
             "api_timeout": 200,
             "isabelle_pool_workers": args.pool_workers,
-            "isabelle_worker_rss_cap_gb": 12,
+            "isabelle_each_worker_proc_tree_mem_max_gb": 12,
         }
         from verl.utils.reward_score.formal_verify import _get_isabelle_engine
         from verl.utils.isabelle_utils.engine import process_one_response as process_response

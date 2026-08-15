@@ -17,35 +17,77 @@ import requests
 from verl.utils.isabelle_utils import cache_lock, state_classes
 
 
-def call_judge(prompt: str, thinking: bool, *,
-               judge_url: str, judge_model: str,
-               max_model_len: int = 12288,
-               timeout: float = 240.0,
-               stats: dict | None = None) -> str:
+# Slack left inside the context window for tokens the server adds at generation time.
+_OUTPUT_MARGIN_TOKENS = 16
+
+# A validator marks a complaint with this when the translation is faithful enough to use: the retry
+# loop stops instead of spending another attempt on wording. Classifying on a shared marker rather
+# than on the text of the message lets the message be reworded without silently changing which
+# complaints block, which matching a message prefix could not promise.
+WARNING_PREFIX = "[warning] "
+
+
+def _measure_prompt(url: str, model: str, messages: list, chat_template_kwargs,
+                    prompt: str, max_model_len: int) -> tuple[int, int]:
+    """Prompt length and context window, measured by the server that will run the request.
+
+    vLLM serves /tokenize at the root rather than under the OpenAI /v1 prefix, and its reply carries
+    both the exact token count for these messages (chat template included) and the window the server
+    was started with. Measuring beats estimating here: the character fallback below reads about three
+    characters per token, which overstates English and mathematical text by roughly a third, and every
+    overstated input token is an output token the request never gets to use.
+    """
+    root = url[:-3] if url.endswith("/v1") else url.rstrip("/")
+    body = {"model": model, "messages": messages}
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
+    try:
+        r = requests.post(f"{root}/tokenize", json=body, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        counted = int(data.get("count") or 0)
+        if counted > 0:
+            return counted, int(data.get("max_model_len") or max_model_len)
+    except Exception:
+        # A tokenizer that is unreachable or answers in an unexpected shape must not fail the
+        # translation; the estimate is conservative, so falling back only costs output budget.
+        pass
+    return len(prompt) // 3 + 300, max_model_len
+
+
+def call_translator(prompt: str, thinking: bool, *,
+                    translator_url: str, translator_model: str,
+                    max_model_len: int = 12288,
+                    timeout: float = 240.0,
+                    stats: dict | None = None) -> str:
     # A comma-separated URL config denotes multiple vLLM translator endpoints. Choose one for each attempt to distribute concurrent requests. A retry may therefore use a different endpoint when one server is unavailable.
-    _urls = [u.strip() for u in judge_url.split(",") if u.strip()] or [judge_url]
+    _urls = [u.strip() for u in translator_url.split(",") if u.strip()] or [translator_url]
+    messages = [
+        {"role": "system", "content":
+         "You are a precise mathematical formalizer. Follow the output "
+         "format exactly. No markdown fences, no commentary."},
+        {"role": "user", "content": prompt},
+    ]
+    chat_template_kwargs = None if thinking else {"enable_thinking": False}
     want = 8192 if thinking else 6144
-    est_in = len(prompt) // 3 + 300
-    max_toks = max(1024, min(want, max_model_len - est_in))
+    # Every endpoint serves the same model, so one of them can answer for all of them.
+    est_in, window = _measure_prompt(random.choice(_urls), translator_model, messages,
+                                     chat_template_kwargs, prompt, max_model_len)
+    max_toks = max(1024, min(want, window - est_in - _OUTPUT_MARGIN_TOKENS))
     payload = {
-        "model": judge_model,
-        "messages": [
-            {"role": "system", "content":
-             "You are a precise mathematical formalizer. Follow the output "
-             "format exactly. No markdown fences, no commentary."},
-            {"role": "user", "content": prompt},
-        ],
+        "model": translator_model,
+        "messages": messages,
         "temperature": 0.2,
         "max_tokens": max_toks,
     }
-    if not thinking:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
     last = None
     for _ in range(2):
         try:
             url = random.choice(_urls)
             if stats is not None:
-                # Count actual HTTP requests. Cache reuse is recorded separately and must not contribute to judge load.
+                # Count actual HTTP requests. Cache reuse is recorded separately and must not contribute to translator load.
                 stats["posts"] = stats.get("posts", 0) + 1
             _http_t0 = time.time()
             try:
@@ -70,7 +112,10 @@ def call_judge(prompt: str, thinking: bool, *,
 
 
 def feedback(prev_reply: str, errors: list) -> str:
-    errs = "\n".join(f"- {e[:300]}" for e in errors[:3])
+    # The warning marker is bookkeeping for the retry loop; the model is told what is wrong, not
+    # how the loop files it.
+    errs = "\n".join(f"- {e[len(WARNING_PREFIX):][:300] if e.startswith(WARNING_PREFIX) else e[:300]}"
+                     for e in errors[:3])
     return (f"\n\nYour previous output was:\n{prev_reply[:2500]}\n\n"
             f"It was rejected:\n{errs}\n"
             "Output a corrected version in the SAME format.")
@@ -127,19 +172,18 @@ def _fn_digest(fn) -> str:
     return d
 
 
-def _tr_key(prompt_base, judge_model, max_model_len, parse_fn, validate_fn,
-            soft_prefix) -> str:
+def _tr_key(prompt_base, translator_model, max_model_len, parse_fn, validate_fn) -> str:
     """Return the cache key for every input that determines the parsed result.
 
-    The key includes the prompt, model, token budget, parser and validator identity, compiled-code digests, and the soft-acceptance policy. Including function digests prevents a cache hit from bypassing changed parser or validator behavior.
+    The key includes the prompt, model, token budget, and parser and validator identity with their compiled-code digests. Including the digests prevents a cache hit from bypassing changed parser or validator behavior; which complaints count as warnings is part of the validator, so it travels with that digest.
     """
     ident = "\0".join((
-        _TR_CACHE_VERSION, judge_model, str(max_model_len),
+        _TR_CACHE_VERSION, translator_model, str(max_model_len),
         getattr(parse_fn, "__qualname__", repr(parse_fn)),
         _fn_digest(parse_fn),
         getattr(validate_fn, "__qualname__", repr(validate_fn)),
         _fn_digest(validate_fn),
-        repr(soft_prefix), prompt_base,
+        prompt_base,
     ))
     return hashlib.sha1(ident.encode("utf-8")).hexdigest()
 
@@ -243,11 +287,10 @@ MAX_TRIES = 3
 
 
 def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
-                        judge_url: str, judge_model: str,
+                        translator_url: str, translator_model: str,
                         max_model_len: int = 12288,
-                        api_timeout: float = 240.0,
-                        soft_prefix: str | None = None) -> tuple:
-    """Call judge with retry loop. Returns (parsed, attempts, soft_flag)."""
+                        api_timeout: float = 240.0) -> tuple:
+    """Call the translator with a retry loop. Returns (parsed, attempts, had_warnings)."""
     attempts, fb = [], None
     last_parsed, last_errors = None, []
     for t in range(MAX_TRIES):
@@ -255,12 +298,13 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
         t0 = time.time()
         http = {"posts": 0, "wall_time": 0.0}
         try:
-            reply = call_judge(prompt, thinking=(t > 0),
-                               judge_url=judge_url, judge_model=judge_model,
-                               max_model_len=max_model_len,
-                               timeout=api_timeout, stats=http)
+            reply = call_translator(prompt, thinking=(t > 0),
+                                    translator_url=translator_url,
+                                    translator_model=translator_model,
+                                    max_model_len=max_model_len,
+                                    timeout=api_timeout, stats=http)
         except Exception as e:
-            attempts.append({"attempt": t, "fail": "judge_error",
+            attempts.append({"attempt": t, "fail": "translator_error",
                              "error": str(e)[:200],
                              "http_posts": http["posts"],
                              "http_wall_time": http["wall_time"]})
@@ -285,10 +329,11 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
         errors = validate_fn(parsed)
         last_parsed, last_errors = parsed, errors
         if errors:
-            only_soft = (soft_prefix is not None
-                         and all(e.startswith(soft_prefix) for e in errors))
-            if only_soft and t >= 1:
-                rec["fail"] = "soft_accept"
+            only_warnings = all(e.startswith(WARNING_PREFIX) for e in errors)
+            # One feedback round first: an attempt that has not yet seen its complaints deserves
+            # the chance to fix them properly rather than being kept as it stands.
+            if only_warnings and t >= 1:
+                rec["fail"] = "soft_fail"
                 rec["errors"] = [e[:200] for e in errors[:3]]
                 attempts.append(rec)
                 return parsed, attempts, True
@@ -300,8 +345,10 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
         rec["fail"] = None
         attempts.append(rec)
         return parsed, attempts, False
-    if (soft_prefix and last_parsed is not None and last_errors
-            and all(e.startswith(soft_prefix) for e in last_errors)):
+    # The attempts ran out, but a result whose every remaining complaint is a warning is the same
+    # result the loop would have returned early; refusing it here would only discard it later.
+    if (last_parsed is not None and last_errors
+            and all(e.startswith(WARNING_PREFIX) for e in last_errors)):
         return last_parsed, attempts, True
     return None, attempts, False
 
@@ -309,21 +356,20 @@ def _translate_uncached(prompt_base: str, parse_fn, validate_fn, *,
 def translate(prompt_base: str, parse_fn, validate_fn, *,
               translator_url: str, translator_model: str,
               max_model_len: int = 12288,
-              api_timeout: float = 240.0,
-              soft_prefix: str | None = None) -> tuple:
+              api_timeout: float = 240.0) -> tuple:
     """Translate with memory and disk caches and shared concurrent requests.
 
-    The cache key covers parser/validator identity, token budget, and the soft
-    acceptance policy, so a cache hit cannot bypass current validation logic.
+    The cache key covers parser/validator identity and token budget, so a cache
+    hit cannot bypass current validation logic.
     Concurrent callers for the same key share one translation attempt. If that
     attempt fails, one waiting caller retries; after two shared failures the
-    remaining callers receive the failure instead of all calling the judge.
+    remaining callers receive the failure instead of all calling the translator.
     Pending-state cleanup compares object identity, so an old owner cannot
     remove a replacement owner's state after an ABA transition. Only
     successful translations are cached.
     """
     key = _tr_key(prompt_base, translator_model, max_model_len,
-                  parse_fn, validate_fn, soft_prefix)
+                  parse_fn, validate_fn)
     # Worst-case translation duration: MAX_TRIES attempts x
     # (2 HTTP posts x api_timeout + 3s inter-post wait), plus parse/validation.
     # Every waiting caller, cross-process stale-lock threshold, and
@@ -366,7 +412,7 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
             failed_shared_attempts += 1
             if failed_shared_attempts >= 2:
                 # Two shared attempts failed for this exact prompt. Return that
-                # failure instead of adding more judge requests.
+                # failure instead of adding more translator requests.
                 return None, [{"cache": "shared-failed"}], False
             continue
 
@@ -416,9 +462,10 @@ def translate(prompt_base: str, parse_fn, validate_fn, *,
                     try:
                         parsed, attempts, soft = _translate_uncached(
                             prompt_base, parse_fn, validate_fn,
-                            judge_url=translator_url, judge_model=translator_model,
+                            translator_url=translator_url,
+                            translator_model=translator_model,
                             max_model_len=max_model_len,
-                            api_timeout=api_timeout, soft_prefix=soft_prefix)
+                            api_timeout=api_timeout)
                         out = (parsed, attempts, soft)
                         if parsed is not None:
                             cached_value = (parsed, soft)

@@ -322,7 +322,7 @@ def formalize(problem, nl_steps, config, verify, profile):
                 continue
             bad = [str(v) for v in consts if v not in allowed_given_nums]
             if bad:
-                errs.append(f"GIVEN uses numbers not in the problem "
+                errs.append(f"{translator.WARNING_PREFIX}GIVEN uses numbers not in the problem "
                             f"statement: {sorted(set(bad))}. Only "
                             "transcribe the problem.")
             if re.fullmatch(r"answer\s*==\s*-?[\d./() *]+", g):
@@ -331,7 +331,7 @@ def formalize(problem, nl_steps, config, verify, profile):
         if errs:
             return errs
         if not any("answer" in ids for _, ids in given_term_ids):
-            return ["No GIVEN defines answer. Add exactly one GIVEN naming "
+            return [f"{translator.WARNING_PREFIX}No GIVEN defines answer. Add exactly one GIVEN naming "
                     "the asked quantity (answer == <variable>), or the "
                     "question's own expression - never a derived formula, "
                     "never a numeric value."]
@@ -361,8 +361,7 @@ def formalize(problem, nl_steps, config, verify, profile):
         translator_url=config.translator_url,
         translator_model=config.translator_model,
         max_model_len=config.max_model_len,
-        api_timeout=config.api_timeout,
-        soft_prefix=("GIVEN uses numbers", "No GIVEN defines answer"))
+        api_timeout=config.api_timeout)
     profile["translate_validate_time"] += time.time() - _time_start
     profile["translator_http_time"] += sum(
         float(a.get("http_wall_time") or 0.0) for a in attempt_a
@@ -436,7 +435,7 @@ def formalize(problem, nl_steps, config, verify, profile):
                 " ".join(nl_step.nl_premises),
                 list(pyexpr_givens) + plist[:k])
             if miss:
-                t_errs.append(f"STEP TRANSCRIPTION {k + 1}: the conclusion "
+                t_errs.append(f"{translator.WARNING_PREFIX}STEP TRANSCRIPTION {k + 1}: the conclusion "
                               f"mentions numbers {miss} absent from your "
                               "expression; include them doing real work "
                               "(as the conclusion computes them), even if "
@@ -485,8 +484,7 @@ def formalize(problem, nl_steps, config, verify, profile):
             translator_url=config.translator_url,
         translator_model=config.translator_model,
             max_model_len=config.max_model_len,
-            api_timeout=config.api_timeout,
-            soft_prefix="STEP TRANSCRIPTION")
+            api_timeout=config.api_timeout)
         profile["translate_validate_time"] += time.time() - _time_start
         profile["translator_http_time"] += sum(
             float(a.get("http_wall_time") or 0.0) for a in att_b

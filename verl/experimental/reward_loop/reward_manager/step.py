@@ -131,10 +131,10 @@ class StepRewardManager(RewardManagerBase):
         isabelle_pool_workers = reward_cfg.get("isabelle_pool_workers", algo_cfg.get("isabelle_pool_workers", None))
         if isabelle_pool_workers is not None:
             self.api_config["isabelle_pool_workers"] = int(isabelle_pool_workers)
-        isabelle_rss_cap = reward_cfg.get("isabelle_worker_rss_cap_gb",
-                                          algo_cfg.get("isabelle_worker_rss_cap_gb", None))
-        if isabelle_rss_cap is not None:
-            self.api_config["isabelle_worker_rss_cap_gb"] = float(isabelle_rss_cap)
+        isabelle_each_worker_mem_max = reward_cfg.get("isabelle_each_worker_proc_tree_mem_max_gb",
+                                                      algo_cfg.get("isabelle_each_worker_proc_tree_mem_max_gb", None))
+        if isabelle_each_worker_mem_max is not None:
+            self.api_config["isabelle_each_worker_proc_tree_mem_max_gb"] = float(isabelle_each_worker_mem_max)
         isabelle_remote_url = reward_cfg.get("isabelle_remote_pool_url", algo_cfg.get("isabelle_remote_pool_url", None))
         if isabelle_remote_url is not None:
             self.api_config["isabelle_remote_pool_url"] = str(isabelle_remote_url)
@@ -293,7 +293,13 @@ class StepRewardManager(RewardManagerBase):
         }
         for reward_type in self.step_reward_types:
             reward_extra_info[f"{reward_type}_step_reward"] = []
-        if "fol" in self.step_reward_types:
+        # These belong to the per-step scoring path. The math path takes the Isabelle
+        # whole-solution branch and continues out of the reward-type loop before that scoring runs,
+        # so there they would only ever report the zeros below. The same task-type switch decides
+        # both whether they are created and whether they are filled, so one batch never mixes the
+        # two key sets, which would collate the missing side to None and NaN the batch's metrics.
+        if ("fol" in self.step_reward_types
+                and (self.api_config or {}).get("fol_task_type") != "math"):
             reward_extra_info.update(
                 {
                     "fol_debug": [],
@@ -337,9 +343,9 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_rewarded_steps": 0,
                         "isabelle_neutral_steps": 0,
                         "isabelle_guard_failed_steps": 0,
-                        "isabelle_judge_calls_givens": 0,
-                        "isabelle_judge_calls_steps": 0,
-                        "isabelle_judge_calls_total": 0,
+                        "isabelle_translator_calls_givens": 0,
+                        "isabelle_translator_calls_steps": 0,
+                        "isabelle_translator_calls_total": 0,
                         "isabelle_o_steps": 0,
                         "isabelle_x_steps": 0,
                         "isabelle_c_steps": 0,
@@ -347,7 +353,7 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_g_steps": 0,
                         "isabelle_m_steps": 0,
                         "isabelle_t_steps": 0,
-                        "isabelle_judge_http_wall_time": 0.0,
+                        "isabelle_translator_http_wall_time": 0.0,
                         "isabelle_translate_validate_wall_time": 0.0,
                         "isabelle_prove_calls": 0,
                         "isabelle_prove_queue_time": 0.0,
@@ -358,13 +364,20 @@ class StepRewardManager(RewardManagerBase):
                         "isabelle_external_solver_reaps": 0,
                         "isabelle_thm_cache_hit_rate": 0.0,
                         "isabelle_tr_cache_hit_rate": 0.0,
-                        "isabelle_judge_http_calls": 0,
-                        "isabelle_judge_retry_calls": 0,
+                        "isabelle_translator_http_calls": 0,
+                        "isabelle_translator_retry_calls": 0,
                         "isabelle_translation_mem_hits": 0,
                         "isabelle_translation_disk_hits": 0,
                         "isabelle_translation_shared_hits": 0,
                         "isabelle_translation_xproc_hits": 0,
                         "isabelle_translation_failures": 0,
+                        "isabelle_translator_fail_truncated": 0,
+                        "isabelle_translator_fail_format": 0,
+                        "isabelle_translator_fail_validate": 0,
+                        "isabelle_translator_fail_soft": 0,
+                        "isabelle_translator_fail_error": 0,
+                        "isabelle_translator_thinking_calls": 0,
+                        "isabelle_translator_thinking_clean": 0,
                         "isabelle_pattern": "",
                         "isabelle_error": "",
                     }
@@ -535,7 +548,7 @@ class StepRewardManager(RewardManagerBase):
                         return_debug=True,
                         # Steps beyond penalty_max_steps get penalty_score and
                         # Their per-step results are not used (see mapping below).
-                        # don't waste judge/prover time computing them.
+                        # don't waste translator/prover time computing them.
                         max_steps=self.penalty_max_steps,
                     ),
                 )
@@ -576,14 +589,14 @@ class StepRewardManager(RewardManagerBase):
                 reward_extra_info["isabelle_g_steps"] = int(d.get("g_steps") or 0)
                 reward_extra_info["isabelle_m_steps"] = int(d.get("m_steps") or 0)
                 reward_extra_info["isabelle_t_steps"] = int(d.get("t_steps") or 0)
-                reward_extra_info["isabelle_judge_calls_givens"] = int(d.get("translation_attempts_givens") or 0)
-                reward_extra_info["isabelle_judge_calls_steps"] = int(d.get("translation_attempts_steps") or 0)
-                reward_extra_info["isabelle_judge_calls_total"] = int(
+                reward_extra_info["isabelle_translator_calls_givens"] = int(d.get("translation_attempts_givens") or 0)
+                reward_extra_info["isabelle_translator_calls_steps"] = int(d.get("translation_attempts_steps") or 0)
+                reward_extra_info["isabelle_translator_calls_total"] = int(
                     (d.get("translation_attempts_givens") or 0)
                     + (d.get("translation_attempts_steps") or 0))
                 # Wall profile + cache/restart gauges (2026-07-11 review #6).
-                reward_extra_info["isabelle_judge_http_wall_time"] = float(
-                    d.get("judge_http_wall_time") or 0.0)
+                reward_extra_info["isabelle_translator_http_wall_time"] = float(
+                    d.get("translator_http_wall_time") or 0.0)
                 reward_extra_info["isabelle_translate_validate_wall_time"] = float(
                     d.get("translate_validate_wall_time") or 0.0)
                 reward_extra_info["isabelle_prove_calls"] = int(d.get("prove_calls") or 0)
@@ -596,14 +609,20 @@ class StepRewardManager(RewardManagerBase):
                     d.get("external_solver_reaps") or 0)
                 reward_extra_info["isabelle_thm_cache_hit_rate"] = float(d.get("thm_cache_hit_rate") or 0.0)
                 reward_extra_info["isabelle_tr_cache_hit_rate"] = float(d.get("tr_cache_hit_rate") or 0.0)
-                # Real HTTP judge load vs per-layer cache reuse (2026-07-11).
-                reward_extra_info["isabelle_judge_http_calls"] = int(d.get("judge_http_calls") or 0)
-                reward_extra_info["isabelle_judge_retry_calls"] = int(d.get("judge_retry_calls") or 0)
+                # Real translator HTTP load vs per-layer cache reuse (2026-07-11).
+                reward_extra_info["isabelle_translator_http_calls"] = int(d.get("translator_http_calls") or 0)
+                reward_extra_info["isabelle_translator_retry_calls"] = int(d.get("translator_retry_calls") or 0)
                 reward_extra_info["isabelle_translation_mem_hits"] = int(d.get("translation_mem_hits") or 0)
                 reward_extra_info["isabelle_translation_disk_hits"] = int(d.get("translation_disk_hits") or 0)
                 reward_extra_info["isabelle_translation_shared_hits"] = int(d.get("translation_shared_hits") or 0)
                 reward_extra_info["isabelle_translation_xproc_hits"] = int(d.get("translation_xproc_hits") or 0)
                 reward_extra_info["isabelle_translation_failures"] = int(d.get("translation_failures") or 0)
+                # Why each translator attempt went round again, and what turning thinking on bought.
+                for _k in ("translator_fail_truncated", "translator_fail_format",
+                           "translator_fail_validate", "translator_fail_soft",
+                           "translator_fail_error", "translator_thinking_calls",
+                           "translator_thinking_clean"):
+                    reward_extra_info[f"isabelle_{_k}"] = int(d.get(_k) or 0)
                 # Per-step verification result symbols (o=rewarded, x=unverified, c=premises-inconsistent, m=transcription-missing, g=guard-failed) for the [Step Rewards] sample print.
                 reward_extra_info["isabelle_pattern"] = str(d.get("pattern") or "")
                 # ALWAYS set the key (empty string when no error): batch

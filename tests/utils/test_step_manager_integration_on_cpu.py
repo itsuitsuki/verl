@@ -148,7 +148,7 @@ def test_isabelle_rewards_map_to_original_positions_and_response_is_cleaned(monk
 
 def test_isabelle_profile_metrics_use_training_batch_keys(monkeypatch):
     debug = {
-        "judge_http_wall_time": 1.25,
+        "translator_http_wall_time": 1.25,
         "translate_validate_wall_time": 2.5,
         "prove_queue_time": 3.75,
         "prove_run_time": 4.5,
@@ -164,7 +164,7 @@ def test_isabelle_profile_metrics_use_training_batch_keys(monkeypatch):
                        api_config=_math_api_config())
     out = _run(manager, _data_proto(VALID1 + " \\boxed{7}"))
     extra = out["reward_extra_info"]
-    assert extra["isabelle_judge_http_wall_time"] == 1.25
+    assert extra["isabelle_translator_http_wall_time"] == 1.25
     assert extra["isabelle_translate_validate_wall_time"] == 2.5
     assert extra["isabelle_prove_queue_time"] == 3.75
     assert extra["isabelle_prove_run_time"] == 4.5

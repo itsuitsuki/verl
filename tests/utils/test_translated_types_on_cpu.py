@@ -108,11 +108,11 @@ def test_translate_disk_hit_returns_typed_givens(tmp_path, monkeypatch):
     monkeypatch.setenv("ISABELLE_TRANSLATE_DISK_CACHE", "1")
     calls = {"n": 0}
 
-    def fake_judge(prompt, **_kw):
+    def fake_translator(prompt, **_kw):
         calls["n"] += 1
         return "VARS: x int\nGIVEN: x = 3\nGIVEN: answer = x"
 
-    monkeypatch.setattr(translator, "call_judge", fake_judge)
+    monkeypatch.setattr(translator, "call_translator", fake_translator)
     parsed1, _, _ = translator.translate(
         "PB", formalization.parse_givens_vars_to_pyexpr, lambda p: [],
         translator_url="u", translator_model="m")

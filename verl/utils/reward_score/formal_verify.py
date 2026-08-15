@@ -66,6 +66,16 @@ _verify_cache_lock = threading.Lock()
 _verify_pending: dict[tuple, dict] = {}
 _verify_cache_stats = {"hits": 0, "misses": 0}
 _verify_cache_stats_lock = threading.Lock()
+
+# The outcomes the translator's retry loop records on each attempt, mapped to the counter each one
+# feeds. A clean attempt records None and needs no counter; the attempt totals already carry it.
+_TRANSLATOR_OUTCOME_COUNTERS = {
+    "truncated": "translator_fail_truncated",
+    "format": "translator_fail_format",
+    "validate": "translator_fail_validate",
+    "soft_fail": "translator_fail_soft",
+    "translator_error": "translator_fail_error",
+}
 _verify_cache_step_stats: OrderedDict[int, dict[str, int]] = OrderedDict()
 _verify_cache_summary_registered = False
 
@@ -873,7 +883,7 @@ def _isabelle_config_from(api_config: dict | None):
         pool_workers=int(cfg.get("isabelle_pool_workers", 32)),
         verify_timeout=float(timeout),
         api_timeout=float(cfg.get("api_timeout") or 240.0),
-        each_worker_proc_tree_mem_max_gb=float(cfg.get("isabelle_worker_rss_cap_gb") or 12.0),
+        each_worker_proc_tree_mem_max_gb=float(cfg.get("isabelle_each_worker_proc_tree_mem_max_gb") or 12.0),
         translate_chunk_steps=int(cfg.get("isabelle_translate_chunk_steps") or 20),
         step_check_parallelism=int(cfg.get("isabelle_step_check_parallelism") or 4),
         runaway_cpu_s=float(cfg.get("isabelle_runaway_cpu_s") or 90.0),
@@ -926,11 +936,11 @@ def compute_solution_reward_isabelle(
 
     Returns:
         list[float]: per-step rewards (0/1). With return_debug=True, returns
-        (rewards, debug_dict) where debug_dict carries judge/verifier
+        (rewards, debug_dict) where debug_dict carries translator/verifier
         statistics for metric aggregation (mirrors Z3 path's debug_info).
 
     Fast-fail mirrors the Z3 path: if the XML yields no valid step, skip the
-    expensive judge + Isabelle call entirely. The \\boxed outcome contract is
+    expensive translator + Isabelle call entirely. The \\boxed outcome contract is
     the reward manager's business (format_penalty), not this backend's.
     """
     debug = {
@@ -944,6 +954,16 @@ def compute_solution_reward_isabelle(
         "neutral_steps": 0,
         "translation_attempts_givens": 0,
         "translation_attempts_steps": 0,
+        # Why the translator's retry loop went round again, and what thinking bought. An attempt
+        # without thinking is cheap; every retry turns it on, so these decide whether the retries
+        # are worth their cost or whether the loop is spending on causes a cheaper attempt could fix.
+        "translator_fail_truncated": 0,
+        "translator_fail_format": 0,
+        "translator_fail_validate": 0,
+        "translator_fail_soft": 0,
+        "translator_fail_error": 0,
+        "translator_thinking_calls": 0,
+        "translator_thinking_clean": 0,
         "guard_failed_steps": 0,
         "premise_consistency_inconsistent_at": None,
         "premise_consistency_unknown_at": None,
@@ -968,12 +988,12 @@ def compute_solution_reward_isabelle(
         # failed" and t_rate is "translator/format could not formalize".
         # Invariant restored: o + x + c + u + g + m + t == n_steps.
         "t_steps": 0,
-        # Per-response wall profile (2026-07-11 review #6). judge_http_wall_time
+        # Per-response wall profile (2026-07-11 review #6). translator_http_wall_time
         # is pure HTTP wall and does not overlap prover time;
         # translate_validate_wall_time is end-to-end translation/validation wall
         # and may include prover-backed validation. Cache/restart gauges are
         # process-cumulative snapshots; batch max is the meaningful endpoint.
-        "judge_http_wall_time": 0.0,
+        "translator_http_wall_time": 0.0,
         "translate_validate_wall_time": 0.0,
         "prove_calls": 0,
         "prove_queue_time": 0.0,
@@ -984,10 +1004,10 @@ def compute_solution_reward_isabelle(
         "external_solver_reaps": 0,
         "thm_cache_hit_rate": 0.0,
         "tr_cache_hit_rate": 0.0,
-        # Count actual judge HTTP requests separately from cache reuse. The old
-        # judge_calls_* calculation counted cache metadata as judge calls.
-        "judge_http_calls": 0,
-        "judge_retry_calls": 0,
+        # Count actual translator HTTP requests separately from cache reuse. The
+        # old calls calculation counted cache metadata as translator calls.
+        "translator_http_calls": 0,
+        "translator_retry_calls": 0,
         "translation_mem_hits": 0,
         "translation_disk_hits": 0,
         "translation_shared_hits": 0,
@@ -1025,7 +1045,7 @@ def compute_solution_reward_isabelle(
             "premise_consistency_inconsistent_at")
         debug["premise_consistency_unknown_at"] = result.get(
             "premise_consistency_unknown_at")
-        # translation_record_from_problem: single dict OR list of dicts (judge attempts)
+        # translation_record_from_problem: single dict OR list of dicts (translator attempts)
         ta = result.get("translation_record_from_problem")
         if isinstance(ta, list):
             debug["translation_attempts_givens"] = len(ta)
@@ -1065,7 +1085,7 @@ def compute_solution_reward_isabelle(
         # Wall profile from the engine (review #6). Guarded: an old cached
         # rec or an early-return path may lack keys; defaults stay 0.
         prof = result.get("prof") or {}
-        debug["judge_http_wall_time"] = float(
+        debug["translator_http_wall_time"] = float(
             prof.get("translator_http_time") or 0.0)
         debug["translate_validate_wall_time"] = float(
             prof.get("translate_validate_time") or 0.0)
@@ -1092,7 +1112,7 @@ def compute_solution_reward_isabelle(
         except Exception:  # noqa: BLE001
             pass
 
-        # Split real judge HTTP load from cache reuse (review round 2).
+        # Split real translator HTTP load from cache reuse (review round 2).
         def _tr_attempt_entries(x):
             # the problem record is a list (or single dict); the steps record
             # is one chunk's list or a list of per-chunk lists.
@@ -1118,8 +1138,17 @@ def compute_solution_reward_isabelle(
             elif marker == "xproc":
                 debug["translation_xproc_hits"] += 1
             posts = int(a.get("http_posts") or 0)
-            debug["judge_http_calls"] += posts
-            debug["judge_retry_calls"] += max(0, posts - 1)
+            debug["translator_http_calls"] += posts
+            debug["translator_retry_calls"] += max(0, posts - 1)
+            # Only real attempts record an outcome; a cache-marker entry carries none.
+            if "fail" in a:
+                counter = _TRANSLATOR_OUTCOME_COUNTERS.get(a.get("fail"))
+                if counter:
+                    debug[counter] += 1
+                if a.get("thinking"):
+                    debug["translator_thinking_calls"] += 1
+                    if a.get("fail") is None:
+                        debug["translator_thinking_clean"] += 1
         # response-level FINAL translation failures (not per-retry noise)
         debug["translation_failures"] = int(
             (1 if debug["format_ok"] and not debug["givens_ok"] else 0)

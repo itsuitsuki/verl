@@ -131,7 +131,8 @@ class IsabelleConfig:
     # The reward API's api_timeout config controls each translator HTTP request
     api_timeout: float = 240.0
     # Each worker's Poly/ML process tree may use at most this many GB before the pool restarts it.
-    # The value is a Hydra config setting, not an environment variable; 12 GB was validated under the 300 GB cgroup.
+    # The cap is per worker and measured over the whole tree (the JVM plus its Poly/ML children), so a pool's aggregate ceiling is this value times pool_workers; size it against the memory the host actually has.
+    # Set through the Hydra knob `algorithm.isabelle_each_worker_proc_tree_mem_max_gb`, not an environment variable.
     each_worker_proc_tree_mem_max_gb: float = 12.0
     # Steps per translator call. A solution with at most this many steps is translated in a single call; a longer one is split into chunks of this size, with later chunks shown the earlier props as context. Sized to what one prompt handles well at max_model_len; a Hydra config knob, not a hardcoded constant.
     translate_chunk_steps: int = 20
